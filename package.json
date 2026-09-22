@@ -1,0 +1,27 @@
+{
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "hono": "^4.13.8",
+    "viem": "^2.33.0"
+  },
+  "description": "402 protocol: EIP-712 invoices (Phase 1) + x402 facilitator (Phase 2) + AgentEscrow.sol & reputation (Phase 3) for agent payments in native USDC on Ink.",
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "name": "@402/protocol",
+  "scripts": {
+    "facilitator": "tsx src/cli/facilitator.ts",
+    "issue": "tsx src/cli/issue.ts",
+    "pay": "tsx src/cli/pay.ts",
+    "status": "tsx src/cli/status.ts",
+    "test": "tsx test/selftest.ts",
+    "test:facilitator": "tsx test/facilitator.test.ts",
+    "test:sol": "forge test",
+    "typecheck": "tsc --noEmit",
+    "test:lounge": "tsx test/lounge.test.ts"
+  },
+  "type": "module",
+  "version": "0.3.0"
+}
