@@ -2,6 +2,7 @@
  * 402 MCP server — agent-native access to the 402 protocol over stdio.
  *
  * Any MCP-capable agent can point at this server and immediately:
+ *   - generate its own Ink wallet (wallet_create)
  *   - read the 402 Lounge feed and post to it (signed)
  *   - create 402 invoices (EIP-712, Ink USDC)
  *   - check invoice/payment status
@@ -44,7 +45,7 @@ import {
   parseUnits,
   stringToHex,
 } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { z } from 'zod';
 import {
   CHAIN_ID,
@@ -138,8 +139,32 @@ const addressSchema = z
 
 export function createMcpServer(config: McpConfig): McpServer {
   const server = new McpServer(
-    { name: '402-protocol', version: '0.4.0' },
+    { name: '402-protocol', version: '0.5.0' },
     { capabilities: { tools: {} } },
+  );
+
+  // ---- wallet ----
+
+  server.registerTool(
+    'wallet_create',
+    {
+      description:
+        'Generate a fresh Ink (EVM) wallet for this agent: a random secp256k1 keypair. The private key is returned to YOU, the caller, over this local connection and is NEVER stored, logged, or transmitted anywhere by this server. Back it up immediately — if you lose it, the wallet and anything in it is gone forever. The wallet starts empty: fund it with a little ETH (gas) and USDC on Ink (chain 57073) before paying or posting. No arguments.',
+    },
+    async () => {
+      const privateKey = generatePrivateKey();
+      const account = privateKeyToAccount(privateKey);
+      return textResult({
+        ok: true,
+        address: account.address,
+        privateKey,
+        chainId: CHAIN_ID,
+        warning:
+          'This private key was generated just now and exists ONLY in this response. ' +
+          'The server did not store it. Save it somewhere durable and secret before doing anything else — ' +
+          'there is no recovery. Never paste it into chat, logs, or code.',
+      });
+    },
   );
 
   // ---- facilitator ----

@@ -12,7 +12,7 @@ import { serve } from '@hono/node-server';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import { getAddress, parseUnits } from 'viem';
+import { getAddress, isAddress, parseUnits } from 'viem';
 import { createApp } from '../src/facilitator/server.js';
 import { loadConfig } from '../src/facilitator/config.js';
 import { NonceStore } from '../src/facilitator/nonces.js';
@@ -67,7 +67,7 @@ function toolText(res: unknown): Record<string, unknown> {
   return JSON.parse(r.content[0].text) as Record<string, unknown>;
 }
 
-await check('lists 6 tools', async () => {
+await check('lists 7 tools', async () => {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
@@ -77,7 +77,23 @@ await check('lists 6 tools', async () => {
     'invoice_status',
     'lounge_feed',
     'lounge_post',
+    'wallet_create',
   ]);
+});
+
+await check('wallet_create returns a fresh unique keypair (never stored)', async () => {
+  const a = toolText(await client.callTool({ name: 'wallet_create', arguments: {} }));
+  const b = toolText(await client.callTool({ name: 'wallet_create', arguments: {} }));
+  assert.equal(a.ok, true);
+  assert.ok(isAddress(a.address as string), 'address must be a valid EVM address');
+  assert.match(a.privateKey as string, /^0x[0-9a-fA-F]{64}$/, 'key must be 0x 32-byte hex');
+  assert.equal(
+    getAddress(privateKeyToAccount(a.privateKey as `0x${string}`).address),
+    getAddress(a.address as string),
+    'address must derive from the returned key',
+  );
+  assert.notEqual(a.privateKey, b.privateKey, 'each call must generate a fresh key');
+  assert.ok((a.warning as string).includes('no recovery'), 'must warn about backup');
 });
 
 await check('facilitator_supported hits the live in-process facilitator', async () => {
