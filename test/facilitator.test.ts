@@ -575,4 +575,144 @@ await check('M1: /settle fail-closed when no keys configured -> 503', async () =
   assert.equal(body.errorReason, 'settle_auth_not_configured');
 });
 
+// ---------- H1 (2026-09-23 audit): /demo/data must not settle real funds unauthenticated ----------
+
+function liveConfig(
+  over: Record<string, string | undefined> = {},
+): ReturnType<typeof loadConfig> {
+  // Production posture: dry-run OFF. Keys stay throwaway test values.
+  return loadConfig({ ...process.env, FOUR02_DRY_RUN: 'false', ...over });
+}
+
+await check('H1-23: /demo/data with dry-run off, no API key -> 401 (no challenge, no settlement)', async () => {
+  const app = createApp(liveConfig(), new NonceStore());
+  // Even without a signature the gate fires before the 402 challenge.
+  const noSig = await app.request('/demo/data');
+  assert.equal(noSig.status, 401);
+  const noSigBody = (await noSig.json()) as { error: string };
+  assert.equal(noSigBody.error, 'unauthorized');
+
+  // And with a valid payment signature: still refused, nothing settles.
+  const sigB64 = await demoSignedPayloadB64();
+  const res = await app.request('/demo/data', {
+    headers: { 'PAYMENT-SIGNATURE': sigB64 },
+  });
+  assert.equal(res.status, 401);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, 'unauthorized');
+});
+
+await check('H1-23: /demo/data with dry-run off, wrong API key -> 401', async () => {
+  const app = createApp(liveConfig(), new NonceStore());
+  const sigB64 = await demoSignedPayloadB64();
+  const res = await app.request('/demo/data', {
+    headers: { 'PAYMENT-SIGNATURE': sigB64, 'x-api-key': 'wrong-key' },
+  });
+  assert.equal(res.status, 401);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, 'unauthorized');
+});
+
+await check('H1-23: /demo/data with dry-run off, no keys configured -> 503 fail-closed', async () => {
+  const cfg = liveConfig({ FOUR02_SETTLE_API_KEYS: '' });
+  const app = createApp(cfg, new NonceStore());
+  const sigB64 = await demoSignedPayloadB64();
+  const res = await app.request('/demo/data', {
+    headers: { 'PAYMENT-SIGNATURE': sigB64, 'x-api-key': 'test-settle-key' },
+  });
+  assert.equal(res.status, 503);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, 'demo_auth_not_configured');
+});
+
+await check('H1-23: /demo/data with dry-run off + valid API key reaches settlement step (no settler key -> 503, nonce untouched)', async () => {
+  const store = new NonceStore();
+  const cfg = liveConfig({ FOUR02_SETTLER_KEY: undefined });
+  const app = createApp(cfg, store);
+  const sigB64 = await demoSignedPayloadB64();
+  const nonce = (
+    JSON.parse(Buffer.from(sigB64, 'base64').toString('utf8')) as PaymentPayload
+  ).payload.authorization.nonce;
+  const res = await app.request('/demo/data', {
+    headers: { 'PAYMENT-SIGNATURE': sigB64, 'x-api-key': 'test-settle-key' },
+  });
+  // Auth passed, signature verified, settlement refused for lack of key —
+  // crucially, no broadcast was possible and the nonce was NOT consumed.
+  assert.equal(res.status, 503);
+  const body = (await res.json()) as { errorReason: string };
+  assert.equal(body.errorReason, 'missing_settler_key');
+  assert.equal(store.has(INK_CONFIG.chainId, nonce, now()), false);
+});
+
+await check('H1-23: /demo/data dry-run still permissionless (no API key needed)', async () => {
+  const app = createApp(loadConfig(), new NonceStore());
+  const sigB64 = await demoSignedPayloadB64();
+  const res = await app.request('/demo/data', {
+    headers: { 'PAYMENT-SIGNATURE': sigB64 },
+  });
+  assert.equal(res.status, 200);
+});
+
+// ---------- H2 (2026-09-23 audit): concurrent duplicate settle -> exactly one broadcast ----------
+
+await check('H2-23: concurrent duplicate settleExactPayment -> one runs, one duplicate_settlement', async () => {
+  const store = new NonceStore();
+  const r = await signedRequest();
+  const opts = { store, settlerKey, dryRun: true };
+  const [first, second] = await Promise.all([
+    settleExactPayment(r, opts),
+    settleExactPayment(r, opts),
+  ]);
+  // The first call runs the inner settlement (dry-run: simulated, never
+  // broadcast); the concurrent duplicate is rejected deterministically —
+  // registration in the in-flight map is synchronous, before any await.
+  assert.equal(first.errorReason, 'dry_run_mode');
+  assert.equal(first.success, false);
+  assert.equal(second.success, false);
+  assert.equal(second.errorReason, 'duplicate_settlement');
+});
+
+await check('H2-23: in-flight entry is cleaned up — a later identical settle is not wedged', async () => {
+  const store = new NonceStore();
+  const r = await signedRequest();
+  const opts = { store, settlerKey, dryRun: true };
+  const first = await settleExactPayment(r, opts);
+  assert.equal(first.errorReason, 'dry_run_mode');
+  // Sequential retry after completion: processed normally, never
+  // duplicate_settlement (the in-flight entry was removed).
+  const retry = await settleExactPayment(r, opts);
+  assert.notEqual(retry.errorReason, 'duplicate_settlement');
+});
+
+await check('H2-23: POST /settle concurrent duplicates -> one 200, one 409', async () => {
+  const app = createApp(loadConfig(), new NonceStore());
+  const r = await signedRequest();
+  const post = () =>
+    app.request('/settle', {
+      method: 'POST',
+      headers: SETTLE_HEADERS,
+      body: JSON.stringify(r),
+    });
+  const [res1, res2] = await Promise.all([post(), post()]);
+  assert.equal(res1.status, 200);
+  assert.equal(res2.status, 409);
+  const b1 = (await res1.json()) as { errorReason: string };
+  const b2 = (await res2.json()) as { errorReason: string };
+  assert.equal(b1.errorReason, 'dry_run_mode');
+  assert.equal(b2.errorReason, 'duplicate_settlement');
+});
+
+await check('H2-23: different nonces do not dedupe each other', async () => {
+  const store = new NonceStore();
+  const opts = { store, settlerKey, dryRun: true };
+  const r1 = await signedRequest();
+  const r2 = await signedRequest();
+  const [a, b] = await Promise.all([
+    settleExactPayment(r1, opts),
+    settleExactPayment(r2, opts),
+  ]);
+  assert.equal(a.errorReason, 'dry_run_mode');
+  assert.equal(b.errorReason, 'dry_run_mode');
+});
+
 console.log(`\n${passed} facilitator tests passed${process.exitCode ? ' (with failures)' : ''}`);

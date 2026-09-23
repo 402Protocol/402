@@ -23,6 +23,12 @@
  * Settle auth (M1): POST /settle is gated on an API-key allowlist
  * (FOUR02_SETTLE_API_KEYS). With no keys configured, /settle refuses with
  * 503 — fail closed, the same posture as a missing settler key.
+ *
+ * Demo auth (H1, 2026-09-23 audit): GET /demo/data triggers REAL onchain
+ * settlement via settleExactPayment once FOUR02_DRY_RUN=false, so in that
+ * mode it is gated on the same API-key allowlist (fail closed when no keys
+ * are configured). In dry-run nothing settles, so the permissionless demo
+ * flow is unchanged.
  */
 import { timingSafeEqual } from 'node:crypto';
 import { Hono, type Context, type Next } from 'hono';
@@ -290,7 +296,14 @@ export function createApp(
       settlerKey: config.settlerKey,
       dryRun: config.dryRun,
     });
-    const status = result.errorReason === 'missing_settler_key' ? 503 : 200;
+    // H2 (2026-09-23 audit): a duplicate arriving while an identical
+    // settlement is in flight is a client conflict, not a server error.
+    const status =
+      result.errorReason === 'missing_settler_key'
+        ? 503
+        : result.errorReason === 'duplicate_settlement'
+          ? 409
+          : 200;
     return c.json(result, status as 200);
   });
 
@@ -304,6 +317,35 @@ export function createApp(
         },
         500,
       );
+    }
+    // H1 (2026-09-23 audit): with dry-run OFF this route calls
+    // settleExactPayment below, which broadcasts a REAL onchain transfer.
+    // An unauthenticated caller must never be able to cause that, so in
+    // production mode the demo requires the same API key as /settle and
+    // fails closed when no keys are configured. Checked BEFORE the 402
+    // challenge so nobody burns effort signing for a request we'd refuse.
+    // In dry-run mode nothing settles, so the permissionless demo flow is
+    // unchanged.
+    if (!config.dryRun) {
+      if (config.settleApiKeys.length === 0) {
+        return c.json(
+          {
+            error: 'demo_auth_not_configured',
+            detail:
+              'Set FOUR02_SETTLE_API_KEYS to enable the demo with live settlement.',
+          },
+          503,
+        );
+      }
+      if (!apiKeyAllowed(settleApiKey(c), config.settleApiKeys)) {
+        return c.json(
+          {
+            error: 'unauthorized',
+            detail: 'This demo endpoint requires an API key when dry-run is off.',
+          },
+          401,
+        );
+      }
     }
     const requirements = demoRequirements(config);
     const paymentRequired: PaymentRequired = {
