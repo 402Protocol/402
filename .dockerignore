@@ -1,0 +1,8 @@
+node_modules
+.git
+*.db
+*.db-journal
+.env
+.env.*
+audits
+brand

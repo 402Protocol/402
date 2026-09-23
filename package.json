@@ -13,6 +13,7 @@
   "name": "@402/protocol",
   "scripts": {
     "facilitator": "tsx src/cli/facilitator.ts",
+    "start": "tsx src/cli/facilitator.ts",
     "issue": "tsx src/cli/issue.ts",
     "pay": "tsx src/cli/pay.ts",
     "status": "tsx src/cli/status.ts",
