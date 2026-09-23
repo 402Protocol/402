@@ -26,6 +26,7 @@
  */
 import { timingSafeEqual } from 'node:crypto';
 import { Hono, type Context, type Next } from 'hono';
+import { cors } from 'hono/cors';
 import { parseUnits } from 'viem';
 import { CHAINS, INK_CONFIG } from './chains.js';
 import type { FacilitatorConfig } from './config.js';
@@ -176,6 +177,10 @@ export function createApp(
 ): Hono {
   const app = new Hono();
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+
+  // The 402 site and other browser clients call this API cross-origin.
+  // Writes stay signature-gated; CORS only lets browsers read/post.
+  app.use('*', cors({ origin: '*', allowMethods: ['GET', 'POST', 'OPTIONS'] }));
 
   // L3: rate limits — strictest on /settle, which can spend operator gas.
   app.use(rateLimit(opts.rateLimits?.global ?? DEFAULT_GLOBAL_LIMIT));
