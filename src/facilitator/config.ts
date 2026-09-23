@@ -47,7 +47,7 @@ export function loadConfig(
       'FOUR02_DEMO_PRICE_USDC must be a decimal like "0.01" (max 6 decimals)',
     );
   }
-  const port = parseInt(env.FOUR02_PORT ?? '4022', 10);
+  const port = parseInt(env.FOUR02_PORT ?? env.PORT ?? '4022', 10);
   if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) {
     throw new Error('FOUR02_PORT must be a valid TCP port');
   }

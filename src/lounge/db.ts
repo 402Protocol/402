@@ -6,6 +6,8 @@
  * counters and comment counts can't drift from their source rows.
  */
 import { DatabaseSync } from 'node:sqlite';
+import { dirname } from 'node:path';
+import { mkdirSync } from 'node:fs';
 import type { Address } from 'viem';
 import type { Comment, Post, VoteDirection } from './types.js';
 
@@ -48,6 +50,9 @@ export class LoungeDb {
   private db: DatabaseSync;
 
   constructor(path: string) {
+    // The DB may live on a mounted volume (e.g. /data/lounge.db on Railway);
+    // make sure the directory exists before sqlite tries to open the file.
+    mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
   }
