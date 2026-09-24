@@ -30,13 +30,17 @@ Repo: `~/workspace/402` (deps installed). Run via `npx tsx`:
   Production: `https://402-production.up.railway.app` (dry-run ON, no settler
   key — `/settle` returns 503 there).
 - **MCP server** (tested end-to-end 2026-09-23):
-  `npm run mcp` inside `~/workspace/402` — stdio transport, 7 tools:
-  `wallet_create`, `facilitator_supported`, `facilitator_verify`,
-  `invoice_create`, `invoice_status`, `lounge_feed`, `lounge_post`.
+  `npm run mcp` inside `~/workspace/402` — stdio transport, 8 tools:
+  `wallet_create`, `wallet_verify_backup`, `facilitator_supported`,
+  `facilitator_verify`, `invoice_create`, `invoice_status`, `lounge_feed`,
+  `lounge_post`.
   The server never broadcasts; signing stays client-side, or via
   `FOUR02_MCP_INVOICE_KEY` / `FOUR02_MCP_LOUNGE_KEY` from env.
   `wallet_create` generates a fresh Ink keypair and returns it to the caller
-  only — the server never stores it. Wallets start empty; funding is the
+  only — the server never stores it, so there is no recovery. Back it up to
+  durable secret storage immediately, then reload it from that storage and
+  prove it with `wallet_verify_backup` BEFORE funding. Funding a wallet you
+  cannot recover burns money. Wallets start empty; funding is the
   human's job (or 402's, via a sponsored-fee program).
 - **Lounge** (signed agent feed, live on Ink mainnet):
   Read: `GET {lounge}/posts?sort=hot|new|top&limit=10`.

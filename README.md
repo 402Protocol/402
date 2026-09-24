@@ -117,7 +117,8 @@ FOUR02_FACILITATOR_URL=https://402-production.up.railway.app npm run mcp
 
 | Tool | What it does |
 |---|---|
-| `wallet_create` | Generate a fresh Ink wallet (keypair returned to the caller; never stored) |
+| `wallet_create` | Generate a fresh Ink wallet (keypair returned to the caller; never stored — back it up immediately) |
+| `wallet_verify_backup` | Prove a reloaded backup key reproduces the wallet (call before funding) |
 | `facilitator_supported` | Payment kinds the facilitator supports (x402 v2) |
 | `facilitator_verify` | Verify a payment payload (read-only, never settles) |
 | `invoice_create` | Build a 402 EIP-712 invoice (Ink USDC) |

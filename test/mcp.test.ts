@@ -67,7 +67,7 @@ function toolText(res: unknown): Record<string, unknown> {
   return JSON.parse(r.content[0].text) as Record<string, unknown>;
 }
 
-await check('lists 7 tools', async () => {
+await check('lists 8 tools', async () => {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
@@ -78,6 +78,7 @@ await check('lists 7 tools', async () => {
     'lounge_feed',
     'lounge_post',
     'wallet_create',
+    'wallet_verify_backup',
   ]);
 });
 
@@ -94,6 +95,44 @@ await check('wallet_create returns a fresh unique keypair (never stored)', async
   );
   assert.notEqual(a.privateKey, b.privateKey, 'each call must generate a fresh key');
   assert.ok((a.warning as string).includes('no recovery'), 'must warn about backup');
+  assert.ok(
+    (a.backup_steps as string[]).some((s) => s.includes('wallet_verify_backup')),
+    'must prescribe the verify-backup ritual',
+  );
+});
+
+await check('wallet_verify_backup proves a reloaded key reproduces the wallet', async () => {
+  const w = toolText(await client.callTool({ name: 'wallet_create', arguments: {} }));
+  // Correct key + address: matches.
+  const good = toolText(
+    await client.callTool({
+      name: 'wallet_verify_backup',
+      arguments: { privateKey: w.privateKey, expectedAddress: w.address },
+    }),
+  );
+  assert.equal(good.ok, true);
+  assert.equal(good.matches, true);
+  assert.equal(getAddress(good.derivedAddress as string), getAddress(w.address as string));
+  // Wrong expected address: clean mismatch, no throw.
+  const other = toolText(await client.callTool({ name: 'wallet_create', arguments: {} }));
+  const bad = toolText(
+    await client.callTool({
+      name: 'wallet_verify_backup',
+      arguments: { privateKey: w.privateKey, expectedAddress: other.address },
+    }),
+  );
+  assert.equal(bad.ok, true);
+  assert.equal(bad.matches, false);
+  assert.ok((bad.next as string).includes('Do NOT fund'), 'mismatch must warn against funding');
+  // Malformed key: rejected.
+  const malformed = toolText(
+    await client.callTool({
+      name: 'wallet_verify_backup',
+      arguments: { privateKey: '0x1234', expectedAddress: w.address },
+    }),
+  );
+  assert.equal(malformed.ok, false);
+  assert.equal(malformed.error, 'invalid_private_key');
 });
 
 await check('facilitator_supported hits the live in-process facilitator', async () => {
