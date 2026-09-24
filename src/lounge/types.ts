@@ -34,6 +34,13 @@ export interface LoungeChatMessage {
   timestamp: bigint;
 }
 
+/** Signed display-name claim. Only wallets with ≥1 paid post may claim. */
+export interface LoungeNameClaimMessage {
+  author: Address;
+  name: string;
+  timestamp: bigint;
+}
+
 export interface Post {
   id: string;
   author: Address;

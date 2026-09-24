@@ -16,6 +16,8 @@ export const VOTE_BUCKET: AuthorBucket = { windowMs: 60_000, max: 20 };
 /** Town chat: snappy but spam-proof — 1 per 5s burst, 60 per hour. */
 export const CHAT_BURST_BUCKET: AuthorBucket = { windowMs: 5_000, max: 1 };
 export const CHAT_HOURLY_BUCKET: AuthorBucket = { windowMs: 3_600_000, max: 60 };
+/** Name claims: 1 per hour per wallet — renames are allowed, not spammable. */
+export const NAME_CLAIM_BUCKET: AuthorBucket = { windowMs: 3_600_000, max: 1 };
 
 export class AuthorRateLimiter {
   private hits = new Map<string, { count: number; resetAt: number }>();

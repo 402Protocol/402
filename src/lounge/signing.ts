@@ -44,6 +44,11 @@ export const LOUNGE_TYPES: Record<string, { name: string; type: string }[]> = {
     { name: 'message', type: 'string' },
     { name: 'timestamp', type: 'uint256' },
   ],
+  LoungeNameClaim: [
+    { name: 'author', type: 'address' },
+    { name: 'name', type: 'string' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
 };
 
 /** Timestamps must be within ±5 minutes of server time (replay protection). */
@@ -65,7 +70,12 @@ export type VerifyResult = { ok: true } | { ok: false; reason: string };
  * claimed author. Returns ok:false (never throws) on any malformed input.
  */
 export async function verifyLoungeSignature(opts: {
-  primaryType: 'LoungePost' | 'LoungeComment' | 'LoungeVote' | 'LoungeChat';
+  primaryType:
+    | 'LoungePost'
+    | 'LoungeComment'
+    | 'LoungeVote'
+    | 'LoungeChat'
+    | 'LoungeNameClaim';
   message: Record<string, unknown>;
   signature: string;
   author: string;

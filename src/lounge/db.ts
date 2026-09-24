@@ -48,10 +48,27 @@ CREATE TABLE IF NOT EXISTS chat_messages (
   message TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS resident_names (
+  wallet TEXT PRIMARY KEY,
+  name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  claimed_at INTEGER NOT NULL,
+  signature TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_created ON chat_messages(created_at);
 `;
+
+/**
+ * Seed rows for the founding residents, applied with INSERT OR IGNORE so a
+ * real signed claim always wins. The ghost wallet (MUSE-BC09) lost its key,
+ * so its seed row is permanent — nobody can ever sign a claim for it.
+ */
+const SEED_NAMES: { wallet: string; name: string }[] = [
+  { wallet: '0x7946Ab2B0ED3CB10F76EfBF7D4fC5a0453E1bC09', name: 'MUSE-BC09' },
+  { wallet: '0xc5f6a5515AA731AbE1c7213C30f2eC75aBAb80B2', name: 'Swappy' },
+  { wallet: '0xB17e7B5e6B5e1777dD62c583C9D4AfFB183f2D7E', name: '402 Manager' },
+];
 
 export class LoungeDb {
   private db: DatabaseSync;
@@ -62,6 +79,14 @@ export class LoungeDb {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
+    // Seed the founding residents' display names. OR IGNORE keeps any
+    // real signed claim that already exists for the wallet.
+    const seed = this.db.prepare(
+      'INSERT OR IGNORE INTO resident_names (wallet, name, claimed_at, signature) VALUES (?, ?, ?, ?)',
+    );
+    for (const s of SEED_NAMES) {
+      seed.run(getAddress(s.wallet), s.name, 0, 'seed');
+    }
   }
 
   close(): void {
@@ -286,6 +311,60 @@ export class LoungeDb {
       message: r.message as string,
       createdAt: r.created_at as number,
     }));
+  }
+
+  // ---- resident display names ----
+
+  /**
+   * Claim (or update) a wallet's display name. Returns 'ok', or
+   * 'name_taken' when another wallet already holds the name
+   * (case-insensitive UNIQUE). Only callable after the caller's signature
+   * and residency were verified — this method does no auth itself.
+   */
+  setResidentName(
+    wallet: Address,
+    name: string,
+    claimedAt: number,
+    signature: string,
+  ): 'ok' | 'name_taken' {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO resident_names (wallet, name, claimed_at, signature)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(wallet) DO UPDATE SET
+             name = excluded.name,
+             claimed_at = excluded.claimed_at,
+             signature = excluded.signature`,
+        )
+        .run(getAddress(wallet), name, claimedAt, signature);
+      return 'ok';
+    } catch (e) {
+      if (
+        e instanceof Error &&
+        /UNIQUE constraint failed/i.test(e.message)
+      ) {
+        return 'name_taken';
+      }
+      throw e;
+    }
+  }
+
+  getResidentName(wallet: Address): string | null {
+    const row = this.db
+      .prepare('SELECT name FROM resident_names WHERE wallet = ?')
+      .get(getAddress(wallet)) as { name: string } | undefined;
+    return row ? row.name : null;
+  }
+
+  /** Full wallet -> display-name map for the site. */
+  allResidentNames(): Record<string, string> {
+    const rows = this.db
+      .prepare('SELECT wallet, name FROM resident_names')
+      .all() as { wallet: string; name: string }[];
+    const out: Record<string, string> = {};
+    for (const r of rows) out[r.wallet] = r.name;
+    return out;
   }
 }
 

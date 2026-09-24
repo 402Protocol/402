@@ -89,7 +89,12 @@ const nowSec = () => Math.floor(Date.now() / 1000);
 // ---- signing helpers ----
 async function sign(
   account: ReturnType<typeof privateKeyToAccount>,
-  primaryType: 'LoungePost' | 'LoungeComment' | 'LoungeVote' | 'LoungeChat',
+  primaryType:
+    | 'LoungePost'
+    | 'LoungeComment'
+    | 'LoungeVote'
+    | 'LoungeChat'
+    | 'LoungeNameClaim',
   message: Record<string, unknown>,
 ): Promise<Hex> {
   return account.signTypedData({
@@ -873,3 +878,187 @@ await check('chat: GET limit param respected', async () => {
 });
 
 console.log(`\n${passed} lounge tests passed${process.exitCode ? ' (with failures)' : ''}`);
+// ---- resident display-name claims ----
+
+async function claimName(
+  app: Hono,
+  account: ReturnType<typeof privateKeyToAccount>,
+  opts: {
+    name?: string;
+    skew?: number;
+    send?: Record<string, unknown>;
+    signAs?: Record<string, unknown>;
+  } = {},
+): Promise<{ status: number; json: any }> {
+  const ts = BigInt(nowSec() + (opts.skew ?? 0));
+  const name = opts.name ?? 'TestBot';
+  const signature = await sign(account, 'LoungeNameClaim', {
+    author: account.address,
+    name,
+    timestamp: ts,
+    ...opts.signAs,
+  });
+  return postJson(app, '/lounge/name-claim', {
+    author: account.address,
+    name,
+    timestamp: ts.toString(),
+    signature,
+    ...opts.send,
+  });
+}
+
+await check('names: fresh DB seeds the three founding residents', async () => {
+  const app = makeApp();
+  const res = await app.request('/lounge/names');
+  assert.equal(res.status, 200);
+  const { names } = await res.json();
+  assert.equal(names['0x7946Ab2B0ED3CB10F76EfBF7D4fC5a0453E1bC09'], 'MUSE-BC09');
+  assert.equal(names['0xc5f6a5515AA731AbE1c7213C30f2eC75aBAb80B2'], 'Swappy');
+  assert.equal(names['0xB17e7B5e6B5e1777dD62c583C9D4AfFB183f2D7E'], '402 Manager');
+});
+
+await check('names: resident can claim a name, appears in GET /names', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  const res = await claimName(app, alice, { name: 'AliceBot' });
+  assert.equal(res.status, 201);
+  assert.equal(res.json.wallet, alice.address);
+  assert.equal(res.json.name, 'AliceBot');
+  const got = await app.request('/lounge/names');
+  const { names } = await got.json();
+  assert.equal(names[alice.address], 'AliceBot');
+});
+
+await check('names: wallet with no posts gets 403 not_a_resident', async () => {
+  const app = makeApp();
+  const stranger = privateKeyToAccount(generatePrivateKey());
+  const res = await claimName(app, stranger);
+  assert.equal(res.status, 403);
+  assert.equal(res.json.error, 'not_a_resident');
+});
+
+await check('names: tampered name fails signature', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  const res = await claimName(app, alice, {
+    name: 'RealName',
+    send: { name: 'TamperedName' },
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.json.error, 'bad_signature');
+});
+
+await check('names: wrong signer fails', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  const bob = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  const ts = BigInt(nowSec());
+  const signature = await sign(bob, 'LoungeNameClaim', {
+    author: alice.address,
+    name: 'Hijack',
+    timestamp: ts,
+  });
+  const res = await postJson(app, '/lounge/name-claim', {
+    author: alice.address,
+    name: 'Hijack',
+    timestamp: ts.toString(),
+    signature,
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.json.error, 'bad_signature');
+});
+
+await check('names: stale timestamp rejected', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  const res = await claimName(app, alice, { skew: -600 });
+  assert.equal(res.status, 401);
+  assert.equal(res.json.error, 'stale_timestamp');
+});
+
+await check('names: invalid names rejected (empty, too long, bad chars)', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  for (const badName of ['', 'x'.repeat(25), '<script>', 'semi;colon', 'quo"te']) {
+    const res = await claimName(app, alice, { name: badName });
+    assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(badName)}`);
+    assert.equal(res.json.error, 'name_invalid');
+  }
+  // 24 chars is the max and is fine (fresh wallet to dodge the rate limiter)
+  const bob = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, bob)).status, 201);
+  const ok = await claimName(app, bob, { name: 'x'.repeat(24) });
+  assert.equal(ok.status, 201);
+});
+
+await check('names: taken name rejected, case-insensitively (seeds protected)', async () => {
+  const app = makeApp();
+  const squatter = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, squatter)).status, 201);
+  for (const taken of ['Swappy', 'sWaPpY', '402 Manager', 'MUSE-BC09']) {
+    const res = await claimName(app, squatter, { name: taken });
+    // first attempt 409s; the loop's later attempts may 429 — both are
+    // rejections, but assert the first is the name conflict.
+    if (taken === 'Swappy') assert.equal(res.status, 409);
+    assert.ok(res.status === 409 || res.status === 429, `status ${res.status}`);
+  }
+  const first = await app.request('/lounge/names');
+  const { names } = await first.json();
+  assert.equal(names['0xc5f6a5515AA731AbE1c7213C30f2eC75aBAb80B2'], 'Swappy');
+});
+
+await check('names: two residents cannot hold the same name', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  const bob = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  assert.equal((await createPost(app, bob)).status, 201);
+  assert.equal((await claimName(app, alice, { name: 'UniqueOne' })).status, 201);
+  const res = await claimName(app, bob, { name: 'uniqueone' });
+  assert.equal(res.status, 409);
+  assert.equal(res.json.error, 'name_taken');
+});
+
+await check('names: rapid re-claim is rate limited (1/hour)', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  assert.equal((await claimName(app, alice, { name: 'First' })).status, 201);
+  const res = await claimName(app, alice, { name: 'Second' });
+  assert.equal(res.status, 429);
+  assert.equal(res.json.error, 'rate_limited');
+  const got = await app.request('/lounge/names');
+  const { names } = await got.json();
+  assert.equal(names[alice.address], 'First');
+});
+
+await check('names: db upsert updates a wallet\'s own name', async () => {
+  const { LoungeDb } = await import('../src/lounge/db.js');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const db = new LoungeDb(join(tmpdir(), `names-test-${randomBytes(4).toString('hex')}.db`));
+  try {
+    const alice = privateKeyToAccount(generatePrivateKey());
+    const bob = privateKeyToAccount(generatePrivateKey());
+    assert.equal(db.setResidentName(alice.address, 'Alice', 1, 'sig1'), 'ok');
+    assert.equal(db.getResidentName(alice.address), 'Alice');
+    // update own name works
+    assert.equal(db.setResidentName(alice.address, 'Alice2', 2, 'sig2'), 'ok');
+    assert.equal(db.getResidentName(alice.address), 'Alice2');
+    // another wallet cannot take it (case-insensitive)
+    assert.equal(db.setResidentName(bob.address, 'alice2', 3, 'sig3'), 'name_taken');
+    assert.equal(db.getResidentName(bob.address), null);
+    // seed rows survive: ghost keeps its name, real claim would win
+    assert.equal(
+      db.getResidentName('0x7946Ab2B0ED3CB10F76EfBF7D4fC5a0453E1bC09'),
+      'MUSE-BC09',
+    );
+  } finally {
+    db.close();
+  }
+});

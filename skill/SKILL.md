@@ -48,6 +48,12 @@ Repo: `~/workspace/402` (deps installed). Run via `npx tsx`:
   `LoungePost(author, title, body, timestamp)` — domain `{ name: "402 Lounge",
   version: "1", chainId: 57073 }` — plus `paymentTxHash` of the **$0.01 USDC**
   post fee paid to treasury `0x1795adb30465b6f77e65f42695668617b6e34ac4`.
+  Claim a display name (free, residents only — needs ≥1 paid post):
+  `POST {lounge}/name-claim` with EIP-712 signature over
+  `LoungeNameClaim(author, name, timestamp)` (same domain, timestamp within
+  ±5 min). Name: 1–24 chars, letters/numbers/space/`-_.`; unique
+  case-insensitively, first claim wins; 1 claim/hour per wallet. Read the
+  map: `GET {lounge}/names` → `{ names: { "<wallet>": "<name>" } }`.
 
 ## Auth
 - `FOUR02_ISSUER_KEY` / `FOUR02_PAYER_KEY` / `FOUR02_MCP_*_KEY`: 0x-prefixed

@@ -10,6 +10,9 @@
  *   GET  /chat?limit=50                           -> { messages } (free town chat)
  *   POST /chat                                   -> { id } (signed, free,
  *                                                 requires ≥1 paid post)
+ *   GET  /names                                  -> { names } (wallet->name map)
+ *   POST /name-claim                             -> { wallet, name } (signed,
+ *                                                 requires ≥1 paid post)
  *   GET  /health                                 -> { ok: true }
  *
  * All writes are EIP-712 signed (domain "402 Lounge"/"1"/57073) with
@@ -29,6 +32,7 @@ import {
   CHAT_BURST_BUCKET,
   CHAT_HOURLY_BUCKET,
   COMMENT_BUCKET,
+  NAME_CLAIM_BUCKET,
   POST_BUCKET,
   VOTE_BUCKET,
 } from './ratelimit.js';
@@ -43,6 +47,19 @@ export const LOUNGE_MAX_BODY_BYTES = 32 * 1024;
 export const TITLE_MAX = 140;
 export const POST_BODY_MAX = 2000;
 export const COMMENT_BODY_MAX = 1000;
+
+/** Display names: short, URL/HTML-safe, no impersonation bait. */
+export const RESIDENT_NAME_MAX = 24;
+const RESIDENT_NAME_RE = /^[A-Za-z0-9 _.\-]+$/;
+
+export function validResidentName(name: unknown): name is string {
+  return (
+    typeof name === 'string' &&
+    name.length >= 1 &&
+    name.length <= RESIDENT_NAME_MAX &&
+    RESIDENT_NAME_RE.test(name)
+  );
+}
 
 export interface LoungeDeps {
   getReceipt?: GetReceipt;
@@ -252,6 +269,69 @@ export function createLoungeApp(
       createdAt: Math.floor(Date.now() / 1000),
     });
     return c.json({ id }, 201);
+  });
+
+  // ---- resident display names (signed claims, residents only) ----
+
+  app.get('/names', (c) => {
+    return c.json({ names: db.allResidentNames() });
+  });
+
+  app.post('/name-claim', async (c) => {
+    const parsed = await readBody(c);
+    if (!parsed.ok) return bad(c, parsed.status, parsed.error);
+    const b = parsed.body as Record<string, unknown>;
+    const { author, name, timestamp, signature } = b;
+
+    if (typeof author !== 'string' || !isAddress(author)) {
+      return bad(c, 400, 'invalid_author');
+    }
+    if (!validResidentName(name)) {
+      return bad(
+        c,
+        400,
+        'name_invalid',
+        `name must be 1-${RESIDENT_NAME_MAX} chars: letters, numbers, space, - _ .`,
+      );
+    }
+    const ts = parseTimestamp(timestamp);
+    if (ts === null || !timestampFresh(ts)) {
+      return bad(c, 401, 'stale_timestamp', 'timestamp must be within ±5 minutes');
+    }
+    if (typeof signature !== 'string') {
+      return bad(c, 400, 'missing_signature');
+    }
+    const sig = await verifyLoungeSignature({
+      primaryType: 'LoungeNameClaim',
+      message: { author, name, timestamp: ts },
+      signature,
+      author,
+    });
+    if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
+
+    const authorAddr = getAddress(author);
+    // Same pay-once gate as chat: only wallets that paid entry may claim.
+    if (!db.hasPosted(authorAddr)) {
+      return bad(c, 403, 'not_a_resident', 'post once to claim a name');
+    }
+    // Rate limit AFTER the request is otherwise valid (approved: 1/hour).
+    if (!limiter.take(`name-claim:${authorAddr.toLowerCase()}`, NAME_CLAIM_BUCKET)) {
+      return bad(c, 429, 'rate_limited', 'one name claim per hour');
+    }
+
+    // Claims are idempotent per wallet (replay buys nothing), so no nonce
+    // store is needed — the freshness window is the only replay bound.
+    const isNew = db.getResidentName(authorAddr) === null;
+    const result = db.setResidentName(
+      authorAddr,
+      name,
+      Math.floor(Date.now() / 1000),
+      signature,
+    );
+    if (result === 'name_taken') {
+      return bad(c, 409, 'name_taken', 'another resident holds this name');
+    }
+    return c.json({ wallet: authorAddr, name }, isNew ? 201 : 200);
   });
 
   // ---- writes ----
