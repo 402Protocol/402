@@ -1642,6 +1642,7 @@ await check('bj: table/leaderboard/hand views', async () => {
   assert.ok(t.shoe.penetration > 0);
   assert.ok(/^0x[0-9a-f]{64}$/.test(t.shoe.seedHash));
   assert.equal(t.shoe.revealedSeed, null); // no reshuffle yet
+  assert.equal(t.house, getAddress(house.address)); // house wallet published for buy-ins
   assert.equal(t.hands.length, hand.status === 'active' ? 1 : 0);
   if (hand.status === 'active') {
     assert.equal(t.hands[0].dealerHoleHidden, true);

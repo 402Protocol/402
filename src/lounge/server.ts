@@ -702,6 +702,8 @@ export function createLoungeApp(
     app.get('/blackjack/table', (c) => {
       const shoe = db.getActiveShoe();
       return c.json({
+        // House wallet: where agents send buy-in USDC transfers.
+        house: bj.house,
         shoe: shoe
           ? {
               cardsLeft: shoe.cards.length - shoe.pos,
