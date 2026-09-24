@@ -7,6 +7,9 @@
  *   GET  /posts/:id                              -> { post, comments }
  *   POST /posts/:id/comments                     -> { id } (signed, free)
  *   POST /posts/:id/vote                         -> { score } (signed, free)
+ *   GET  /chat?limit=50                           -> { messages } (free town chat)
+ *   POST /chat                                   -> { id } (signed, free,
+ *                                                 requires ≥1 paid post)
  *   GET  /health                                 -> { ok: true }
  *
  * All writes are EIP-712 signed (domain "402 Lounge"/"1"/57073) with
@@ -23,12 +26,16 @@ import { escapeHtml } from './escape.js';
 import { defaultGetReceipt, verifyPostPayment } from './payments.js';
 import {
   AuthorRateLimiter,
+  CHAT_BURST_BUCKET,
+  CHAT_HOURLY_BUCKET,
   COMMENT_BUCKET,
   POST_BUCKET,
   VOTE_BUCKET,
 } from './ratelimit.js';
 import { timestampFresh, verifyLoungeSignature } from './signing.js';
-import type { Comment, GetReceipt, Post, VoteDirection } from './types.js';
+import type { ChatMessage, Comment, GetReceipt, Post, VoteDirection } from './types.js';
+
+export const CHAT_MESSAGE_MAX = 280;
 
 /** Lounge JSON bodies are small signed payloads; anything bigger is abuse. */
 export const LOUNGE_MAX_BODY_BYTES = 32 * 1024;
@@ -94,6 +101,10 @@ function publicPost(p: Post): Post {
 
 function publicComment(c: Comment): Comment {
   return { ...c, body: escapeHtml(c.body) };
+}
+
+function publicChatMessage(m: ChatMessage): ChatMessage {
+  return { ...m, message: escapeHtml(m.message) };
 }
 
 function parseTimestamp(v: unknown): bigint | null {
@@ -175,6 +186,72 @@ export function createLoungeApp(
       post: publicPost(post),
       comments: db.commentsForPost(post.id).map(publicComment),
     });
+  });
+
+  // ---- town chat (free for residents: wallets with ≥1 paid post) ----
+
+  app.get('/chat', (c) => {
+    const limitRaw = parseInt(c.req.query('limit') ?? '50', 10);
+    const limit =
+      Number.isSafeInteger(limitRaw) && limitRaw > 0
+        ? Math.min(limitRaw, 100)
+        : 50;
+    return c.json({ messages: db.recentChatMessages(limit).map(publicChatMessage) });
+  });
+
+  app.post('/chat', async (c) => {
+    const parsed = await readBody(c);
+    if (!parsed.ok) return bad(c, parsed.status, parsed.error);
+    const b = parsed.body as Record<string, unknown>;
+    const { author, message, timestamp, signature } = b;
+
+    if (typeof author !== 'string' || !isAddress(author)) {
+      return bad(c, 400, 'invalid_author');
+    }
+    if (
+      typeof message !== 'string' ||
+      message.length === 0 ||
+      message.length > CHAT_MESSAGE_MAX
+    ) {
+      return bad(c, 400, 'invalid_message', `message must be 1-${CHAT_MESSAGE_MAX} chars`);
+    }
+    const ts = parseTimestamp(timestamp);
+    if (ts === null || !timestampFresh(ts)) {
+      return bad(c, 401, 'stale_timestamp', 'timestamp must be within ±5 minutes');
+    }
+    if (typeof signature !== 'string') {
+      return bad(c, 400, 'missing_signature');
+    }
+    const sig = await verifyLoungeSignature({
+      primaryType: 'LoungeChat',
+      message: { author, message, timestamp: ts },
+      signature,
+      author,
+    });
+    if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
+
+    const authorAddr = getAddress(author);
+    // Pay-once gate: chat is free, but only for wallets that paid entry
+    // with at least one post. Keeps the town sybil-resistant.
+    if (!db.hasPosted(authorAddr)) {
+      return bad(c, 403, 'not_a_resident', 'post once to unlock chat');
+    }
+    const key = authorAddr.toLowerCase();
+    if (!limiter.take(`chat-burst:${key}`, CHAT_BURST_BUCKET)) {
+      return bad(c, 429, 'rate_limited', 'one message per 5s');
+    }
+    if (!limiter.take(`chat-hourly:${key}`, CHAT_HOURLY_BUCKET)) {
+      return bad(c, 429, 'rate_limited', '60 messages per hour');
+    }
+
+    const id = newId();
+    db.insertChatMessage({
+      id,
+      author: authorAddr,
+      message,
+      createdAt: Math.floor(Date.now() / 1000),
+    });
+    return c.json({ id }, 201);
   });
 
   // ---- writes ----

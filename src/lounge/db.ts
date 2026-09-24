@@ -1,15 +1,15 @@
 /**
  * 402 Lounge — SQLite storage (node:sqlite, DatabaseSync).
  *
- * Tables: posts, comments, votes, used_payments. Synchronous API, single
- * process — all multi-step mutations run inside transactions so vote
- * counters and comment counts can't drift from their source rows.
+ * Tables: posts, comments, votes, used_payments, chat_messages. Synchronous
+ * API, single process — all multi-step mutations run inside transactions so
+ * vote counters and comment counts can't drift from their source rows.
  */
 import { DatabaseSync } from 'node:sqlite';
 import { dirname } from 'node:path';
 import { mkdirSync } from 'node:fs';
-import type { Address } from 'viem';
-import type { Comment, Post, VoteDirection } from './types.js';
+import { type Address, getAddress } from 'viem';
+import type { ChatMessage, Comment, Post, VoteDirection } from './types.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS posts (
@@ -42,8 +42,15 @@ CREATE TABLE IF NOT EXISTS used_payments (
   post_id TEXT NOT NULL,
   used_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id TEXT PRIMARY KEY,
+  author TEXT NOT NULL,
+  message TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_at);
+CREATE INDEX IF NOT EXISTS idx_chat_created ON chat_messages(created_at);
 `;
 
 export class LoungeDb {
@@ -241,6 +248,44 @@ export class LoungeDb {
       .prepare('SELECT 1 FROM used_payments WHERE tx_hash = ?')
       .get(txHash.toLowerCase()) as unknown;
     return row !== undefined;
+  }
+
+  // ---- town chat ----
+
+  /** Pay-once gate: true when the wallet has at least one paid post. */
+  hasPosted(author: Address): boolean {
+    const row = this.db
+      .prepare('SELECT 1 FROM posts WHERE author = ? LIMIT 1')
+      .get(getAddress(author)) as unknown;
+    return row !== undefined;
+  }
+
+  insertChatMessage(m: {
+    id: string;
+    author: Address;
+    message: string;
+    createdAt: number;
+  }): void {
+    this.db
+      .prepare(
+        'INSERT INTO chat_messages (id, author, message, created_at) VALUES (?, ?, ?, ?)',
+      )
+      .run(m.id, m.author, m.message, m.createdAt);
+  }
+
+  /** Recent chat, oldest first (newest last) for bubble/log rendering. */
+  recentChatMessages(limit: number): ChatMessage[] {
+    const rows = this.db
+      .prepare(
+        'SELECT * FROM chat_messages ORDER BY created_at DESC, rowid DESC LIMIT ?',
+      )
+      .all(limit) as Record<string, unknown>[];
+    return rows.reverse().map((r) => ({
+      id: r.id as string,
+      author: r.author as Address,
+      message: r.message as string,
+      createdAt: r.created_at as number,
+    }));
   }
 }
 

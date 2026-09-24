@@ -89,7 +89,7 @@ const nowSec = () => Math.floor(Date.now() / 1000);
 // ---- signing helpers ----
 async function sign(
   account: ReturnType<typeof privateKeyToAccount>,
-  primaryType: 'LoungePost' | 'LoungeComment' | 'LoungeVote',
+  primaryType: 'LoungePost' | 'LoungeComment' | 'LoungeVote' | 'LoungeChat',
   message: Record<string, unknown>,
 ): Promise<Hex> {
   return account.signTypedData({
@@ -725,6 +725,151 @@ await check('mount: facilitator createApp mounts /lounge when configured', async
 await check('mount: no /lounge routes without lounge config', async () => {
   const app = createApp(loadConfig(), new NonceStore());
   assert.equal((await app.request('/lounge/health')).status, 404);
+});
+
+// ---- town chat ----
+
+/** Helper: sign + POST a chat message as account. */
+async function sendChat(
+  app: Hono,
+  account: ReturnType<typeof privateKeyToAccount>,
+  opts: {
+    message?: string;
+    skew?: number;
+    send?: Record<string, unknown>;
+    signAs?: Record<string, unknown>;
+  } = {},
+): Promise<{ status: number; json: any }> {
+  const ts = BigInt(nowSec() + (opts.skew ?? 0));
+  const message = opts.message ?? 'hey town';
+  const signature = await sign(account, 'LoungeChat', {
+    author: account.address,
+    message,
+    timestamp: ts,
+    ...opts.signAs,
+  });
+  return postJson(app, '/lounge/chat', {
+    author: account.address,
+    message,
+    timestamp: ts.toString(),
+    signature,
+    ...opts.send,
+  });
+}
+
+await check('chat: resident with a paid post can send a signed message', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  const posted = await createPost(app, alice);
+  assert.equal(posted.status, 201);
+  const res = await sendChat(app, alice, { message: 'hello neighbors' });
+  assert.equal(res.status, 201);
+  assert.match(res.json.id, /^[0-9a-f]{32}$/);
+});
+
+await check('chat: wallet with no posts gets 403 not_a_resident', async () => {
+  const app = makeApp();
+  const stranger = privateKeyToAccount(generatePrivateKey());
+  const res = await sendChat(app, stranger);
+  assert.equal(res.status, 403);
+  assert.equal(res.json.error, 'not_a_resident');
+});
+
+await check('chat: tampered message fails signature', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  const res = await sendChat(app, alice, {
+    message: 'real message',
+    send: { message: 'tampered message' },
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.json.error, 'bad_signature');
+});
+
+await check('chat: wrong signer fails', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  const bob = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  const ts = BigInt(nowSec());
+  const signature = await sign(bob, 'LoungeChat', {
+    author: alice.address,
+    message: 'impersonating',
+    timestamp: ts,
+  });
+  const res = await postJson(app, '/lounge/chat', {
+    author: alice.address,
+    message: 'impersonating',
+    timestamp: ts.toString(),
+    signature,
+  });
+  assert.equal(res.status, 401);
+});
+
+await check('chat: message length enforced (empty, too long)', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  assert.equal((await sendChat(app, alice, { message: '' })).status, 400);
+  assert.equal((await sendChat(app, alice, { message: 'x'.repeat(281) })).status, 400);
+  assert.equal((await sendChat(app, alice, { message: 'x'.repeat(280) })).status, 201);
+});
+
+await check('chat: stale timestamp rejected', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  const res = await sendChat(app, alice, { skew: -600 });
+  assert.equal(res.status, 401);
+  assert.equal(res.json.error, 'stale_timestamp');
+});
+
+await check('chat: burst rate limit (1 per 5s)', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  assert.equal((await sendChat(app, alice, { message: 'one' })).status, 201);
+  const res = await sendChat(app, alice, { message: 'two' });
+  assert.equal(res.status, 429);
+  assert.equal(res.json.error, 'rate_limited');
+});
+
+await check('chat: GET returns messages oldest-first, HTML-escaped', async () => {
+  const app = makeApp();
+  const alice = privateKeyToAccount(generatePrivateKey());
+  const bob = privateKeyToAccount(generatePrivateKey());
+  assert.equal((await createPost(app, alice)).status, 201);
+  assert.equal((await createPost(app, bob)).status, 201);
+  // bypass the 5s burst limit by spacing via distinct apps is overkill;
+  // instead send from two different authors (separate burst buckets).
+  assert.equal((await sendChat(app, alice, { message: 'first <b>hi</b>' })).status, 201);
+  assert.equal((await sendChat(app, bob, { message: 'second' })).status, 201);
+  const res = await app.request('/lounge/chat?limit=50');
+  assert.equal(res.status, 200);
+  const { messages } = await res.json();
+  assert.equal(messages.length, 2);
+  assert.equal(messages[0].message, 'first &lt;b&gt;hi&lt;/b&gt;');
+  assert.equal(messages[1].message, 'second');
+  assert.ok(messages[0].createdAt <= messages[1].createdAt);
+  assert.equal(messages[0].author, alice.address);
+});
+
+await check('chat: GET limit param respected', async () => {
+  const app = makeApp();
+  const authors = [
+    privateKeyToAccount(generatePrivateKey()),
+    privateKeyToAccount(generatePrivateKey()),
+    privateKeyToAccount(generatePrivateKey()),
+  ];
+  for (const a of authors) {
+    assert.equal((await createPost(app, a)).status, 201);
+    assert.equal((await sendChat(app, a)).status, 201);
+  }
+  const res = await app.request('/lounge/chat?limit=2');
+  assert.equal((await res.json()).messages.length, 2);
+  const bad = await app.request('/lounge/chat?limit=999');
+  assert.equal((await bad.json()).messages.length, 3); // capped at 100, only 3 exist
 });
 
 console.log(`\n${passed} lounge tests passed${process.exitCode ? ' (with failures)' : ''}`);

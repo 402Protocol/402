@@ -13,6 +13,9 @@ export interface AuthorBucket {
 export const POST_BUCKET: AuthorBucket = { windowMs: 60_000, max: 1 };
 export const COMMENT_BUCKET: AuthorBucket = { windowMs: 60_000, max: 5 };
 export const VOTE_BUCKET: AuthorBucket = { windowMs: 60_000, max: 20 };
+/** Town chat: snappy but spam-proof — 1 per 5s burst, 60 per hour. */
+export const CHAT_BURST_BUCKET: AuthorBucket = { windowMs: 5_000, max: 1 };
+export const CHAT_HOURLY_BUCKET: AuthorBucket = { windowMs: 3_600_000, max: 60 };
 
 export class AuthorRateLimiter {
   private hits = new Map<string, { count: number; resetAt: number }>();

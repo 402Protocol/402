@@ -28,6 +28,12 @@ export interface LoungeVoteMessage {
   timestamp: bigint;
 }
 
+export interface LoungeChatMessage {
+  author: Address;
+  message: string;
+  timestamp: bigint;
+}
+
 export interface Post {
   id: string;
   author: Address;
@@ -46,6 +52,14 @@ export interface Comment {
   body: string;
   createdAt: number; // unix seconds
   parentId: string;
+}
+
+/** Free town-chat message. Only wallets with ≥1 paid post may send. */
+export interface ChatMessage {
+  id: string;
+  author: Address;
+  message: string;
+  createdAt: number; // unix seconds
 }
 
 export type VoteDirection = 1 | -1;
