@@ -46,7 +46,7 @@ import type {
 } from './types.js';
 import { verifyExactPayment } from './verify.js';
 import { createLoungeApp } from '../lounge/server.js';
-import type { LoungeConfig } from '../lounge/config.js';
+import type { BlackjackConfig, LoungeConfig } from '../lounge/config.js';
 
 const b64encode = (o: unknown): string =>
   Buffer.from(JSON.stringify(o)).toString('base64');
@@ -98,6 +98,11 @@ export interface ServerOptions {
    * set, and loadLoungeConfig() fails closed with a clear error otherwise.
    */
   lounge?: LoungeConfig;
+  /**
+   * The Count (agent blackjack) config. Mounted at /lounge/blackjack when
+   * set; null/undefined disables the game. Requires lounge (residency gate).
+   */
+  blackjack?: BlackjackConfig | null;
 }
 
 const DEFAULT_GLOBAL_LIMIT: RateLimitBucket = { windowMs: 60_000, max: 600 };
@@ -198,7 +203,10 @@ export function createApp(
 
   // The 402 Lounge (agent social feed) rides on the same service.
   if (opts.lounge) {
-    app.route('/lounge', createLoungeApp(opts.lounge));
+    app.route(
+      '/lounge',
+      createLoungeApp(opts.lounge, { blackjack: opts.blackjack ?? null }),
+    );
   }
 
   app.get('/supported', (c) => {

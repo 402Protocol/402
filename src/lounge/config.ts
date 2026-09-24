@@ -6,7 +6,7 @@
  * the config without it throws a clear error at startup (fail closed — we
  * must never accept a post payment to an unknown recipient).
  */
-import { type Address, getAddress, isAddress, parseUnits } from 'viem';
+import { type Address, type Hex, getAddress, isAddress, parseUnits } from 'viem';
 import { INK_RPC_URL, USDC_DECIMALS } from '../constants.js';
 
 export interface LoungeConfig {
@@ -49,5 +49,71 @@ export function loadLoungeConfig(
     postFeeUnits: parseUnits(postFeeUsdc, USDC_DECIMALS),
     rpcUrl: env.INK_RPC_URL ?? INK_RPC_URL,
     dbPath: env.LOUNGE_DB_PATH ?? './lounge.db',
+  };
+}
+
+// ---- The Count (agent blackjack) ----
+
+export interface BlackjackConfig {
+  /** Ink address receiving buy-ins and sending cash-outs. */
+  house: Address;
+  /** House private key for cash-out relay. Absent -> cash-outs 503. */
+  houseKey?: Hex;
+  /** Min/max bet in USDC base units. */
+  minBetUnits: bigint;
+  maxBetUnits: bigint;
+  /** True unless FOUR02_DRY_RUN=false: cash-outs never broadcast in dry-run. */
+  dryRun: boolean;
+  /** Ink RPC used for the cash-out relay. */
+  rpcUrl: string;
+}
+
+export const DEFAULT_MIN_BET_USDC = '0.01';
+export const DEFAULT_MAX_BET_USDC = '1.00';
+
+/** Minimum buy-in: $0.10 USDC in base units. */
+export const MIN_BUYIN_UNITS = 100_000n;
+
+function isValidHouseKey(k: unknown): k is Hex {
+  return typeof k === 'string' && /^0x[0-9a-fA-F]{64}$/.test(k);
+}
+
+/**
+ * Load the blackjack config. Returns null when BLACKJACK_HOUSE is unset —
+ * the game is disabled and no /blackjack routes are mounted. Throws (fail
+ * closed) on a malformed house address, key, or bet bounds.
+ */
+export function loadBlackjackConfig(
+  env: Record<string, string | undefined> = process.env,
+): BlackjackConfig | null {
+  const house = env.BLACKJACK_HOUSE;
+  if (!house) return null;
+  if (!isAddress(house)) {
+    throw new Error('BLACKJACK_HOUSE is not a valid Ethereum address');
+  }
+  const houseKey = env.FOUR02_HOUSE_KEY;
+  if (houseKey !== undefined && !isValidHouseKey(houseKey)) {
+    throw new Error('FOUR02_HOUSE_KEY must be a 0x-prefixed 32-byte hex key');
+  }
+  const amountRe = /^\d+(\.\d{1,6})?$/;
+  const minBetUsdc = env.BLACKJACK_MIN_BET_USDC ?? DEFAULT_MIN_BET_USDC;
+  const maxBetUsdc = env.BLACKJACK_MAX_BET_USDC ?? DEFAULT_MAX_BET_USDC;
+  if (!amountRe.test(minBetUsdc) || !amountRe.test(maxBetUsdc)) {
+    throw new Error(
+      'BLACKJACK_MIN_BET_USDC / BLACKJACK_MAX_BET_USDC must be decimals like "0.01" (max 6 decimals)',
+    );
+  }
+  const minBetUnits = parseUnits(minBetUsdc, USDC_DECIMALS);
+  const maxBetUnits = parseUnits(maxBetUsdc, USDC_DECIMALS);
+  if (minBetUnits <= 0n || maxBetUnits < minBetUnits) {
+    throw new Error('blackjack min bet must be positive and <= max bet');
+  }
+  return {
+    house: getAddress(house),
+    houseKey: houseKey as Hex | undefined,
+    minBetUnits,
+    maxBetUnits,
+    dryRun: env.FOUR02_DRY_RUN !== 'false',
+    rpcUrl: env.INK_RPC_URL ?? INK_RPC_URL,
   };
 }

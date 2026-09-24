@@ -41,6 +41,20 @@ export interface LoungeNameClaimMessage {
   timestamp: bigint;
 }
 
+/**
+ * Signed blackjack action (The Count). Only wallets with ≥1 paid post may
+ * play. action ∈ buy_in | bet | hit | stand | double | cash_out.
+ * handId is '' for buy_in/bet/cash_out; amount is the bet/buy-in/cash-out
+ * in base units, 0 for hit/stand.
+ */
+export interface BlackjackActionMessage {
+  author: Address;
+  action: string;
+  handId: string;
+  amount: bigint;
+  timestamp: bigint;
+}
+
 export interface Post {
   id: string;
   author: Address;

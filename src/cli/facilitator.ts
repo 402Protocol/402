@@ -19,6 +19,14 @@
  *   LOUNGE_POST_FEE_USDC   lounge post fee in USDC, default "0.01".
  *   LOUNGE_DB_PATH         SQLite file for the lounge, default "./lounge.db".
  *   INK_RPC_URL            Ink RPC for lounge payment verification.
+ *   BLACKJACK_HOUSE        Ink address receiving buy-ins / paying cash-outs.
+ *                         When set (with LOUNGE_TREASURY), /lounge/blackjack
+ *                         (The Count) is mounted. Unset = game disabled.
+ *   FOUR02_HOUSE_KEY       house key for cash-out relay. Unset = cash-outs
+ *                         503 (chips stay in the DB until the founder
+ *                         enables payouts with FOUR02_DRY_RUN=false).
+ *   BLACKJACK_MIN_BET_USDC min bet, default "0.01".
+ *   BLACKJACK_MAX_BET_USDC max bet, default "1.00".
  *
  * The founder holds all production keys and runs deploys. This CLI only reads
  * keys from the environment — it never prints, stores, or transmits them.
@@ -30,6 +38,7 @@ import { NonceStore } from '../facilitator/nonces.js';
 import { createApp } from '../facilitator/server.js';
 import { settlerAddress } from '../facilitator/settle.js';
 import { loadLoungeConfig, type LoungeConfig } from '../lounge/config.js';
+import { loadBlackjackConfig, type BlackjackConfig } from '../lounge/config.js';
 
 const config = loadConfig();
 
@@ -40,7 +49,11 @@ let lounge: LoungeConfig | undefined;
 if (process.env.LOUNGE_TREASURY) {
   lounge = loadLoungeConfig();
 }
-const app = createApp(config, new NonceStore(), { lounge });
+// The Count is opt-in on top of the lounge: BLACKJACK_HOUSE set =>
+// mounted at /lounge/blackjack. No lounge = no game (residency gate).
+const blackjack: BlackjackConfig | null =
+  lounge ? loadBlackjackConfig() : null;
+const app = createApp(config, new NonceStore(), { lounge, blackjack });
 
 console.log('402 facilitator — x402 v2, exact/EVM');
 console.log(`  chains  : ${Object.values(CHAINS).map((c) => c.caip2).join(', ')}`);
@@ -57,6 +70,13 @@ console.log(
 );
 console.log(
   `  lounge  : ${lounge ? `/lounge enabled -> treasury ${lounge.treasury} (fee ${lounge.postFeeUsdc} USDC)` : 'not configured (set LOUNGE_TREASURY to enable /lounge)'}`,
+);
+console.log(
+  `  blackjack: ${
+    blackjack
+      ? `/lounge/blackjack enabled -> house ${blackjack.house} (cash-outs ${blackjack.houseKey && !blackjack.dryRun ? 'LIVE' : 'disabled — 503 until FOUR02_HOUSE_KEY is set and FOUR02_DRY_RUN=false'})`
+      : 'not configured (set BLACKJACK_HOUSE to enable The Count)'
+  }`,
 );
 
 serve({ fetch: app.fetch, port: config.port }, (info) => {

@@ -22,13 +22,53 @@
 import { randomBytes } from 'node:crypto';
 import { Hono, type Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
-import { type Address, getAddress, isAddress } from 'viem';
-import type { LoungeConfig } from './config.js';
-import { LoungeDb, type PostRow } from './db.js';
+import {
+  type Address,
+  type Hex,
+  createPublicClient,
+  createWalletClient,
+  getAddress,
+  http,
+  isAddress,
+} from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { INK_CONFIG } from '../facilitator/chains.js';
+import {
+  EIP3009_TYPES,
+  eip3009Domain,
+  randomNonce,
+  splitSignature,
+  usdcEip3009Abi,
+  viemChain,
+} from '../facilitator/eip3009.js';
+import type { BlackjackConfig, LoungeConfig } from './config.js';
+import { MIN_BUYIN_UNITS } from './config.js';
+import {
+  RESHUFFLE_PENETRATION,
+  dealHand,
+  dealerPlay,
+  drawCard,
+  handValue,
+  isBlackjack,
+  newShoe,
+  resolve,
+  seedHash,
+  type Card,
+  type HandStatus,
+} from './blackjack.js';
+import {
+  LoungeDb,
+  type BlackjackHandRow,
+  type PostRow,
+  type ShoeRollover,
+} from './db.js';
 import { escapeHtml } from './escape.js';
-import { defaultGetReceipt, verifyPostPayment } from './payments.js';
+import { defaultGetReceipt, verifyPostPayment, verifyTransferPayment } from './payments.js';
 import {
   AuthorRateLimiter,
+  BLACKJACK_BUYIN_BUCKET,
+  BLACKJACK_CASHOUT_BUCKET,
+  BLACKJACK_GAME_BUCKET,
   CHAT_BURST_BUCKET,
   CHAT_HOURLY_BUCKET,
   COMMENT_BUCKET,
@@ -63,6 +103,11 @@ export function validResidentName(name: unknown): name is string {
 
 export interface LoungeDeps {
   getReceipt?: GetReceipt;
+  /**
+   * The Count (agent blackjack) config. When set, the game routes are
+   * mounted at /blackjack. Null/undefined disables the game entirely.
+   */
+  blackjack?: BlackjackConfig | null;
 }
 
 type Sort = 'hot' | 'new' | 'top';
@@ -507,5 +552,582 @@ export function createLoungeApp(
     return c.json({ score: upvotes - downvotes });
   });
 
+  // ---- the count: agent blackjack ----
+
+  const bj = deps.blackjack ?? null;
+  if (bj) {
+    /** Amounts arrive as JSON numbers or decimal strings; cap at 2^53-1. */
+    const parseAmount = (v: unknown): bigint | null => {
+      if (typeof v === 'number') {
+        if (!Number.isSafeInteger(v) || v < 0) return null;
+        return BigInt(v);
+      }
+      if (typeof v === 'string') {
+        const s = v.trim();
+        if (!/^\d+$/.test(s)) return null;
+        try {
+          const b = BigInt(s);
+          return b <= BigInt(Number.MAX_SAFE_INTEGER) ? b : null;
+        } catch {
+          return null;
+        }
+      }
+      return null;
+    };
+
+    /**
+     * Verify a BlackjackAction signature + the pay-once residency gate.
+     * Returns the checksummed author, or a ready-made error response.
+     */
+    const bjAuth = async (
+      c: Context,
+      body: Record<string, unknown>,
+      action: 'buy_in' | 'bet' | 'hit' | 'stand' | 'double' | 'cash_out',
+    ): Promise<
+      | { ok: true; author: Address; amount: bigint; handId: string }
+      | { ok: false; res: Response }
+    > => {
+      const { author, handId, amount, timestamp, signature } = body;
+      if (typeof author !== 'string' || !isAddress(author)) {
+        return { ok: false, res: bad(c, 400, 'invalid_author') };
+      }
+      const hid = handId === undefined ? '' : handId;
+      if (typeof hid !== 'string') {
+        return { ok: false, res: bad(c, 400, 'invalid_hand_id') };
+      }
+      const amt = amount === undefined ? 0n : parseAmount(amount);
+      if (amt === null) {
+        return { ok: false, res: bad(c, 400, 'invalid_amount') };
+      }
+      const ts = parseTimestamp(timestamp);
+      if (ts === null || !timestampFresh(ts)) {
+        return { ok: false, res: bad(c, 401, 'stale_timestamp', 'timestamp must be within ±5 minutes') };
+      }
+      if (typeof signature !== 'string') {
+        return { ok: false, res: bad(c, 400, 'missing_signature') };
+      }
+      const sig = await verifyLoungeSignature({
+        primaryType: 'BlackjackAction',
+        message: { author, action, handId: hid, amount: amt, timestamp: ts },
+        signature,
+        author,
+      });
+      if (!sig.ok) return { ok: false, res: bad(c, 401, 'bad_signature', sig.reason) };
+      const authorAddr = getAddress(author);
+      if (!db.hasPosted(authorAddr)) {
+        return { ok: false, res: bad(c, 403, 'not_a_resident', 'post once to play at The Count') };
+      }
+      return { ok: true, author: authorAddr, amount: amt, handId: hid };
+    };
+
+    /** Public hand view: the dealer's hole card stays hidden while active. */
+    const publicHand = (h: BlackjackHandRow): Record<string, unknown> => {
+      const player = JSON.parse(h.playerJson) as Card[];
+      const dealer = JSON.parse(h.dealerJson) as Card[];
+      const holeHidden = h.status === 'active';
+      return {
+        id: h.id,
+        wallet: h.wallet,
+        bet: h.bet.toString(),
+        player,
+        dealer: holeHidden ? [dealer[0]] : dealer,
+        dealerHoleHidden: holeHidden,
+        status: h.status,
+        payout: h.payout === null ? null : h.payout.toString(),
+        createdAt: h.createdAt,
+        resolvedAt: h.resolvedAt,
+      };
+    };
+
+    /**
+     * Fetch the active shoe, rolling over (reveal old seed, mint a fresh
+     * shoe) when penetration hits 75% or the shoe is nearly exhausted.
+     * The rollover is returned for the caller's transaction — nothing is
+     * written here.
+     */
+    const prepareShoeForDeal = (): {
+      shoeId: string;
+      cards: Card[];
+      pos: number;
+      rollover: ShoeRollover | null;
+    } => {
+      const existing = db.getActiveShoe();
+      const exhausted =
+        !existing ||
+        existing.pos / existing.cards.length >= RESHUFFLE_PENETRATION ||
+        existing.pos + 16 > existing.cards.length;
+      if (!exhausted) {
+        return { shoeId: existing.id, cards: existing.cards, pos: existing.pos, rollover: null };
+      }
+      const seed = `0x${randomBytes(32).toString('hex')}` as Hex;
+      const cards = newShoe(seed);
+      return {
+        shoeId: newId(),
+        cards,
+        pos: 0,
+        rollover: {
+          oldShoeId: existing?.id ?? null,
+          revealedSeed: existing?.seed ?? null,
+          newSeed: seed,
+          newSeedHash: seedHash(seed),
+          newCardsJson: JSON.stringify(cards),
+        },
+      };
+    };
+
+    const gameLimited = (c: Context, author: Address): Response | null => {
+      if (!limiter.take(`bj-game:${author.toLowerCase()}`, BLACKJACK_GAME_BUCKET)) {
+        return bad(c, 429, 'rate_limited', '60 game actions per minute');
+      }
+      return null;
+    };
+
+    /** Load an active hand owned by the author, or an error response. */
+    const activeOwnedHand = (
+      c: Context,
+      handId: string,
+      author: Address,
+    ): { ok: true; hand: BlackjackHandRow } | { ok: false; res: Response } => {
+      const hand = db.getHand(handId);
+      if (!hand) return { ok: false, res: bad(c, 404, 'hand_not_found') };
+      if (getAddress(hand.wallet) !== author) {
+        return { ok: false, res: bad(c, 403, 'not_your_hand') };
+      }
+      if (hand.status !== 'active') {
+        return { ok: false, res: bad(c, 409, 'hand_not_active') };
+      }
+      return { ok: true, hand };
+    };
+
+    app.get('/blackjack/table', (c) => {
+      const shoe = db.getActiveShoe();
+      return c.json({
+        shoe: shoe
+          ? {
+              cardsLeft: shoe.cards.length - shoe.pos,
+              penetration: shoe.pos / shoe.cards.length,
+              seedHash: shoe.seedHash,
+              revealedSeed: db.lastRevealedSeed(),
+            }
+          : null,
+        hands: db.activeHands().map(publicHand),
+        recent: db.recentResolvedHands(20).map(publicHand),
+      });
+    });
+
+    app.get('/blackjack/chips/:wallet', (c) => {
+      const w = c.req.param('wallet');
+      if (!isAddress(w)) return bad(c, 400, 'invalid_wallet');
+      const wallet = getAddress(w);
+      return c.json({ wallet, chips: db.getChips(wallet).toString() });
+    });
+
+    app.get('/blackjack/leaderboard', (c) => {
+      return c.json({
+        leaders: db.leaderboard(25).map((l) => ({
+          wallet: l.wallet,
+          chips: l.chips.toString(),
+          net: l.net.toString(),
+        })),
+      });
+    });
+
+    app.get('/blackjack/hand/:id', (c) => {
+      const hand = db.getHand(c.req.param('id'));
+      if (!hand) return bad(c, 404, 'hand_not_found');
+      return c.json({ hand: publicHand(hand) });
+    });
+
+    app.post('/blackjack/buy-in', async (c) => {
+      const parsed = await readBody(c);
+      if (!parsed.ok) return bad(c, parsed.status, parsed.error);
+      const b = parsed.body as Record<string, unknown>;
+      const auth = await bjAuth(c, b, 'buy_in');
+      if (!auth.ok) return auth.res;
+      if (auth.handId !== '') return bad(c, 400, 'unexpected_hand_id');
+      const { author, amount } = auth;
+      if (typeof b.txHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(b.txHash)) {
+        return bad(c, 400, 'invalid_tx_hash');
+      }
+      if (amount < MIN_BUYIN_UNITS) {
+        return bad(c, 400, 'buyin_too_small', 'minimum buy-in is $0.10 USDC');
+      }
+      // Rate limit AFTER the request is otherwise valid.
+      if (!limiter.take(`bj-buyin:${author.toLowerCase()}`, BLACKJACK_BUYIN_BUCKET)) {
+        return bad(c, 429, 'rate_limited', '10 buy-ins per minute');
+      }
+      // Verify the receipt: Transfer(author -> house, value >= amount).
+      // Read-only — nothing is broadcast here.
+      const paid = await verifyTransferPayment({
+        getReceipt,
+        txHash: b.txHash,
+        from: author,
+        to: bj.house,
+        minUnits: amount,
+      });
+      if (!paid.ok) {
+        const status = paid.reason === 'malformed_tx_hash' ? 400 : 402;
+        return bad(c, status, 'payment_invalid', paid.reason);
+      }
+      const now = Math.floor(Date.now() / 1000);
+      const res = db.creditBuyin(b.txHash, author, amount, now);
+      if (res === 'replay') return bad(c, 409, 'buyin_reused');
+      return c.json({ chips: db.getChips(author).toString() }, 201);
+    });
+
+    app.post('/blackjack/bet', async (c) => {
+      const parsed = await readBody(c);
+      if (!parsed.ok) return bad(c, parsed.status, parsed.error);
+      const b = parsed.body as Record<string, unknown>;
+      const auth = await bjAuth(c, b, 'bet');
+      if (!auth.ok) return auth.res;
+      if (auth.handId !== '') return bad(c, 400, 'unexpected_hand_id');
+      const { author, amount } = auth;
+      if (amount <= 0n) return bad(c, 400, 'invalid_amount');
+      if (amount < bj.minBetUnits || amount > bj.maxBetUnits) {
+        return bad(
+          c,
+          400,
+          'bet_out_of_range',
+          `bet must be ${bj.minBetUnits}–${bj.maxBetUnits} base units`,
+        );
+      }
+      const limited = gameLimited(c, author);
+      if (limited) return limited;
+
+      const now = Math.floor(Date.now() / 1000);
+      const prep = prepareShoeForDeal();
+      let dealt: { player: Card[]; dealer: Card[]; pos: number };
+      try {
+        dealt = dealHand(prep.cards, prep.pos);
+      } catch {
+        return bad(c, 503, 'shoe_exhausted', 'the shoe is empty; try again');
+      }
+      // Naturals resolve immediately — no player actions on a peeked hand.
+      let status: HandStatus = 'active';
+      let payout: bigint | null = null;
+      let resolvedAt: number | null = null;
+      if (isBlackjack(dealt.player) || isBlackjack(dealt.dealer)) {
+        const r = resolve(dealt.player, dealt.dealer, amount);
+        status = r.status;
+        payout = r.payout;
+        resolvedAt = now;
+      }
+      const handId = newId();
+      const res = db.placeBet({
+        wallet: author,
+        bet: amount,
+        handId,
+        playerJson: JSON.stringify(dealt.player),
+        dealerJson: JSON.stringify(dealt.dealer),
+        status,
+        payout,
+        resolvedAt,
+        now,
+        shoeId: prep.shoeId,
+        newPos: dealt.pos,
+        rollover: prep.rollover,
+      });
+      if (res === 'active_hand') return bad(c, 409, 'hand_already_active');
+      if (res === 'insufficient_chips') return bad(c, 402, 'insufficient_chips');
+      const hand = db.getHand(handId);
+      if (!hand) return bad(c, 500, 'internal_error');
+      return c.json({ hand: publicHand(hand) }, 201);
+    });
+
+    app.post('/blackjack/hit', async (c) => {
+      const parsed = await readBody(c);
+      if (!parsed.ok) return bad(c, parsed.status, parsed.error);
+      const b = parsed.body as Record<string, unknown>;
+      const auth = await bjAuth(c, b, 'hit');
+      if (!auth.ok) return auth.res;
+      if (!auth.handId) return bad(c, 400, 'missing_hand_id');
+      if (auth.amount !== 0n) return bad(c, 400, 'invalid_amount');
+      const { author, handId } = auth;
+      const owned = activeOwnedHand(c, handId, author);
+      if (!owned.ok) return owned.res;
+      const limited = gameLimited(c, author);
+      if (limited) return limited;
+
+      const now = Math.floor(Date.now() / 1000);
+      const prep = prepareShoeForDeal();
+      const player = JSON.parse(owned.hand.playerJson) as Card[];
+      const dealer = JSON.parse(owned.hand.dealerJson) as Card[];
+      let drawn: { card: Card; pos: number };
+      try {
+        drawn = drawCard(prep.cards, prep.pos);
+      } catch {
+        return bad(c, 503, 'shoe_exhausted', 'the shoe is empty; try again');
+      }
+      const newPlayer = [...player, drawn.card];
+      const pv = handValue(newPlayer);
+      let status: HandStatus = 'active';
+      let payout: bigint | null = null;
+      let resolvedAt: number | null = null;
+      let finalDealer = dealer;
+      let finalPos = drawn.pos;
+      if (pv > 21) {
+        status = 'bust';
+        payout = 0n;
+        resolvedAt = now;
+      } else if (pv === 21) {
+        // 21 from a hit stands automatically — the dealer plays out.
+        const dp = dealerPlay(dealer, prep.cards, drawn.pos);
+        finalDealer = dp.dealer;
+        finalPos = dp.pos;
+        const r = resolve(newPlayer, finalDealer, owned.hand.bet);
+        status = r.status;
+        payout = r.payout;
+        resolvedAt = now;
+      }
+      const res = db.progressHand({
+        handId,
+        playerJson: JSON.stringify(newPlayer),
+        dealerJson: JSON.stringify(finalDealer),
+        status,
+        payout,
+        resolvedAt,
+        shoeId: prep.shoeId,
+        newPos: finalPos,
+        now,
+      });
+      if (res === 'not_active') return bad(c, 409, 'hand_not_active');
+      const hand = db.getHand(handId);
+      if (!hand) return bad(c, 500, 'internal_error');
+      return c.json({ hand: publicHand(hand) });
+    });
+
+    app.post('/blackjack/stand', async (c) => {
+      const parsed = await readBody(c);
+      if (!parsed.ok) return bad(c, parsed.status, parsed.error);
+      const b = parsed.body as Record<string, unknown>;
+      const auth = await bjAuth(c, b, 'stand');
+      if (!auth.ok) return auth.res;
+      if (!auth.handId) return bad(c, 400, 'missing_hand_id');
+      if (auth.amount !== 0n) return bad(c, 400, 'invalid_amount');
+      const { author, handId } = auth;
+      const owned = activeOwnedHand(c, handId, author);
+      if (!owned.ok) return owned.res;
+      const limited = gameLimited(c, author);
+      if (limited) return limited;
+
+      const now = Math.floor(Date.now() / 1000);
+      const prep = prepareShoeForDeal();
+      const player = JSON.parse(owned.hand.playerJson) as Card[];
+      const dealer = JSON.parse(owned.hand.dealerJson) as Card[];
+      let dp: { dealer: Card[]; pos: number };
+      try {
+        dp = dealerPlay(dealer, prep.cards, prep.pos);
+      } catch {
+        return bad(c, 503, 'shoe_exhausted', 'the shoe is empty; try again');
+      }
+      const r = resolve(player, dp.dealer, owned.hand.bet);
+      const res = db.progressHand({
+        handId,
+        playerJson: JSON.stringify(player),
+        dealerJson: JSON.stringify(dp.dealer),
+        status: r.status,
+        payout: r.payout,
+        resolvedAt: now,
+        shoeId: prep.shoeId,
+        newPos: dp.pos,
+        now,
+      });
+      if (res === 'not_active') return bad(c, 409, 'hand_not_active');
+      const hand = db.getHand(handId);
+      if (!hand) return bad(c, 500, 'internal_error');
+      return c.json({ hand: publicHand(hand) });
+    });
+
+    app.post('/blackjack/double', async (c) => {
+      const parsed = await readBody(c);
+      if (!parsed.ok) return bad(c, parsed.status, parsed.error);
+      const b = parsed.body as Record<string, unknown>;
+      const auth = await bjAuth(c, b, 'double');
+      if (!auth.ok) return auth.res;
+      if (!auth.handId) return bad(c, 400, 'missing_hand_id');
+      if (auth.amount !== 0n) return bad(c, 400, 'invalid_amount');
+      const { author, handId } = auth;
+      const owned = activeOwnedHand(c, handId, author);
+      if (!owned.ok) return owned.res;
+      const limited = gameLimited(c, author);
+      if (limited) return limited;
+
+      // Fast-path check; the transaction re-checks under the write lock.
+      if (db.getChips(author) < owned.hand.bet) {
+        return bad(c, 402, 'insufficient_chips', 'doubling needs chips >= bet');
+      }
+      const now = Math.floor(Date.now() / 1000);
+      const prep = prepareShoeForDeal();
+      const player = JSON.parse(owned.hand.playerJson) as Card[];
+      const dealer = JSON.parse(owned.hand.dealerJson) as Card[];
+      let drawn: { card: Card; pos: number };
+      try {
+        drawn = drawCard(prep.cards, prep.pos);
+      } catch {
+        return bad(c, 503, 'shoe_exhausted', 'the shoe is empty; try again');
+      }
+      const newPlayer = [...player, drawn.card];
+      const newBet = owned.hand.bet * 2n;
+      let status: HandStatus;
+      let payout: bigint;
+      let finalDealer = dealer;
+      let finalPos = drawn.pos;
+      if (handValue(newPlayer) > 21) {
+        status = 'bust';
+        payout = 0n;
+      } else {
+        let dp: { dealer: Card[]; pos: number };
+        try {
+          dp = dealerPlay(dealer, prep.cards, drawn.pos);
+        } catch {
+          return bad(c, 503, 'shoe_exhausted', 'the shoe is empty; try again');
+        }
+        finalDealer = dp.dealer;
+        finalPos = dp.pos;
+        const r = resolve(newPlayer, finalDealer, newBet);
+        status = r.status;
+        payout = r.payout;
+      }
+      const res = db.doubleDown({
+        handId,
+        addedBet: owned.hand.bet,
+        playerJson: JSON.stringify(newPlayer),
+        dealerJson: JSON.stringify(finalDealer),
+        status,
+        payout,
+        resolvedAt: now,
+        shoeId: prep.shoeId,
+        newPos: finalPos,
+        now,
+      });
+      if (res === 'not_active') return bad(c, 409, 'hand_not_active');
+      if (res === 'insufficient_chips') {
+        return bad(c, 402, 'insufficient_chips', 'doubling needs chips >= bet');
+      }
+      const hand = db.getHand(handId);
+      if (!hand) return bad(c, 500, 'internal_error');
+      return c.json({ hand: publicHand(hand) });
+    });
+
+    app.post('/blackjack/cash-out', async (c) => {
+      const parsed = await readBody(c);
+      if (!parsed.ok) return bad(c, parsed.status, parsed.error);
+      const b = parsed.body as Record<string, unknown>;
+      const auth = await bjAuth(c, b, 'cash_out');
+      if (!auth.ok) return auth.res;
+      if (auth.handId !== '') return bad(c, 400, 'unexpected_hand_id');
+      const { author, amount } = auth;
+      if (amount <= 0n) return bad(c, 400, 'invalid_amount');
+      // Rate limit AFTER the request is otherwise valid.
+      if (!limiter.take(`bj-cashout:${author.toLowerCase()}`, BLACKJACK_CASHOUT_BUCKET)) {
+        return bad(c, 429, 'rate_limited', '5 cash-outs per hour');
+      }
+      // Fail closed: chips stay in the DB until the founder enables payouts
+      // (house key set AND dry-run explicitly off).
+      if (!bj.houseKey || bj.dryRun) {
+        return bad(c, 503, 'cash_out_unavailable', 'the house has not enabled cash-outs yet');
+      }
+      const key = author.toLowerCase();
+      if (inFlightCashouts.has(key)) {
+        return bad(c, 409, 'cashout_in_flight', 'a cash-out is already processing for this wallet');
+      }
+      // Registered synchronously, before any await — a concurrent duplicate
+      // is guaranteed to see the entry.
+      inFlightCashouts.add(key);
+      try {
+        const now = Math.floor(Date.now() / 1000);
+        const cashoutId = newId();
+        const debited = db.debitForCashout({ id: cashoutId, wallet: author, amount, now });
+        if (debited === 'insufficient_chips') {
+          return bad(c, 402, 'insufficient_chips');
+        }
+        const relay = await relayCashout({
+          houseKey: bj.houseKey,
+          house: bj.house,
+          to: author,
+          amount,
+          rpcUrl: bj.rpcUrl,
+        });
+        if (!relay.ok) {
+          db.recreditCashout(cashoutId, author, amount, now);
+          return bad(c, 502, 'cashout_failed', relay.detail);
+        }
+        db.confirmCashout(cashoutId, relay.txHash);
+        return c.json({ txHash: relay.txHash });
+      } finally {
+        inFlightCashouts.delete(key);
+      }
+    });
+  }
+
   return app;
+}
+
+/**
+ * In-flight cash-out dedupe, one entry per wallet (same pattern as
+ * /settle's settlementDedupeKey). Same-process only.
+ */
+const inFlightCashouts = new Set<string>();
+
+/**
+ * Sign an EIP-3009 TransferWithAuthorization (house -> agent) with the
+ * house key and relay it via USDC.transferWithAuthorization. Called only
+ * when payouts are enabled (house key set, dry-run off) — the route guards
+ * this; the helper itself never checks env.
+ */
+async function relayCashout(opts: {
+  houseKey: Hex;
+  house: Address;
+  to: Address;
+  amount: bigint;
+  rpcUrl: string;
+}): Promise<{ ok: true; txHash: Hex } | { ok: false; detail: string }> {
+  const cfg = INK_CONFIG;
+  const houseAccount = privateKeyToAccount(opts.houseKey);
+  if (getAddress(houseAccount.address) !== getAddress(opts.house)) {
+    return { ok: false, detail: 'house_key_mismatch' };
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const message = {
+    from: getAddress(opts.house),
+    to: getAddress(opts.to),
+    value: opts.amount,
+    validAfter: BigInt(now - 60),
+    validBefore: BigInt(now + 3600),
+    nonce: randomNonce(),
+  };
+  const signature = await houseAccount.signTypedData({
+    domain: eip3009Domain(cfg),
+    types: EIP3009_TYPES,
+    primaryType: 'TransferWithAuthorization',
+    message,
+  });
+  const { v, r, s } = splitSignature(signature);
+  const chain = viemChain(cfg);
+  const transport = http(opts.rpcUrl);
+  const publicClient = createPublicClient({ chain, transport });
+  const walletClient = createWalletClient({ account: houseAccount, chain, transport });
+  try {
+    const hash = await walletClient.writeContract({
+      address: cfg.usdc.address,
+      abi: usdcEip3009Abi,
+      functionName: 'transferWithAuthorization',
+      args: [
+        message.from,
+        message.to,
+        message.value,
+        message.validAfter,
+        message.validBefore,
+        message.nonce,
+        v,
+        r,
+        s,
+      ],
+    });
+    await publicClient.waitForTransactionReceipt({ hash });
+    return { ok: true, txHash: hash };
+  } catch (e) {
+    return { ok: false, detail: (e as Error).message?.slice(0, 300) };
+  }
 }

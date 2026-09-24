@@ -54,15 +54,16 @@ export type PaymentCheck =
   | { ok: false; reason: string };
 
 /**
- * Verify that txHash pays the post fee. Pure w.r.t. chain state except via
- * the injected getReceipt — no broadcasts, no signing.
+ * Verify that txHash carries a Transfer(from -> to, value >= minUnits)
+ * emitted by the Ink USDC contract. Pure w.r.t. chain state except via the
+ * injected getReceipt — no broadcasts, no signing.
  */
-export async function verifyPostPayment(opts: {
+export async function verifyTransferPayment(opts: {
   getReceipt: GetReceipt;
   txHash: string;
-  author: Address;
-  treasury: Address;
-  feeUnits: bigint;
+  from: Address;
+  to: Address;
+  minUnits: bigint;
   usdc?: Address;
 }): Promise<PaymentCheck> {
   if (!/^0x[0-9a-fA-F]{64}$/.test(opts.txHash)) {
@@ -73,8 +74,8 @@ export async function verifyPostPayment(opts: {
   if (receipt.status !== 'success') return { ok: false, reason: 'tx_failed' };
 
   const usdc = (opts.usdc ?? USDC_ADDRESS).toLowerCase();
-  const fromTopic = addressTopic(opts.author);
-  const toTopic = addressTopic(opts.treasury);
+  const fromTopic = addressTopic(opts.from);
+  const toTopic = addressTopic(opts.to);
 
   for (const log of receipt.logs) {
     if (log.address.toLowerCase() !== usdc) continue;
@@ -88,7 +89,29 @@ export async function verifyPostPayment(opts: {
     } catch {
       continue;
     }
-    if (value >= opts.feeUnits) return { ok: true };
+    if (value >= opts.minUnits) return { ok: true };
   }
   return { ok: false, reason: 'no_matching_transfer' };
+}
+
+/**
+ * Verify that txHash pays the post fee. Pure w.r.t. chain state except via
+ * the injected getReceipt — no broadcasts, no signing.
+ */
+export async function verifyPostPayment(opts: {
+  getReceipt: GetReceipt;
+  txHash: string;
+  author: Address;
+  treasury: Address;
+  feeUnits: bigint;
+  usdc?: Address;
+}): Promise<PaymentCheck> {
+  return verifyTransferPayment({
+    getReceipt: opts.getReceipt,
+    txHash: opts.txHash,
+    from: opts.author,
+    to: opts.treasury,
+    minUnits: opts.feeUnits,
+    usdc: opts.usdc,
+  });
 }

@@ -18,6 +18,12 @@ export const CHAT_BURST_BUCKET: AuthorBucket = { windowMs: 5_000, max: 1 };
 export const CHAT_HOURLY_BUCKET: AuthorBucket = { windowMs: 3_600_000, max: 60 };
 /** Name claims: 1 per hour per wallet — renames are allowed, not spammable. */
 export const NAME_CLAIM_BUCKET: AuthorBucket = { windowMs: 3_600_000, max: 1 };
+/** The Count: game actions are chatty by design (hit/stand/double). */
+export const BLACKJACK_GAME_BUCKET: AuthorBucket = { windowMs: 60_000, max: 60 };
+/** Buy-ins are receipt-backed; still cap the cadence. */
+export const BLACKJACK_BUYIN_BUCKET: AuthorBucket = { windowMs: 60_000, max: 10 };
+/** Cash-outs move real money: 5 per hour per wallet. */
+export const BLACKJACK_CASHOUT_BUCKET: AuthorBucket = { windowMs: 3_600_000, max: 5 };
 
 export class AuthorRateLimiter {
   private hits = new Map<string, { count: number; resetAt: number }>();

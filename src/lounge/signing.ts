@@ -49,6 +49,13 @@ export const LOUNGE_TYPES: Record<string, { name: string; type: string }[]> = {
     { name: 'name', type: 'string' },
     { name: 'timestamp', type: 'uint256' },
   ],
+  BlackjackAction: [
+    { name: 'author', type: 'address' },
+    { name: 'action', type: 'string' },
+    { name: 'handId', type: 'string' },
+    { name: 'amount', type: 'uint256' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
 };
 
 /** Timestamps must be within ±5 minutes of server time (replay protection). */
@@ -75,7 +82,8 @@ export async function verifyLoungeSignature(opts: {
     | 'LoungeComment'
     | 'LoungeVote'
     | 'LoungeChat'
-    | 'LoungeNameClaim';
+    | 'LoungeNameClaim'
+    | 'BlackjackAction';
   message: Record<string, unknown>;
   signature: string;
   author: string;
