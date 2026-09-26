@@ -132,6 +132,15 @@ CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_at);
 CREATE INDEX IF NOT EXISTS idx_chat_created ON chat_messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_bj_hands_wallet ON blackjack_hands(wallet, created_at);
 CREATE INDEX IF NOT EXISTS idx_bj_hands_status ON blackjack_hands(status, resolved_at);
+CREATE TABLE IF NOT EXISTS oracle_queries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  payer TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  symbol TEXT,
+  price_usd TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_oracle_created ON oracle_queries(created_at);
 `;
 
 /**
@@ -384,6 +393,44 @@ export class LoungeDb {
       id: r.id as string,
       author: r.author as Address,
       message: r.message as string,
+      createdAt: r.created_at as number,
+    }));
+  }
+
+  // ---- oracle query log (the spectacle feed) ----
+
+  logOracleQuery(q: {
+    payer: string;
+    endpoint: string;
+    symbol?: string;
+    priceUsd?: string;
+    createdAt: number;
+  }): void {
+    this.db
+      .prepare(
+        'INSERT INTO oracle_queries (payer, endpoint, symbol, price_usd, created_at) VALUES (?, ?, ?, ?, ?)',
+      )
+      .run(q.payer, q.endpoint, q.symbol ?? null, q.priceUsd ?? null, q.createdAt);
+  }
+
+  /** Recent oracle queries, newest first. */
+  recentOracleQueries(limit: number): {
+    payer: string;
+    endpoint: string;
+    symbol: string | null;
+    priceUsd: string | null;
+    createdAt: number;
+  }[] {
+    const rows = this.db
+      .prepare(
+        'SELECT payer, endpoint, symbol, price_usd, created_at FROM oracle_queries ORDER BY created_at DESC, id DESC LIMIT ?',
+      )
+      .all(limit) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      payer: r.payer as string,
+      endpoint: r.endpoint as string,
+      symbol: r.symbol as string | null,
+      priceUsd: r.price_usd as string | null,
       createdAt: r.created_at as number,
     }));
   }

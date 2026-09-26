@@ -26,6 +26,10 @@ export interface FacilitatorConfig {
   demoPayTo?: Address;
   /** Demo price in USDC, e.g. "0.01". */
   demoPriceUsdc: string;
+  /** Recipient for paid oracle queries (required for /oracle). */
+  oraclePayTo?: Address;
+  /** Oracle price in USDC per query, e.g. "0.001". */
+  oraclePriceUsdc: string;
 }
 
 export function loadConfig(
@@ -47,6 +51,16 @@ export function loadConfig(
       'FOUR02_DEMO_PRICE_USDC must be a decimal like "0.01" (max 6 decimals)',
     );
   }
+  const oraclePayTo = env.FOUR02_ORACLE_PAYTO;
+  if (oraclePayTo !== undefined && !isAddress(oraclePayTo)) {
+    throw new Error('FOUR02_ORACLE_PAYTO is not a valid address');
+  }
+  const oraclePrice = env.FOUR02_ORACLE_PRICE_USDC ?? '0.001';
+  if (!/^\d+(\.\d{1,6})?$/.test(oraclePrice)) {
+    throw new Error(
+      'FOUR02_ORACLE_PRICE_USDC must be a decimal like "0.001" (max 6 decimals)',
+    );
+  }
   const port = parseInt(env.FOUR02_PORT ?? env.PORT ?? '4022', 10);
   if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) {
     throw new Error('FOUR02_PORT must be a valid TCP port');
@@ -63,5 +77,7 @@ export function loadConfig(
     settleApiKeys,
     demoPayTo: demoPayTo ? getAddress(demoPayTo) : undefined,
     demoPriceUsdc: price,
+    oraclePayTo: oraclePayTo ? getAddress(oraclePayTo) : undefined,
+    oraclePriceUsdc: oraclePrice,
   };
 }

@@ -46,6 +46,8 @@ import type {
 } from './types.js';
 import { verifyExactPayment } from './verify.js';
 import { createLoungeApp } from '../lounge/server.js';
+import { LoungeDb } from '../lounge/db.js';
+import { createOracleApp } from './oracle.js';
 import type { BlackjackConfig, LoungeConfig } from '../lounge/config.js';
 
 const b64encode = (o: unknown): string =>
@@ -154,25 +156,30 @@ export function rateLimit(bucket: RateLimitBucket) {
 /**
  * Extract the caller's API key: the `x-api-key` header, an
  * `Authorization: Bearer <key>` header, or the `api_key` query param.
+ * Exported for the oracle routes' production gate.
  */
-function settleApiKey(c: Context): string | null {
-  const header = c.req.header('x-api-key');
+export function settleApiKey(
+  getHeader: (name: string) => string | undefined,
+  getQuery: (name: string) => string | undefined,
+): string | null {
+  const header = getHeader('x-api-key');
   if (header?.trim()) return header.trim();
-  const auth = c.req.header('authorization');
+  const auth = getHeader('authorization');
   if (auth) {
     const m = /^bearer\s+(.+)$/i.exec(auth.trim());
     if (m?.[1]?.trim()) return m[1].trim();
   }
-  const query = c.req.query('api_key');
+  const query = getQuery('api_key');
   if (query?.trim()) return query.trim();
   return null;
 }
 
 /**
  * Constant-time allowlist check. Length mismatch short-circuits safely
- * (timingSafeEqual throws on unequal lengths).
+ * (timingSafeEqual throws on unequal lengths). Exported for the oracle
+ * routes' production gate.
  */
-function apiKeyAllowed(provided: string | null, allowlist: string[]): boolean {
+export function apiKeyAllowed(provided: string | null, allowlist: string[]): boolean {
   if (provided === null) return false;
   const p = Buffer.from(provided, 'utf8');
   return allowlist.some((k) => {
@@ -202,12 +209,45 @@ export function createApp(
   );
 
   // The 402 Lounge (agent social feed) rides on the same service.
+  // The lounge DB is opened here and shared: the oracle routes log every
+  // served query into it for the command map's spectacle feed.
+  let loungeDb: LoungeDb | null = null;
   if (opts.lounge) {
+    loungeDb = new LoungeDb(opts.lounge.dbPath);
     app.route(
       '/lounge',
-      createLoungeApp(opts.lounge, { blackjack: opts.blackjack ?? null }),
+      createLoungeApp(opts.lounge, {
+        blackjack: opts.blackjack ?? null,
+        db: loungeDb,
+      }),
     );
   }
+
+  // 402 Oracles: pay-per-call data feeds. Mounted whenever the recipient
+  // is configured; without FOUR02_ORACLE_PAYTO the routes fail closed.
+  app.route(
+    '/oracle',
+    createOracleApp(config, {
+      store,
+      onQueryServed: (q) =>
+        loungeDb?.logOracleQuery({
+          payer: q.payer,
+          endpoint: q.endpoint,
+          symbol: q.symbol,
+          priceUsd: q.priceUsd,
+          createdAt: Math.floor(Date.now() / 1000),
+        }),
+      productionGate: (getHeader) => {
+        if (config.settleApiKeys.length === 0) return 'not_configured';
+        // Note: query-param keys aren't available here (GET routes read
+        // them per-route); header + bearer only.
+        const key = settleApiKey(getHeader, () => undefined);
+        return apiKeyAllowed(key, config.settleApiKeys)
+          ? 'ok'
+          : 'unauthorized';
+      },
+    }),
+  );
 
   app.get('/supported', (c) => {
     const kinds = Object.values(CHAINS).map((ch) => ({
@@ -289,7 +329,15 @@ export function createApp(
         503,
       );
     }
-    if (!apiKeyAllowed(settleApiKey(c), config.settleApiKeys)) {
+    if (
+      !apiKeyAllowed(
+        settleApiKey(
+          (n) => c.req.header(n),
+          (n) => c.req.query(n),
+        ),
+        config.settleApiKeys,
+      )
+    ) {
       return c.json({ success: false, errorReason: 'unauthorized' }, 401);
     }
     const body = await readX402Body(c);
@@ -345,7 +393,15 @@ export function createApp(
           503,
         );
       }
-      if (!apiKeyAllowed(settleApiKey(c), config.settleApiKeys)) {
+      if (
+      !apiKeyAllowed(
+        settleApiKey(
+          (n) => c.req.header(n),
+          (n) => c.req.query(n),
+        ),
+        config.settleApiKeys,
+      )
+    ) {
         return c.json(
           {
             error: 'unauthorized',

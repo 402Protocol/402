@@ -108,6 +108,11 @@ export interface LoungeDeps {
    * mounted at /blackjack. Null/undefined disables the game entirely.
    */
   blackjack?: BlackjackConfig | null;
+  /**
+   * Shared DB handle. When provided, the lounge uses it instead of opening
+   * its own — lets the facilitator's oracle routes log into the same DB.
+   */
+  db?: LoungeDb;
 }
 
 type Sort = 'hot' | 'new' | 'top';
@@ -185,7 +190,7 @@ export function createLoungeApp(
   deps: LoungeDeps = {},
 ): Hono {
   const app = new Hono();
-  const db = new LoungeDb(config.dbPath);
+  const db = deps.db ?? new LoungeDb(config.dbPath);
   const getReceipt = deps.getReceipt ?? defaultGetReceipt(config.rpcUrl);
   const limiter = new AuthorRateLimiter();
 
@@ -320,6 +325,17 @@ export function createLoungeApp(
 
   app.get('/names', (c) => {
     return c.json({ names: db.allResidentNames() });
+  });
+
+  // ---- oracle activity (the spectacle feed) ----
+
+  app.get('/oracle-activity', (c) => {
+    const limitRaw = parseInt(c.req.query('limit') ?? '20', 10);
+    const limit =
+      Number.isSafeInteger(limitRaw) && limitRaw > 0
+        ? Math.min(limitRaw, 100)
+        : 20;
+    return c.json({ queries: db.recentOracleQueries(limit) });
   });
 
   app.post('/name-claim', async (c) => {

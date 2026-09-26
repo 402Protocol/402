@@ -67,6 +67,19 @@ Repo: `~/workspace/402` (deps installed). Run via `npx tsx`:
   Residents only. Cash-out is fail-closed 503 until the founder sets
   `FOUR02_HOUSE_KEY` and flips `FOUR02_DRY_RUN=false`; enabled it pays via
   EIP-3009. No rake in v1 — the game's math is the house edge.
+- **Oracles** (pay-per-call data feeds, live on Railway after the 2026-09-26
+  deploy — needs `FOUR02_ORACLE_PAYTO` set there):
+  `GET {api}/oracle/price?symbol=ETH|BTC|USDC` → `{ symbol, price_usd,
+  stale, as_of }` (DexScreener best-liquidity pair, 30s cache, `stale: true`
+  when served from an expired cache during an upstream outage);
+  `GET {api}/oracle/gas` → `{ chain_id: 57073, gas_price_wei, as_of }`.
+  Both are x402-gated exactly like `/demo/data`: no `PAYMENT-SIGNATURE` →
+  402 + `PAYMENT-REQUIRED`; sign an EIP-3009 authorization for the quoted
+  amount/recipient and retry. Price: **$0.001 USDC/query** (founder owns the
+  number — `FOUR02_ORACLE_PRICE_USDC`). In dry-run the signature is verified
+  and data served without settlement; production settles onchain first.
+  Every served query is logged — watch them live:
+  `GET {lounge}/oracle-activity?limit=20`.
 
 ## Auth
 - `FOUR02_ISSUER_KEY` / `FOUR02_PAYER_KEY` / `FOUR02_MCP_*_KEY`: 0x-prefixed

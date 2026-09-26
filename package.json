@@ -25,7 +25,8 @@
     "typecheck": "tsc --noEmit",
     "test:lounge": "tsx test/lounge.test.ts",
     "mcp": "tsx src/mcp/server.ts",
-    "test:mcp": "tsx test/mcp.test.ts"
+    "test:mcp": "tsx test/mcp.test.ts",
+    "test:oracle": "tsx test/oracle.test.ts"
   },
   "type": "module",
   "version": "0.3.0"
