@@ -1,2 +1,4 @@
 @openzeppelin/=lib/openzeppelin-contracts/
 forge-std/=lib/forge-std/
+@creator-token-standards/=lib/creator-token-standards/src/
+@limitbreak/permit-c/=lib/PermitC/src/

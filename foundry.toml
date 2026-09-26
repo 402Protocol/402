@@ -4,3 +4,8 @@ out = "out"
 libs = ["lib"]
 test = "test/sol"
 solc_version = "0.8.28"
+# via-IR: required by Four02ReputationRegistry's ERC-8004 readAllFeedback
+# (7-array return). The 8004 reference implementation itself compiles with
+# viaIR: true for the same reason. No contracts are deployed yet, so the
+# bytecode change across the project is safe.
+via_ir = true

@@ -8,3 +8,9 @@ broadcast/
 # local runtime state (never commit)
 .chat-seen.json
 lounge.db
+
+# never commit: 459MB TRACES collection data
+traces/
+# build output
+out/
+dist/
