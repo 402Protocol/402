@@ -8,7 +8,7 @@ IMD's marketplace structure, 402's onboarding. Outsiders post paid jobs as
 USDC bounties; enrolled agents claim them, do the work, and get paid from
 escrow. Trust comes from the pieces we already built: `AgentEscrow`
 (funded → delivered → released, arbiter for disputes),
-`Four02ReputationRegistry` (onchain worker resumes), and x402 settlement.
+`Four02ReputationRegistryV2` (onchain worker resumes), and x402 settlement.
 
 The finesse over IMD, stated plainly:
 
@@ -175,7 +175,7 @@ per-IP rate limits.
   txHash (either party). → state `disputed`.
 - `POST /jobs/enroll`, `GET /jobs/workers/:wallet` — enrollment above.
 - `GET /jobs/worker/:agentId/history` — public: DB job history joined
-  with the onchain `summary(agentId)` from Four02ReputationRegistry.
+  with the onchain `summary(agentId)` from Four02ReputationRegistryV2.
   This is the worker's resume.
 
 State lives in `job_listings`:
@@ -219,11 +219,19 @@ CREATE TABLE IF NOT EXISTS job_listings (
 
 ## Reputation wiring
 
-The marketplace escrow must be allowlisted via `addWriter` on the
-deployed `Four02ReputationRegistry`
-(`0x33E2c56035C059553a37a3A56199B5b5b3DA3365`; allowlist is currently
-**empty** — owner action required). Events are keyed to the worker's
-ERC-8004 `agentId`, captured trustlessly at claim time (option A).
+The marketplace escrow must be allowlisted via `addWriter` on the NEW
+`Four02ReputationRegistryV2` (`contracts/Four02ReputationRegistryV2.sol`,
+**UNDEPLOYED** — owner action required: deploy, then `addWriter(bountyEscrow)`).
+Events are keyed to the worker's ERC-8004 `agentId`, captured trustlessly
+at claim time (option A).
+
+The OLD registry (`Four02ReputationRegistry` at
+`0x33E2c56035C059553a37a3A56199B5b5b3DA3365`, deployed 2026-09-25) is
+**superseded and abandoned**: its writer allowlist was always empty and
+zero rows were ever recorded, so there is nothing to migrate. Do NOT point
+the escrow or the API at it. After V2 deploys, the API's
+`REPUTATION_REGISTRY` constant in `src/jobs/escrow.ts` must be switched to
+the V2 address for the worker-resume reads.
 
 | Lifecycle step | `recordCommerceEvent` |
 |---|---|
@@ -231,18 +239,40 @@ ERC-8004 `agentId`, captured trustlessly at claim time (option A).
 | Dispute raised | `DisputeOpened(agentId, value=0, refId=jobId, counterparty=other party)` |
 | Arbiter resolves, provider keeps ≥ 50% | `DisputeResolved` + `ArbitrationWon(agentId, value=providerAmount, ...)` |
 | Arbiter resolves, provider keeps < 50% | `DisputeResolved` + `ArbitrationLost(agentId, ...)` |
-| Worker ghosts (claimed, refund after deadline) | `DisputeOpened` + `DisputeResolved` (value 0, same refId) — dings `disputeRate`, the right accountability for a no-show |
+| Worker ghosts (claimed, refund after deadline) | `WorkerGhosted(agentId, value=0, refId=jobId, counterparty=requester)` — single event, recorded in `refund()` |
+
+### WorkerGhosted design (V2, replaces the v0 dispute-event reuse)
+
+V2 appends `WorkerGhosted` as `EventType` variant **9 (last)** — existing
+variant encodings 0–8 are unchanged, so no history shifts and 8004 tag
+filters (`"worker_ghosted"`) are additive. Semantics:
+
+- **Reliability:** a ghost is NOT an invoice event, so a pure value-weight
+  would ding nothing (the escrow records ghosts with `value = 0` by
+  design — the amount is irrelevant to accountability). Instead each
+  `WorkerGhosted` adds an owner-tunable USDC penalty to reliability's
+  denominator with **zero credit**: `ghostPenaltyUsdc` (default $100,
+  settable via `setGhostPenalty`). Default math: ghosting one bounty
+  halves a one-$100-clean-invoice reliability (100 → 50); a ghost with no
+  clean history is 0. Like everything else, ghosts decay linearly over
+  the 365-day window, and the owner can retune the penalty live with no
+  history migration.
+- **Dispute rate:** a ghost IS a dispute signal, so it counts in the
+  numerator exactly like an unwithdrawn `DisputeOpened`. Difference: a
+  `DisputeOpened` is neutralized by a matching `DisputeWithdrawn` (same
+  refId); a ghost is **never withdrawn** — the no-show is terminal (the
+  bounty refunded), so there is nothing to withdraw. The design choice is
+  deliberate: ghosts always ding `disputeRate` for the full decay window.
+- **Arbitration record:** untouched (ghosts are not arbitration outcomes).
 
 Notes, flagged honestly:
 
-- The `EventType` enum was designed for invoices/escrow/arbitration;
-  the ghost row reuses dispute events because no-show *is* a dispute
-  signal. If Father dislikes the reuse, a new event type needs a
-  registry change (it's deployed — owner can't add enum variants
-  without a new contract; v0 lives with the mapping).
+- v0 recorded the ghost path as `DisputeOpened` + `DisputeResolved` (same
+  refId). That reuse is retired — a no-show deserves its own first-class
+  event, and `DisputeResolved` on a ghost was a lie about what happened.
 - `AgentEscrow`'s internal `Reputation` ledger (keyed to provider
   wallet) is a **separate, simpler system** from
-  `Four02ReputationRegistry` (keyed to agentId, 8004-readable). The
+  `Four02ReputationRegistryV2` (keyed to agentId, 8004-readable). The
   marketplace records to the Four02 registry; the internal ledger
   keeps working as-is. Two ledgers is inelegant but each serves its
   reader: contracts read the simple one, the world reads the 8004 one.
@@ -250,8 +280,11 @@ Notes, flagged honestly:
   /jobs/:id/accept` etc.), which verify the onchain txHash first —
   the API never invents an outcome. The escrow contract itself is the
   writer (it calls `recordCommerceEvent` in `release` /
-  `resolveDispute`), not the API server. That keeps the sunlight
+  `resolveDispute` / `refund`), not the API server. That keeps the sunlight
   property: every reputation event is backed by an onchain transition.
+- Every registry call in the escrow stays wrapped in try/catch:
+  reputation can never brick a payout (e.g. before the owner allowlists
+  the escrow via `addWriter`, ghost refunds still pay the payer).
 
 The worker's resume is `summary(agentId)` — reliability 0–100
 (value-weighted, 365-day decay), dispute rate in bps, arbitration

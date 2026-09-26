@@ -4,7 +4,7 @@ pragma solidity ^0.8.28;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {Four02ReputationRegistry} from "./Four02ReputationRegistry.sol";
+import {Four02ReputationRegistryV2} from "./Four02ReputationRegistryV2.sol";
 
 /// @notice Minimal read interface of the ERC-8004 identity registry.
 /// @dev The live registry (0x7274e874CA62410a93Bd8bf61c69d8045E399c02 on Ink,
@@ -28,17 +28,18 @@ interface IIdentityRegistry {
 ///      - createBounty names no provider. claimBounty binds one trustlessly:
 ///        the contract verifies IDENTITY_REGISTRY.ownerOf(agentId) ==
 ///        msg.sender onchain at claim time, callable exactly once from Open.
-///      - Reputation goes to the deployed Four02ReputationRegistry — the ONLY
+///      - Reputation goes to the Four02ReputationRegistryV2 — the ONLY
 ///        ledger for this contract (it deploys NO internal Reputation) —
 ///        keyed to the claimed ERC-8004 agentId. EVERY registry call is
 ///        wrapped in try/catch so a revert (e.g. this contract not yet
 ///        allowlisted as a writer) can NEVER brick a payout. Funds always
 ///        move; reputation is best-effort.
 ///
-///      DEPLOY NOTE: the Four02ReputationRegistry at
-///      0x33E2c56035C059553a37a3A56199B5b5b3DA3365 ships with an EMPTY writer
-///      allowlist. The registry owner must call addWriter(bountyEscrow)
-///      after this contract deploys, or reputation calls no-op silently via
+///      DEPLOY NOTE: the Four02ReputationRegistryV2 is UNDEPLOYED (the V1
+///      registry at 0x33E2c56035C059553a37a3A56199B5b5b3DA3365 is
+///      superseded/abandoned with an empty writer allowlist — do NOT point
+///      this at V1). After V2 deploys, its owner must call
+///      addWriter(bountyEscrow), or reputation calls no-op silently via
 ///      the try/catch (payouts keep working; nothing is recorded).
 contract BountyEscrow is ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -140,7 +141,7 @@ contract BountyEscrow is ReentrancyGuard {
 
     /// @notice The 402 reputation ledger. This contract never records to any
     /// other ledger; writes are best-effort (see _recordRep).
-    Four02ReputationRegistry public immutable reputationRegistry;
+    Four02ReputationRegistryV2 public immutable reputationRegistry;
 
     // ------------------------------------------------------------------------
     // Storage
@@ -193,9 +194,10 @@ contract BountyEscrow is ReentrancyGuard {
     /// @param feeRecipient_ Suggested: the Lounge treasury
     /// 0x1795adb30465b6f77e65f42695668617b6e34ac4 (deploy-time decision).
     /// @param identityRegistry_ Live Ink: 0x7274e874CA62410a93Bd8bf61c69d8045E399c02.
-    /// @param reputationRegistry_ Deployed Four02ReputationRegistry
-    /// (0x33E2c56035C059553a37a3A56199B5b5b3DA3365 on Ink). Its owner must
-    /// addWriter(this) after deploy — see the DEPLOY NOTE above.
+    /// @param reputationRegistry_ Deployed Four02ReputationRegistryV2
+    /// (UNDEPLOYED — the V1 at 0x33E2c56035C059553a37a3A56199B5b5b3DA3365 is
+    /// superseded/abandoned, do NOT use it). Its owner must addWriter(this)
+    /// after deploy — see the DEPLOY NOTE above.
     constructor(
         address token_,
         address arbiter_,
@@ -228,7 +230,7 @@ contract BountyEscrow is ReentrancyGuard {
         refundDelay = refundDelay_;
         guardian = guardian_;
         identityRegistry = IIdentityRegistry(identityRegistry_);
-        reputationRegistry = Four02ReputationRegistry(reputationRegistry_);
+        reputationRegistry = Four02ReputationRegistryV2(reputationRegistry_);
     }
 
     // ------------------------------------------------------------------------
@@ -324,7 +326,7 @@ contract BountyEscrow is ReentrancyGuard {
             claims[jobId][feeRecipient] += fee;
         }
         _recordRep(
-            job.agentId, Four02ReputationRegistry.EventType.EscrowCompleted, job.amount, jobId, job.payer
+            job.agentId, Four02ReputationRegistryV2.EventType.EscrowCompleted, job.amount, jobId, job.payer
         );
         emit JobReleased(jobId, providerAmount, fee);
     }
@@ -339,7 +341,7 @@ contract BountyEscrow is ReentrancyGuard {
         if (job.state != JobState.Funded && job.state != JobState.Delivered) revert BadState();
         job.state = JobState.Disputed;
         address counterparty = msg.sender == job.payer ? job.provider : job.payer;
-        _recordRep(job.agentId, Four02ReputationRegistry.EventType.DisputeOpened, 0, jobId, counterparty);
+        _recordRep(job.agentId, Four02ReputationRegistryV2.EventType.DisputeOpened, 0, jobId, counterparty);
         emit DisputeRaised(jobId, msg.sender);
     }
 
@@ -374,14 +376,14 @@ contract BountyEscrow is ReentrancyGuard {
             claims[jobId][job.payer] += payerAmount;
         }
 
-        _recordRep(job.agentId, Four02ReputationRegistry.EventType.DisputeResolved, 0, jobId, job.payer);
+        _recordRep(job.agentId, Four02ReputationRegistryV2.EventType.DisputeResolved, 0, jobId, job.payer);
         if (providerShareBps >= BPS_DENOMINATOR / 2) {
             _recordRep(
-                job.agentId, Four02ReputationRegistry.EventType.ArbitrationWon, providerAmount, jobId, job.payer
+                job.agentId, Four02ReputationRegistryV2.EventType.ArbitrationWon, providerAmount, jobId, job.payer
             );
         } else {
             _recordRep(
-                job.agentId, Four02ReputationRegistry.EventType.ArbitrationLost, payerAmount, jobId, job.payer
+                job.agentId, Four02ReputationRegistryV2.EventType.ArbitrationLost, payerAmount, jobId, job.payer
             );
         }
         emit DisputeResolved(jobId, providerAmount, payerAmount);
@@ -394,10 +396,12 @@ contract BountyEscrow is ReentrancyGuard {
     /// release or dispute instead.
     /// @dev M3: the grace window kills the deadline-block mempool race where
     /// a stranger's refund could front-run the provider's confirmDelivery.
-    /// Ghost path: a claimed-but-never-delivered bounty dings the worker's
-    /// agentId (DisputeOpened + DisputeResolved, value 0) — a no-show is a
-    /// dispute signal. An unclaimed bounty reclaims silently: no worker was
-    /// ever bound, so there is no reputation to record.
+    /// Ghost path: a claimed-but-never-delivered bounty records a single
+    /// WorkerGhosted event (value 0) against the worker's agentId — a
+    /// no-show is a dispute signal: it counts in disputeRate and dings
+    /// reliability via the registry's ghost penalty. An unclaimed bounty
+    /// reclaims silently: no worker was ever bound, so there is no
+    /// reputation to record.
     function refund(uint256 jobId) external nonReentrant {
         Job storage job = _getJob(jobId);
         if (job.state != JobState.Open && job.state != JobState.Funded) revert BadState();
@@ -410,8 +414,9 @@ contract BountyEscrow is ReentrancyGuard {
         claims[jobId][job.payer] += job.amount; // += for the uniform recording rule
 
         if (wasClaimed) {
-            _recordRep(agentId, Four02ReputationRegistry.EventType.DisputeOpened, 0, jobId, job.payer);
-            _recordRep(agentId, Four02ReputationRegistry.EventType.DisputeResolved, 0, jobId, job.payer);
+            _recordRep(
+                agentId, Four02ReputationRegistryV2.EventType.WorkerGhosted, 0, jobId, job.payer
+            );
         }
         emit JobRefunded(jobId);
     }
@@ -495,14 +500,14 @@ contract BountyEscrow is ReentrancyGuard {
         if (jobId == 0 || jobId > jobCounter) revert UnknownJob();
     }
 
-    /// @notice Best-effort reputation write to the Four02ReputationRegistry.
+    /// @notice Best-effort reputation write to the Four02ReputationRegistryV2.
     /// @dev try/catch is load-bearing: if this escrow was never allowlisted
     /// via addWriter (NotWriter revert), or the registry is otherwise
     /// unhappy, the revert is swallowed and the payout path continues
     /// untouched. Reputation must never be able to brick a payout.
     function _recordRep(
         uint256 agentId,
-        Four02ReputationRegistry.EventType eventType,
+        Four02ReputationRegistryV2.EventType eventType,
         uint256 value,
         uint256 jobId,
         address counterparty

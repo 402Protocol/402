@@ -19,11 +19,11 @@
  *
  * Reputation note (spec §Reputation wiring): the API NEVER writes
  * reputation. The BountyEscrow contract itself calls
- * Four02ReputationRegistry.recordCommerceEvent inside release /
- * resolveDispute — the API only mirrors outcomes after verifying the
- * txHash. That keeps the sunlight property: every reputation event is
- * backed by an onchain transition, and a compromised API server cannot
- * invent worker resumes.
+ * Four02ReputationRegistryV2.recordCommerceEvent inside release /
+ * resolveDispute / refund (the ghost path records WorkerGhosted) — the
+ * API only mirrors outcomes after verifying the txHash. That keeps the
+ * sunlight property: every reputation event is backed by an onchain
+ * transition, and a compromised API server cannot invent worker resumes.
  */
 import {
   type Address,
@@ -42,7 +42,10 @@ import type { GetReceipt } from '../lounge/types.js';
 export const IDENTITY_REGISTRY =
   '0x7274e874CA62410a93Bd8bf61c69d8045E399c02' as const;
 
-/** Four02ReputationRegistry on Ink (deployed 2026-09-25). */
+/**
+ * Four02ReputationRegistry V1 on Ink (deployed 2026-09-25) — SUPERSEDED.
+ * Switch to the V2 address after Four02ReputationRegistryV2 deploys.
+ */
 export const REPUTATION_REGISTRY =
   '0x33E2c56035C059553a37a3A56199B5b5b3DA3365' as const;
 
@@ -328,7 +331,8 @@ const SUMMARY_ABI = [
 ] as const;
 
 /**
- * summary(agentId) on the deployed Four02ReputationRegistry. Read-only;
+ * summary(agentId) on the Four02ReputationRegistry (V1 address until V2
+ * deploys — see REPUTATION_REGISTRY). Read-only;
  * returns null on RPC failure so the resume endpoint degrades to the DB
  * history instead of 500ing.
  */

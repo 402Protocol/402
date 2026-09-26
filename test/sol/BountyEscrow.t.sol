@@ -3,7 +3,7 @@ pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/src/Test.sol";
 import {BountyEscrow, IIdentityRegistry} from "../../contracts/BountyEscrow.sol";
-import {Four02ReputationRegistry} from "../../contracts/Four02ReputationRegistry.sol";
+import {Four02ReputationRegistryV2} from "../../contracts/Four02ReputationRegistryV2.sol";
 
 /// @notice Minimal mock USDC (6 decimals, mintable) for local testing.
 contract MockUSDC {
@@ -70,7 +70,7 @@ contract MockIdentityRegistry is IIdentityRegistry {
 contract BountyEscrowTest is Test {
     MockUSDC internal usdc;
     MockIdentityRegistry internal identityRegistry;
-    Four02ReputationRegistry internal repRegistry;
+    Four02ReputationRegistryV2 internal repRegistry;
     BountyEscrow internal escrow;
     BountyEscrow internal escrowNoRep; // same registries, NOT allowlisted as a writer
 
@@ -96,7 +96,7 @@ contract BountyEscrowTest is Test {
     function setUp() public {
         usdc = new MockUSDC();
         identityRegistry = new MockIdentityRegistry();
-        repRegistry = new Four02ReputationRegistry(address(this));
+        repRegistry = new Four02ReputationRegistryV2(address(this));
         escrow = new BountyEscrow(
             address(usdc),
             arbiter,
@@ -150,9 +150,9 @@ contract BountyEscrowTest is Test {
     function _repEventType(uint256 agentId, uint256 idx)
         internal
         view
-        returns (Four02ReputationRegistry.EventType)
+        returns (Four02ReputationRegistryV2.EventType)
     {
-        (Four02ReputationRegistry.EventType t,,,,,) = repRegistry.events(agentId, idx);
+        (Four02ReputationRegistryV2.EventType t,,,,,) = repRegistry.events(agentId, idx);
         return t;
     }
 
@@ -345,7 +345,7 @@ contract BountyEscrowTest is Test {
         escrow.release(jobId);
 
         assertEq(repRegistry.getEventCount(AGENT_ID), 1);
-        assertEq(uint8(_repEventType(AGENT_ID, 0)), uint8(Four02ReputationRegistry.EventType.EscrowCompleted));
+        assertEq(uint8(_repEventType(AGENT_ID, 0)), uint8(Four02ReputationRegistryV2.EventType.EscrowCompleted));
         assertEq(_repEventValue(AGENT_ID, 0), JOB_AMOUNT); // value = gross bounty
         assertEq(_repEventCounterparty(AGENT_ID, 0), payer);
     }
@@ -400,9 +400,9 @@ contract BountyEscrowTest is Test {
 
         // Reputation: DisputeOpened + DisputeResolved + ArbitrationWon.
         assertEq(repRegistry.getEventCount(AGENT_ID), 3);
-        assertEq(uint8(_repEventType(AGENT_ID, 0)), uint8(Four02ReputationRegistry.EventType.DisputeOpened));
-        assertEq(uint8(_repEventType(AGENT_ID, 1)), uint8(Four02ReputationRegistry.EventType.DisputeResolved));
-        assertEq(uint8(_repEventType(AGENT_ID, 2)), uint8(Four02ReputationRegistry.EventType.ArbitrationWon));
+        assertEq(uint8(_repEventType(AGENT_ID, 0)), uint8(Four02ReputationRegistryV2.EventType.DisputeOpened));
+        assertEq(uint8(_repEventType(AGENT_ID, 1)), uint8(Four02ReputationRegistryV2.EventType.DisputeResolved));
+        assertEq(uint8(_repEventType(AGENT_ID, 2)), uint8(Four02ReputationRegistryV2.EventType.ArbitrationWon));
         assertEq(_repEventValue(AGENT_ID, 2), JOB_AMOUNT);
         (uint256 wins, uint256 losses) = repRegistry.arbitrationRecord(AGENT_ID);
         assertEq(wins, 1);
@@ -424,7 +424,7 @@ contract BountyEscrowTest is Test {
         assertEq(escrow.claimable(jobId, worker), 30_000_000);
         assertEq(escrow.claimable(jobId, payer), 70_000_000);
 
-        assertEq(uint8(_repEventType(AGENT_ID, 2)), uint8(Four02ReputationRegistry.EventType.ArbitrationLost));
+        assertEq(uint8(_repEventType(AGENT_ID, 2)), uint8(Four02ReputationRegistryV2.EventType.ArbitrationLost));
         assertEq(_repEventValue(AGENT_ID, 2), 70_000_000); // value = payer's share
         (uint256 wins, uint256 losses) = repRegistry.arbitrationRecord(AGENT_ID);
         assertEq(wins, 0);
@@ -488,12 +488,11 @@ contract BountyEscrowTest is Test {
         escrow.claim(jobId);
         assertEq(usdc.balanceOf(payer), 10_000_000_000);
 
-        // Ghost ding: DisputeOpened + DisputeResolved, value 0, keyed to agent.
-        assertEq(repRegistry.getEventCount(AGENT_ID), 2);
-        assertEq(uint8(_repEventType(AGENT_ID, 0)), uint8(Four02ReputationRegistry.EventType.DisputeOpened));
-        assertEq(uint8(_repEventType(AGENT_ID, 1)), uint8(Four02ReputationRegistry.EventType.DisputeResolved));
+        // Ghost ding: a single WorkerGhosted event, value 0, keyed to agent.
+        assertEq(repRegistry.getEventCount(AGENT_ID), 1);
+        assertEq(uint8(_repEventType(AGENT_ID, 0)), uint8(Four02ReputationRegistryV2.EventType.WorkerGhosted));
+        assertEq(uint8(Four02ReputationRegistryV2.EventType.WorkerGhosted), 9); // appended last, no shift
         assertEq(_repEventValue(AGENT_ID, 0), 0);
-        assertEq(_repEventValue(AGENT_ID, 1), 0);
     }
 
     function test_Refund_RevertsTooEarly() public {

@@ -20,7 +20,7 @@
  *
  * The API never broadcasts, never signs for users, and NEVER writes
  * reputation — the BountyEscrow contract calls
- * Four02ReputationRegistry.recordCommerceEvent itself. Every state
+ * Four02ReputationRegistryV2.recordCommerceEvent itself. Every state
  * transition here mirrors a verified onchain transition.
  */
 import { Hono, type Context } from 'hono';
@@ -776,7 +776,7 @@ export function createJobsApp(
     // Verify the onchain release: release(escrowJobId) called by the
     // requester on the escrow contract. This is what pays the worker —
     // the escrow's release() itself calls
-    // Four02ReputationRegistry.recordCommerceEvent, so the API never
+    // Four02ReputationRegistryV2.recordCommerceEvent, so the API never
     // writes reputation; it only mirrors the verified outcome.
     const released = await verifyEscrowCall({
       getReceipt,
