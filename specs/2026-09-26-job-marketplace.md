@@ -117,6 +117,11 @@ mirrors state from **txHashes** using the blackjack buy-in pattern
   complete, fires the reputation write.
 - Reject/dispute: requester calls `raiseDispute(jobId)` onchain (or the
   worker does), `POST /jobs/:id/dispute` with the txHash.
+- Refund mirror: anyone calls `POST /jobs/:id/refund` with the refund
+  txHash; server verifies the `JobRefunded(jobId)` event and mirrors
+  `open | claimed → refunded` (the only states `refund()` permits).
+- Resolve mirror: `POST /jobs/:id/resolve` with the resolve txHash; server
+  verifies `DisputeResolved(jobId, ...)` and mirrors `disputed → resolved`.
 
 `termsHash` (keccak256 of the offchain spec, recorded at bounty creation)
 is the anchor: the posted spec text is stored in DB, its hash must match
@@ -173,10 +178,29 @@ per-IP rate limits.
   reputation event queued.
 - `POST /jobs/:id/dispute` — signed decision `"dispute"` + raiseDispute
   txHash (either party). → state `disputed`.
+- `POST /jobs/:id/refund` — txHash only. Server verifies the tx's receipt
+  carries the escrow's `JobRefunded(jobId)` event, then mirrors the onchain
+  refund into the DB. Legal states: `open | claimed` (mirrors the contract:
+  `refund()` reverts from Delivered/Disputed/Resolved). → `refunded`.
+- `POST /jobs/:id/resolve` — txHash only. Server verifies the receipt
+  carries the escrow's `DisputeResolved(jobId, ...)` event, then mirrors
+  the arbiter's resolution. Legal state: `disputed` only. → `resolved`.
+  Both mirrors burn the txHash before changing state and document the
+  point-in-time receipt / deep-reorg caveat in code comments; a
+  confirmation-depth policy is still an open hardening item.
 - `POST /jobs/enroll`, `GET /jobs/workers/:wallet` — enrollment above.
 - `GET /jobs/worker/:agentId/history` — public: DB job history joined
   with the onchain `summary(agentId)` from Four02ReputationRegistryV2.
-  This is the worker's resume.
+  This is the worker's resume. The registry address is configured via
+  `FOUR02_REPUTATION_REGISTRY` (defaults to the superseded V1 address
+  until V2 is deployed — set the env var at deploy time).
+- Post-audit rules baked into the API: `POST /jobs` rejects deadlines
+  beyond `uint64.max` (so DB/onchain can never diverge); the funding
+  verifier scans ALL `BountyCreated` events from the payer in a batched
+  receipt and accepts the first full match (a sibling underfunded bounty
+  no longer fails the post); `accept` verifies the release from either
+  `claimed` or `submitted` (the worker may confirm onchain directly and
+  skip the API submit step).
 
 State lives in `job_listings`:
 
@@ -259,10 +283,14 @@ filters (`"worker_ghosted"`) are additive. Semantics:
   history migration.
 - **Dispute rate:** a ghost IS a dispute signal, so it counts in the
   numerator exactly like an unwithdrawn `DisputeOpened`. Difference: a
-  `DisputeOpened` is neutralized by a matching `DisputeWithdrawn` (same
-  refId); a ghost is **never withdrawn** — the no-show is terminal (the
-  bounty refunded), so there is nothing to withdraw. The design choice is
-  deliberate: ghosts always ding `disputeRate` for the full decay window.
+  `DisputeOpened` is neutralized by a matching `DisputeWithdrawn` **or
+  `DisputeResolved`** (same refId); a ghost is **never withdrawn or
+  resolved** — the no-show is terminal (the bounty refunded), so there is
+  nothing to neutralize. The design choice is deliberate: ghosts always
+  ding `disputeRate` for the full decay window. Neutralizing on resolve
+  too (post-audit fix): a dispute the arbiter resolved — even one the
+  worker wins — must not scar the worker's live signal; the outcome
+  itself stays visible in `arbitrationRecord`.
 - **Arbitration record:** untouched (ghosts are not arbitration outcomes).
 
 Notes, flagged honestly:

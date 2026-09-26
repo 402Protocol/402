@@ -14,6 +14,7 @@
  */
 import { type Address, getAddress, isAddress, parseUnits } from 'viem';
 import { INK_RPC_URL, USDC_DECIMALS } from '../constants.js';
+import { REPUTATION_REGISTRY } from './escrow.js';
 
 export interface JobsConfig {
   /** BountyEscrow contract address on Ink. */
@@ -26,6 +27,8 @@ export interface JobsConfig {
   rpcUrl: string;
   /** SQLite file path (":memory:" for tests). */
   dbPath: string;
+  /** Four02ReputationRegistry address for the worker-resume reads. */
+  reputationRegistry: Address;
 }
 
 /** Default listing fee: free at launch. */
@@ -51,11 +54,19 @@ export function loadJobsConfig(
       'FOUR02_JOBS_LISTING_FEE_USDC must be a decimal like "0.25" (max 6 decimals)',
     );
   }
+  // Reputation registry for the worker-resume reads. Defaults to the
+  // SUPERSEDED V1; set to the V2 address after Four02ReputationRegistryV2
+  // deploys (no code change needed).
+  const reputationRegistry = env.FOUR02_REPUTATION_REGISTRY ?? REPUTATION_REGISTRY;
+  if (!isAddress(reputationRegistry)) {
+    throw new Error('FOUR02_REPUTATION_REGISTRY is not a valid Ethereum address');
+  }
   return {
     escrow: getAddress(escrow),
     listingFeeUsdc,
     listingFeeUnits: parseUnits(listingFeeUsdc, USDC_DECIMALS),
     rpcUrl: env.INK_RPC_URL ?? INK_RPC_URL,
     dbPath: env.FOUR02_JOBS_DB_PATH ?? './jobs.db',
+    reputationRegistry: getAddress(reputationRegistry),
   };
 }

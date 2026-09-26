@@ -26,6 +26,8 @@ import { JobsDb } from '../src/jobs/db.js';
 import {
   BOUNTY_CLAIMED_TOPIC,
   BOUNTY_CREATED_TOPIC,
+  DISPUTE_RESOLVED_TOPIC,
+  JOB_REFUNDED_TOPIC,
   RAISE_DISPUTE_SELECTOR,
   RELEASE_SELECTOR,
   type GetTransaction,
@@ -133,6 +135,22 @@ function bountyClaimedLog(jobId: bigint, provider: string, agentId: bigint) {
       uintTopic(agentId),
     ],
     data: '0x',
+  };
+}
+
+function jobRefundedLog(jobId: bigint) {
+  return {
+    address: escrowAddr,
+    topics: [JOB_REFUNDED_TOPIC, uintTopic(jobId)],
+    data: '0x',
+  };
+}
+
+function disputeResolvedLog(jobId: bigint) {
+  return {
+    address: escrowAddr,
+    topics: [DISPUTE_RESOLVED_TOPIC, uintTopic(jobId)],
+    data: `0x${(50_000_000n).toString(16).padStart(64, '0')}${(50_000_000n).toString(16).padStart(64, '0')}`,
   };
 }
 
@@ -912,18 +930,231 @@ await check('db: disputed -> resolved; claimed -> refunded; wrong-state rejected
   assert.equal(db.disputeJob(idA, txHash('db-dispute-a'), now), 'ok');
   assert.equal(db.getJob(idA)?.state, 'disputed');
   assert.ok(typeof db.getJob(idA)?.disputedAt === 'number');
-  assert.equal(db.resolveJob(idA, now), 'ok');
+  assert.equal(db.resolveJob(idA, txHash('db-resolve-a'), now), 'ok');
   assert.equal(db.getJob(idA)?.state, 'resolved');
-  assert.equal(db.refundJob(idA, now), 'wrong_state'); // resolved is terminal
+  assert.equal(db.refundJob(idA, txHash('db-refund-a'), now), 'wrong_state'); // resolved is terminal
+  assert.equal(db.resolveJob(idA, txHash('db-resolve-a2'), now), 'wrong_state'); // resolve burns once
 
   const b = mk();
   assert.equal(b.ok, true);
   if (!b.ok) throw new Error('unreachable');
   const idB = b.id;
   assert.equal(db.claimJob(idB, worker.address, '7', txHash('db-claim-b'), now), 'ok');
-  assert.equal(db.refundJob(idB, now), 'ok');
+  assert.equal(db.refundJob(idB, txHash('db-refund-b'), now), 'ok');
   assert.equal(db.getJob(idB)?.state, 'refunded');
+
+  // open -> refunded is legal (unclaimed bounty refunded onchain); a
+  // disputed job can never be refunded onchain, so the DB must refuse it.
+  const cRow = mk();
+  assert.equal(cRow.ok, true);
+  if (!cRow.ok) throw new Error('unreachable');
+  const idC = cRow.id;
+  assert.equal(db.refundJob(idC, txHash('db-refund-c'), now), 'ok');
+  assert.equal(db.getJob(idC)?.state, 'refunded');
+
+  const d = mk();
+  assert.equal(d.ok, true);
+  if (!d.ok) throw new Error('unreachable');
+  const idD = d.id;
+  assert.equal(db.claimJob(idD, worker.address, '7', txHash('db-claim-d'), now), 'ok');
+  assert.equal(db.disputeJob(idD, txHash('db-dispute-d'), now), 'ok');
+  assert.equal(db.refundJob(idD, txHash('db-refund-d'), now), 'wrong_state'); // disputed can't refund
   db.close();
+});
+
+// ---- refund / resolve mirrors ----
+
+async function postRefundTx(jobId: number, escrowJobId: bigint, seed: string) {
+  const h = txHash(seed);
+  receipts.set(h.toLowerCase(), {
+    status: 'success',
+    logs: [jobRefundedLog(escrowJobId)],
+  });
+  return postJson(app, `/jobs/${jobId}/refund`, { txHash: h });
+}
+
+async function postResolveTx(jobId: number, escrowJobId: bigint, seed: string) {
+  const h = txHash(seed);
+  receipts.set(h.toLowerCase(), {
+    status: 'success',
+    logs: [disputeResolvedLog(escrowJobId)],
+  });
+  return postJson(app, `/jobs/${jobId}/resolve`, { txHash: h });
+}
+
+await check('refund mirror: open job + JobRefunded event -> refunded', async () => {
+  const before = activity.length;
+  const jobId = await postFundedJob('post-20', 20n); // stays open (unclaimed)
+  const res = await postRefundTx(jobId, 20n, 'refund-20');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.state, 'refunded');
+  const got = await getJson(app, `/jobs/${jobId}`);
+  assert.equal((got.body.job as Record<string, unknown>).state, 'refunded');
+  assert.equal(activity.length, before + 1);
+  assert.equal(activity[activity.length - 1]?.kind, 'refunded');
+});
+
+await check('refund mirror: claimed job (ghost path) -> refunded', async () => {
+  const jobId = await postFundedJob('post-21', 21n);
+  const claimed = await claimJob(jobId, AGENT_ID, 'claim-21');
+  assert.equal(claimed.status, 200);
+  const res = await postRefundTx(jobId, 21n, 'refund-21');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.state, 'refunded');
+});
+
+await check('refund mirror on a submitted job -> 409 (Delivered cannot refund onchain)', async () => {
+  const jobId = await postFundedJob('post-22', 22n);
+  await claimJob(jobId, AGENT_ID, 'claim-22');
+  await submitDeliverable(jobId);
+  const res = await postRefundTx(jobId, 22n, 'refund-22');
+  assert.equal(res.status, 409);
+  assert.equal(res.body.error, 'wrong_state');
+});
+
+await check('refund mirror on a disputed job -> 409 (refund reverts from Disputed onchain)', async () => {
+  const jobId = await postFundedJob('post-23', 23n);
+  await claimJob(jobId, AGENT_ID, 'claim-23');
+  const d = await raiseDispute(jobId, 23n, true, 'dispute-23');
+  assert.equal(d.status, 200);
+  const res = await postRefundTx(jobId, 23n, 'refund-23');
+  assert.equal(res.status, 409);
+  assert.equal(res.body.error, 'wrong_state');
+});
+
+await check('refund mirror with a tx lacking the event -> 402 refund_invalid', async () => {
+  const jobId = await postFundedJob('post-24', 24n);
+  const h = txHash('refund-24-bad');
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [] });
+  const res = await postJson(app, `/jobs/${jobId}/refund`, { txHash: h });
+  assert.equal(res.status, 402);
+  assert.equal(res.body.error, 'refund_invalid');
+});
+
+await check('refund mirror with an event for the wrong job -> 402 refund_invalid', async () => {
+  const jobId = await postFundedJob('post-25', 25n);
+  const res = await postRefundTx(jobId, 999n, 'refund-25-wrongjob');
+  assert.equal(res.status, 402);
+  assert.equal(res.body.error, 'refund_invalid');
+});
+
+await check('refund txHash replay -> 409 tx_hash_reused', async () => {
+  const jobId = await postFundedJob('post-26', 26n);
+  const h = txHash('refund-20'); // burned by the first refund mirror
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [jobRefundedLog(26n)] });
+  const res = await postJson(app, `/jobs/${jobId}/refund`, { txHash: h });
+  assert.equal(res.status, 409);
+  assert.equal(res.body.error, 'tx_hash_reused');
+});
+
+await check('resolve mirror: disputed + DisputeResolved event -> resolved', async () => {
+  const before = activity.length;
+  const jobId = await postFundedJob('post-27', 27n);
+  await claimJob(jobId, AGENT_ID, 'claim-27');
+  const d = await raiseDispute(jobId, 27n, false, 'dispute-27');
+  assert.equal(d.status, 200);
+  const res = await postResolveTx(jobId, 27n, 'resolve-27');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.state, 'resolved');
+  const got = await getJson(app, `/jobs/${jobId}`);
+  assert.equal((got.body.job as Record<string, unknown>).state, 'resolved');
+  assert.equal(activity.length, before + 1);
+  assert.equal(activity[activity.length - 1]?.kind, 'resolved');
+});
+
+await check('resolve mirror on a non-disputed job -> 409 wrong_state', async () => {
+  const jobId = await postFundedJob('post-28', 28n); // open
+  const res = await postResolveTx(jobId, 28n, 'resolve-28');
+  assert.equal(res.status, 409);
+  assert.equal(res.body.error, 'wrong_state');
+});
+
+await check('resolve mirror with a tx lacking the event -> 402 resolve_invalid', async () => {
+  const jobId = await postFundedJob('post-29', 29n);
+  await claimJob(jobId, AGENT_ID, 'claim-29');
+  await raiseDispute(jobId, 29n, true, 'dispute-29');
+  const h = txHash('resolve-29-bad');
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [] });
+  const res = await postJson(app, `/jobs/${jobId}/resolve`, { txHash: h });
+  assert.equal(res.status, 402);
+  assert.equal(res.body.error, 'resolve_invalid');
+});
+
+// ---- accept from claimed (worker delivered onchain, skipped API submit) ----
+
+await check('accept mirrors a verified release even when API submit was skipped', async () => {
+  const jobId = await postFundedJob('post-30', 30n);
+  const claimed = await claimJob(jobId, AGENT_ID, 'claim-30');
+  assert.equal(claimed.status, 200);
+  // No submitDeliverable: the worker called confirmDelivery onchain directly.
+  const h = txHash('accept-30');
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [] });
+  transactions.set(h.toLowerCase(), callTx(RELEASE_SELECTOR, 30n, requester.address));
+  const message = {
+    jobId: BigInt(jobId),
+    requester: requester.address,
+    decision: 'accept',
+    timestamp: BigInt(nowSec()),
+  };
+  const signature = await sign(requester, 'JobDecision', message);
+  const res = await postJson(app, `/jobs/${jobId}/accept`, {
+    jobId,
+    requester: requester.address,
+    decision: 'accept',
+    timestamp: Number(message.timestamp),
+    signature,
+    txHash: h,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.state, 'complete');
+});
+
+// ---- funding robustness ----
+
+await check('post accepts when a LATER BountyCreated event fully matches (first is underfunded)', async () => {
+  const body = await signedPost({ title: 'Batched funding' });
+  const h = txHash('batched-funding');
+  const amount = parseUnits(body.bountyUsdc as string, 6);
+  const deadline = BigInt(body.deadline as string);
+  const termsHash = body.termsHash as string;
+  receipts.set(h.toLowerCase(), {
+    status: 'success',
+    logs: [
+      transferLog(requester.address, escrowAddr, amount),
+      // Sibling bounty in the same tx: same payer, underfunded -> skipped, not fatal.
+      bountyCreatedLog(90n, requester.address, 1n, deadline, termsHash),
+      bountyCreatedLog(91n, requester.address, amount, deadline, termsHash),
+    ],
+  });
+  const res = await postJson(app, '/jobs', { ...body, txHash: h });
+  assert.equal(res.status, 201);
+  const got = await getJson(app, `/jobs/${res.body.jobId}`);
+  assert.equal((got.body.job as Record<string, unknown>).escrowJobId, '91');
+});
+
+await check('post with deadline beyond uint64 -> 400 invalid_deadline', async () => {
+  const body = await signedPost({ deadline: (2n ** 64n).toString() });
+  const res = await postJson(app, '/jobs', { ...body, txHash: txHash('huge-deadline') });
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'invalid_deadline');
+});
+
+// ---- config ----
+
+await check('loadJobsConfig honors FOUR02_REPUTATION_REGISTRY; malformed throws', () => {
+  const v2 = getAddress('0x1111111111111111111111111111111111111111');
+  const cfg = loadJobsConfig({
+    FOUR02_BOUNTY_ESCROW: escrowAddr,
+    FOUR02_REPUTATION_REGISTRY: v2,
+  });
+  assert.ok(cfg);
+  assert.equal(cfg.reputationRegistry, v2);
+  const def = loadJobsConfig({ FOUR02_BOUNTY_ESCROW: escrowAddr });
+  assert.ok(def);
+  assert.equal(def.reputationRegistry, '0x33E2c56035C059553a37a3A56199B5b5b3DA3365');
+  assert.throws(() =>
+    loadJobsConfig({ FOUR02_BOUNTY_ESCROW: escrowAddr, FOUR02_REPUTATION_REGISTRY: 'nope' }),
+  );
 });
 
 console.log(`\njobs: ${passed} checks passed`);

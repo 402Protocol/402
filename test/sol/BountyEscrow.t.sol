@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/src/Test.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {BountyEscrow, IIdentityRegistry} from "../../contracts/BountyEscrow.sol";
 import {Four02ReputationRegistryV2} from "../../contracts/Four02ReputationRegistryV2.sol";
 
@@ -52,6 +53,29 @@ contract MockUSDC {
     }
 }
 
+/// @notice Malicious ERC-8004 identity registry: ownerOf reenters
+/// claimBounty mid-claim. The escrow calls it via the IIdentityRegistry
+/// interface (a regular CALL, not a staticcall), so a hostile registry
+/// contract could reenter before provider/agentId are written.
+contract ReenteringRegistry {
+    BountyEscrow internal escrow;
+    address internal victim;
+    uint256 internal victimJob;
+    uint256 internal attackAgent;
+
+    function configure(BountyEscrow e, address v, uint256 jobId, uint256 agentId) external {
+        escrow = e;
+        victim = v;
+        victimJob = jobId;
+        attackAgent = agentId;
+    }
+
+    function ownerOf(uint256) external returns (address) {
+        escrow.claimBounty(victimJob, attackAgent);
+        return victim;
+    }
+}
+
 /// @notice Mock ERC-8004 identity registry: ownerOf is a test-controlled map.
 /// Unknown agentIds return address(0) (the real ERC-721 reverts; either way
 /// the escrow's claimBounty fails closed).
@@ -92,6 +116,9 @@ contract BountyEscrowTest is Test {
         uint256 indexed jobId, address indexed payer, uint256 amount, uint64 deadline, bytes32 termsHash
     );
     event BountyClaimed(uint256 indexed jobId, address indexed provider, uint256 indexed agentId);
+    event ReputationSkipped(
+        uint256 indexed jobId, uint256 indexed agentId, Four02ReputationRegistryV2.EventType eventType
+    );
 
     function setUp() public {
         usdc = new MockUSDC();
@@ -299,6 +326,38 @@ contract BountyEscrowTest is Test {
         escrow.claimBounty(jobId, 0);
     }
 
+    function test_ClaimBounty_ReentrancyBlocked() public {
+        // A hostile identity registry reenters claimBounty from inside
+        // ownerOf, before provider/agentId are written. The nonReentrant
+        // guard makes the inner call revert, which propagates and fails the
+        // whole claim closed — no partial state is written.
+        ReenteringRegistry evil = new ReenteringRegistry();
+        BountyEscrow evilEscrow = new BountyEscrow(
+            address(usdc),
+            arbiter,
+            feeRecipient,
+            FEE_BPS,
+            REFUND_DELAY,
+            guardian,
+            address(evil),
+            address(repRegistry)
+        );
+        vm.prank(payer);
+        usdc.approve(address(evilEscrow), type(uint256).max);
+        vm.prank(payer);
+        uint256 jobId = evilEscrow.createBounty(JOB_AMOUNT, uint64(block.timestamp + 7 days), keccak256("s"));
+        evil.configure(evilEscrow, worker, jobId, 777);
+
+        vm.prank(worker);
+        vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        evilEscrow.claimBounty(jobId, AGENT_ID);
+
+        BountyEscrow.Job memory job = evilEscrow.getJob(jobId);
+        assertEq(uint8(job.state), uint8(BountyEscrow.JobState.Open));
+        assertEq(job.provider, address(0));
+        assertEq(job.agentId, 0);
+    }
+
     // -- confirmDelivery ---------------------------------------------------------
 
     function test_ConfirmDelivery_HappyPath() public {
@@ -367,6 +426,25 @@ contract BountyEscrowTest is Test {
         escrowNoRep.claim(jobId);
         assertEq(usdc.balanceOf(worker), EXPECTED_PROVIDER);
         assertEq(repRegistry.getEventCount(AGENT_ID), 0); // nothing recorded
+    }
+
+    function test_Release_EmitsReputationSkippedWhenNotAllowlisted() public {
+        // The skipped reputation write is observable (ReputationSkipped),
+        // not silent: operators can see the empty writer allowlist here
+        // instead of discovering it from a missing resume.
+        vm.prank(payer);
+        uint256 jobId = escrowNoRep.createBounty(JOB_AMOUNT, uint64(block.timestamp + 7 days), keccak256("s"));
+        vm.prank(worker);
+        escrowNoRep.claimBounty(jobId, AGENT_ID);
+        vm.prank(worker);
+        escrowNoRep.confirmDelivery(jobId);
+
+        vm.expectEmit(true, true, false, true);
+        emit ReputationSkipped(jobId, AGENT_ID, Four02ReputationRegistryV2.EventType.EscrowCompleted);
+        vm.prank(payer);
+        escrowNoRep.release(jobId);
+
+        assertEq(escrowNoRep.claimable(jobId, worker), EXPECTED_PROVIDER);
     }
 
     function test_Release_RevertsForNonPayer() public {
@@ -493,6 +571,27 @@ contract BountyEscrowTest is Test {
         assertEq(uint8(_repEventType(AGENT_ID, 0)), uint8(Four02ReputationRegistryV2.EventType.WorkerGhosted));
         assertEq(uint8(Four02ReputationRegistryV2.EventType.WorkerGhosted), 9); // appended last, no shift
         assertEq(_repEventValue(AGENT_ID, 0), 0);
+    }
+
+    function test_Refund_GhostPath_EmitsReputationSkippedWhenNotAllowlisted() public {
+        // Ghost path with no writer allowlist: the payer is still refunded
+        // in full, and the skipped ghost write is emitted (not silent).
+        vm.prank(payer);
+        uint256 jobId = escrowNoRep.createBounty(JOB_AMOUNT, uint64(block.timestamp + 7 days), keccak256("s"));
+        vm.prank(worker);
+        escrowNoRep.claimBounty(jobId, AGENT_ID);
+        uint64 deadline = escrowNoRep.getJob(jobId).deadline;
+        vm.warp(deadline + REFUND_DELAY + 1);
+
+        vm.expectEmit(true, true, false, true);
+        emit ReputationSkipped(jobId, AGENT_ID, Four02ReputationRegistryV2.EventType.WorkerGhosted);
+        vm.prank(stranger);
+        escrowNoRep.refund(jobId);
+
+        assertEq(escrowNoRep.claimable(jobId, payer), JOB_AMOUNT);
+        vm.prank(payer);
+        escrowNoRep.claim(jobId);
+        assertEq(usdc.balanceOf(payer), 10_000_000_000);
     }
 
     function test_Refund_RevertsTooEarly() public {

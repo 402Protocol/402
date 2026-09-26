@@ -78,9 +78,9 @@ contract Four02ReputationRegistryV2 is Ownable {
 
     /// @notice Point-in-time reputation snapshot for an agent.
     /// @param reliability 0-100, value-weighted payment reliability.
-    /// @param disputeRateBps Active dispute signals (unwithdrawn
-    ///        DisputeOpened + WorkerGhosted) per completed commerce event,
-    ///        in basis points (10000 = 100%).
+    /// @param disputeRateBps Active dispute signals (unwithdrawn AND
+    ///        unresolved DisputeOpened + WorkerGhosted) per completed
+    ///        commerce event, in basis points (10000 = 100%).
     /// @param arbitrationWins Lifetime arbitration wins (no decay).
     /// @param arbitrationLosses Lifetime arbitration losses (no decay).
     /// @param totalEvents Raw event count (never decays).
@@ -166,6 +166,16 @@ contract Four02ReputationRegistryV2 is Ownable {
     /// @dev A withdrawn dispute neutralizes its DisputeOpened in disputeRate.
     mapping(uint256 => mapping(bytes32 => bool)) private _disputeWithdrawn;
 
+    /// @notice agentId => refId => a DisputeResolved was recorded.
+    /// @dev A RESOLVED dispute is no longer an ACTIVE signal: it neutralizes
+    ///      its DisputeOpened in disputeRate (the arbitration outcome itself
+    ///      stays visible in arbitrationRecord). Without this, any party
+    ///      could permanently ding a worker's disputeRate by raising a
+    ///      dispute the worker then WINS — the scar would outlive the
+    ///      exoneration. WorkerGhosted is never neutralized: a no-show is
+    ///      terminal, there is nothing to withdraw or resolve.
+    mapping(uint256 => mapping(bytes32 => bool)) private _disputeResolved;
+
     /// @notice 402 protocol contracts allowed to record commerce events.
     mapping(address => bool) public isWriter;
 
@@ -178,9 +188,21 @@ contract Four02ReputationRegistryV2 is Ownable {
     /// ghosting one bounty halves a one-$100-clean-invoice reliability.
     /// Owner-retunable like the other weights; scores are derived views, so
     /// retuning takes effect immediately with no history migration.
+    /// Capped at MAX_GHOST_PENALTY_USDC: an uncapped penalty could overflow
+    /// the reliability math and brick the view for ghosted agents.
     uint256 public ghostPenaltyUsdc = 100_000_000;
     /// @notice Linear decay window for headline scores (default 365 days).
+    /// Capped at MAX_DECAY_WINDOW for the same overflow reason.
     uint256 public decayWindow = 365 days;
+
+    /// @notice Upper bound for setGhostPenalty ($1M USDC, 6 decimals).
+    /// 10,000x the default: generous headroom, still overflow-safe in the
+    /// reliability math (penalty * decayWindow stays far below 2^256).
+    uint256 public constant MAX_GHOST_PENALTY_USDC = 1_000_000_000_000;
+    /// @notice Upper bound for setDecayWindow (10 years). Keeps
+    /// (decayWindow * 10_000) and (value * decayWeight * weightBps) inside
+    /// uint256 for every reachable input.
+    uint256 public constant MAX_DECAY_WINDOW = 3650 days;
 
     // ------------------------------------------------------------------------
     // Constructor
@@ -211,6 +233,11 @@ contract Four02ReputationRegistryV2 is Ownable {
     ) external {
         if (!isWriter[msg.sender]) revert NotWriter();
         if (agentId == 0) revert ZeroAgentId();
+        // Values must fit int128: readFeedback/getSummary expose them as
+        // int128, and the reliability math multiplies value by the decay
+        // weight — an uncapped value could overflow and brick the views for
+        // the agent. Writers are trusted, this is defense in depth.
+        if (value > uint256(int256(type(int128).max))) revert ValueTooLarge();
 
         events[agentId].push(
             CommerceEvent({
@@ -229,6 +256,9 @@ contract Four02ReputationRegistryV2 is Ownable {
         }
         if (eventType == EventType.DisputeWithdrawn) {
             _disputeWithdrawn[agentId][refId] = true;
+        }
+        if (eventType == EventType.DisputeResolved) {
+            _disputeResolved[agentId][refId] = true;
         }
 
         emit CommerceEventRecorded(agentId, eventType, value, refId, msg.sender, counterparty);
@@ -271,17 +301,19 @@ contract Four02ReputationRegistryV2 is Ownable {
     ///         history migration.
     /// @param ghostPenaltyUsdc_ USDC (6 decimals) added per ghost to
     ///        reliability's denominator, with zero credit. Must be nonzero
-    ///        (a zero penalty would make ghosts invisible to reliability).
+    ///        (a zero penalty would make ghosts invisible to reliability)
+    ///        and at most MAX_GHOST_PENALTY_USDC (overflow safety).
     function setGhostPenalty(uint256 ghostPenaltyUsdc_) external onlyOwner {
-        if (ghostPenaltyUsdc_ == 0) revert BadGhostPenalty();
+        if (ghostPenaltyUsdc_ == 0 || ghostPenaltyUsdc_ > MAX_GHOST_PENALTY_USDC) revert BadGhostPenalty();
         ghostPenaltyUsdc = ghostPenaltyUsdc_;
         emit GhostPenaltyUpdated(ghostPenaltyUsdc_);
     }
 
     /// @notice Retune the linear decay window for headline scores.
-    /// @param decayWindow_ Must be nonzero.
+    /// @param decayWindow_ Must be nonzero and at most MAX_DECAY_WINDOW
+    ///        (overflow safety — the reliability math multiplies by it).
     function setDecayWindow(uint256 decayWindow_) external onlyOwner {
-        if (decayWindow_ == 0) revert BadDecayWindow();
+        if (decayWindow_ == 0 || decayWindow_ > MAX_DECAY_WINDOW) revert BadDecayWindow();
         decayWindow = decayWindow_;
         emit DecayWindowUpdated(decayWindow_);
     }
@@ -302,11 +334,14 @@ contract Four02ReputationRegistryV2 is Ownable {
     }
 
     /// @notice Active dispute signals per completed commerce event, in bps.
-    /// @dev Dispute signals = DisputeOpened not neutralized by a matching
-    ///      DisputeWithdrawn (same refId), PLUS WorkerGhosted (a ghost is a
-    ///      dispute signal and is never withdrawn). Completed commerce =
-    ///      escrows completed + invoices paid (on time or late). Returns 0
-    ///      when there is no (undecayed) completed commerce.
+    /// @dev Dispute signals = DisputeOpened neutralized by NEITHER a
+    ///      matching DisputeWithdrawn NOR a matching DisputeResolved (same
+    ///      refId), PLUS WorkerGhosted (a ghost is a dispute signal and is
+    ///      never withdrawn or resolved). A resolved dispute is no longer
+    ///      active — the arbitration outcome stays visible in
+    ///      arbitrationRecord. Completed commerce = escrows completed +
+    ///      invoices paid (on time or late). Returns 0 when there is no
+    ///      (undecayed) completed commerce.
     function disputeRate(uint256 agentId) external view returns (uint256) {
         return _disputeRate(agentId);
     }
@@ -501,8 +536,12 @@ contract Four02ReputationRegistryV2 is Ownable {
             if (w == 0) continue;
             EventType t = e.eventType;
             if (t == EventType.DisputeOpened) {
-                // A withdrawn dispute (same refId) cancels the signal.
-                if (!_disputeWithdrawn[agentId][e.refId]) disputeW += w;
+                // A withdrawn OR resolved dispute (same refId) is no longer
+                // an active signal: withdrawals cancel the claim, resolutions
+                // end it (the outcome lives in arbitrationRecord).
+                if (!_disputeWithdrawn[agentId][e.refId] && !_disputeResolved[agentId][e.refId]) {
+                    disputeW += w;
+                }
             } else if (t == EventType.WorkerGhosted) {
                 // A ghost IS a dispute signal: it counts in the numerator
                 // like DisputeOpened. Unlike DisputeOpened it is NEVER

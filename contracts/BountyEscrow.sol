@@ -186,6 +186,14 @@ contract BountyEscrow is ReentrancyGuard {
     );
     event RotationConfirmed(address indexed oldArbiter, address indexed newArbiter);
     event RotationCancelled(address indexed canceller, address indexed newArbiter);
+    /// @notice Emitted when a reputation write was SKIPPED because the
+    /// registry call reverted (e.g. this escrow was never allowlisted via
+    /// addWriter). The payout path continued untouched — reputation is
+    /// best-effort by design. Operators: an empty writer allowlist after
+    /// deploy shows up here, not in a bricked payout.
+    event ReputationSkipped(
+        uint256 indexed jobId, uint256 indexed agentId, Four02ReputationRegistryV2.EventType eventType
+    );
 
     // ------------------------------------------------------------------------
     // Constructor
@@ -273,10 +281,12 @@ contract BountyEscrow is ReentrancyGuard {
     /// trustlessly: IDENTITY_REGISTRY.ownerOf(agentId) must equal msg.sender,
     /// re-checked at every claim — a stale offchain enrollment row can never
     /// claim. The agentId is what reputation events are keyed to.
-    /// @dev M2: the payer cannot claim their own bounty. No nonReentrant:
-    /// the only external call is a view (staticcall) to the identity
-    /// registry, which cannot reenter state-changingly.
-    function claimBounty(uint256 jobId, uint256 agentId) external {
+    /// @dev M2: the payer cannot claim their own bounty. nonReentrant:
+    /// ownerOf is a REGULAR external call (not a staticcall) into a
+    /// deploy-time-chosen registry address — state is written only after it
+    /// returns, so a malicious registry contract could otherwise reenter and
+    /// overwrite provider/agentId mid-claim.
+    function claimBounty(uint256 jobId, uint256 agentId) external nonReentrant {
         Job storage job = _getJob(jobId);
         if (job.state != JobState.Open) revert BadState();
         if (msg.sender == job.payer) revert SelfDealing();
@@ -504,7 +514,9 @@ contract BountyEscrow is ReentrancyGuard {
     /// @dev try/catch is load-bearing: if this escrow was never allowlisted
     /// via addWriter (NotWriter revert), or the registry is otherwise
     /// unhappy, the revert is swallowed and the payout path continues
-    /// untouched. Reputation must never be able to brick a payout.
+    /// untouched. Reputation must never be able to brick a payout. The
+    /// skip is emitted (ReputationSkipped) so a missing allowlist is
+    /// observable instead of silent.
     function _recordRep(
         uint256 agentId,
         Four02ReputationRegistryV2.EventType eventType,
@@ -513,6 +525,8 @@ contract BountyEscrow is ReentrancyGuard {
         address counterparty
     ) internal {
         try reputationRegistry.recordCommerceEvent(agentId, eventType, value, bytes32(jobId), counterparty) {}
-        catch {}
+        catch {
+            emit ReputationSkipped(jobId, agentId, eventType);
+        }
     }
 }

@@ -165,6 +165,33 @@ contract Four02ReputationRegistryV2Test is Test {
         );
     }
 
+    function test_RecordValueTooLargeReverts() public {
+        // Values must fit int128 (readFeedback/getSummary expose int128, and
+        // the reliability math multiplies by the decay weight): an uncapped
+        // writer value could overflow and brick the views for the agent.
+        vm.prank(writer);
+        vm.expectRevert(Four02ReputationRegistryV2.ValueTooLarge.selector);
+        reg.recordCommerceEvent(
+            AGENT,
+            Four02ReputationRegistryV2.EventType.InvoicePaidOnTime,
+            uint256(int256(type(int128).max)) + 1,
+            bytes32(uint256(1)),
+            counterparty
+        );
+    }
+
+    function test_RecordMaxInt128ValueDoesNotBrickViews() public {
+        _record(
+            AGENT,
+            Four02ReputationRegistryV2.EventType.InvoicePaidOnTime,
+            uint256(int256(type(int128).max)),
+            bytes32(uint256(1))
+        );
+        assertEq(reg.reliability(AGENT), 100);
+        (int128 v,,,,) = reg.readFeedback(AGENT, writer, 1);
+        assertEq(v, type(int128).max);
+    }
+
     // ------------------------------------------------------------------------
     // Writer allowlist (owner only)
     // ------------------------------------------------------------------------
@@ -371,6 +398,20 @@ contract Four02ReputationRegistryV2Test is Test {
         reg.setGhostPenalty(0);
     }
 
+    function test_SetGhostPenalty_CappedAtMax() public {
+        // An uncapped penalty could overflow the reliability math and brick
+        // the view for ghosted agents (owner fat-finger / compromised key).
+        uint256 overMax = reg.MAX_GHOST_PENALTY_USDC() + 1;
+        vm.prank(owner);
+        vm.expectRevert(Four02ReputationRegistryV2.BadGhostPenalty.selector);
+        reg.setGhostPenalty(overMax);
+
+        uint256 maxPenalty = reg.MAX_GHOST_PENALTY_USDC();
+        vm.prank(owner);
+        reg.setGhostPenalty(maxPenalty); // boundary ok
+        assertEq(reg.ghostPenaltyUsdc(), maxPenalty);
+    }
+
     function test_SetGhostPenalty_TakesEffectImmediately() public {
         _record(AGENT, Four02ReputationRegistryV2.EventType.InvoicePaidOnTime, HUNDRED_USDC, bytes32(uint256(1)));
         _record(AGENT, Four02ReputationRegistryV2.EventType.WorkerGhosted, 0, bytes32(uint256(2)));
@@ -433,6 +474,44 @@ contract Four02ReputationRegistryV2Test is Test {
         _record(AGENT, Four02ReputationRegistryV2.EventType.EscrowCompleted, HUNDRED_USDC, bytes32(uint256(1)));
         _record(AGENT, Four02ReputationRegistryV2.EventType.DisputeResolved, 0, bytes32(uint256(2)));
         assertEq(reg.disputeRate(AGENT), 0);
+    }
+
+    function test_DisputeRate_ResolvedDisputeNeutralizesOpened() public {
+        // A dispute the arbiter RESOLVED is no longer an ACTIVE signal —
+        // even when the worker wins. Without this, any party could
+        // permanently ding a worker's disputeRate by raising a dispute the
+        // worker then wins: the scar would outlive the exoneration.
+        _record(AGENT, Four02ReputationRegistryV2.EventType.EscrowCompleted, HUNDRED_USDC, bytes32(uint256(1)));
+        _record(AGENT, Four02ReputationRegistryV2.EventType.DisputeOpened, 0, bytes32(uint256(2)));
+        assertEq(reg.disputeRate(AGENT), 10_000);
+        _record(AGENT, Four02ReputationRegistryV2.EventType.DisputeResolved, 0, bytes32(uint256(2)));
+        _record(AGENT, Four02ReputationRegistryV2.EventType.ArbitrationWon, HUNDRED_USDC, bytes32(uint256(2)));
+        assertEq(reg.disputeRate(AGENT), 0);
+        // ...but the arbitration outcome stays on the record.
+        (uint256 wins, uint256 losses) = reg.arbitrationRecord(AGENT);
+        assertEq(wins, 1);
+        assertEq(losses, 0);
+    }
+
+    function test_DisputeRate_LostDisputeAlsoNeutralized() public {
+        // A lost arbitration stops counting as an ACTIVE signal too — the
+        // loss is what arbitrationRecord is for.
+        _record(AGENT, Four02ReputationRegistryV2.EventType.EscrowCompleted, HUNDRED_USDC, bytes32(uint256(1)));
+        _record(AGENT, Four02ReputationRegistryV2.EventType.DisputeOpened, 0, bytes32(uint256(2)));
+        _record(AGENT, Four02ReputationRegistryV2.EventType.DisputeResolved, 0, bytes32(uint256(2)));
+        _record(AGENT, Four02ReputationRegistryV2.EventType.ArbitrationLost, HUNDRED_USDC, bytes32(uint256(2)));
+        assertEq(reg.disputeRate(AGENT), 0);
+        (, uint256 losses) = reg.arbitrationRecord(AGENT);
+        assertEq(losses, 1);
+    }
+
+    function test_DisputeRate_ResolvedDifferentRefIdStillCounts() public {
+        // Neutralization is per refId: a resolution for another job does
+        // not cancel this dispute's signal.
+        _record(AGENT, Four02ReputationRegistryV2.EventType.EscrowCompleted, HUNDRED_USDC, bytes32(uint256(1)));
+        _record(AGENT, Four02ReputationRegistryV2.EventType.DisputeOpened, 0, bytes32(uint256(2)));
+        _record(AGENT, Four02ReputationRegistryV2.EventType.DisputeResolved, 0, bytes32(uint256(99)));
+        assertEq(reg.disputeRate(AGENT), 10_000);
     }
 
     function test_DisputeRate_InvoicesCountAsCompleted() public {
@@ -539,6 +618,18 @@ contract Four02ReputationRegistryV2Test is Test {
         vm.prank(owner);
         vm.expectRevert(Four02ReputationRegistryV2.BadDecayWindow.selector);
         reg.setDecayWindow(0);
+
+        // Uncapped, decayWindow * 10_000 in the reliability math could
+        // overflow and brick the views.
+        uint256 overMaxWindow = reg.MAX_DECAY_WINDOW() + 1;
+        vm.prank(owner);
+        vm.expectRevert(Four02ReputationRegistryV2.BadDecayWindow.selector);
+        reg.setDecayWindow(overMaxWindow);
+
+        uint256 maxWindow = reg.MAX_DECAY_WINDOW();
+        vm.prank(owner);
+        reg.setDecayWindow(maxWindow); // boundary ok
+        assertEq(reg.decayWindow(), maxWindow);
 
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", stranger));

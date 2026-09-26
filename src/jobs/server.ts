@@ -8,6 +8,8 @@
  *   POST /jobs/:id/submit           -> worker submits deliverable (signed JobSubmit)
  *   POST /jobs/:id/accept           -> requester accepts (signed JobDecision + release txHash)
  *   POST /jobs/:id/dispute          -> either party disputes (signed JobDecision + raiseDispute txHash)
+ *   POST /jobs/:id/refund           -> mirror an onchain refund (refund txHash, permissionless)
+ *   POST /jobs/:id/resolve          -> mirror an onchain arbitration (resolveDispute txHash, permissionless)
  *   POST /jobs/enroll               -> worker enrollment (signed JobEnroll + onchain ownerOf check)
  *   GET  /jobs/workers/:wallet      -> enrollment record
  *   GET  /jobs/worker/:agentId/history -> DB history + onchain reputation summary
@@ -51,7 +53,9 @@ import {
   defaultReputationSummary,
   verifyBountyClaimed,
   verifyBountyFunding,
+  verifyDisputeResolved,
   verifyEscrowCall,
+  verifyJobRefunded,
   type GetTransaction,
   type IdentityOwner,
   type ReputationSummary,
@@ -86,7 +90,14 @@ export const JOB_URI_MAX = 2048;
 export const JOBS_ACTION_BUCKET = { windowMs: 60_000, max: 30 };
 
 export interface JobActivityEvent {
-  kind: 'posted' | 'claimed' | 'submitted' | 'completed' | 'disputed';
+  kind:
+    | 'posted'
+    | 'claimed'
+    | 'submitted'
+    | 'completed'
+    | 'disputed'
+    | 'resolved'
+    | 'refunded';
   jobId: number;
   actor: string;
   title: string;
@@ -185,7 +196,8 @@ export function createJobsApp(
     deps.getTransaction ?? defaultGetTransaction(config.rpcUrl);
   const identityOwner = deps.identityOwner ?? defaultIdentityOwner(config.rpcUrl);
   const reputationSummary =
-    deps.reputationSummary ?? defaultReputationSummary(config.rpcUrl);
+    deps.reputationSummary ??
+    defaultReputationSummary(config.rpcUrl, config.reputationRegistry);
   const limiter = new AuthorRateLimiter();
 
   async function readBody(
@@ -390,8 +402,14 @@ export function createJobsApp(
     }
     const deadlineBig = parseUint(deadline);
     const nowSec = Math.floor(Date.now() / 1000);
-    if (deadlineBig === null || deadlineBig <= BigInt(nowSec)) {
-      return bad(c, 400, 'invalid_deadline', 'deadline must be a future unix timestamp');
+    // The escrow takes a uint64 deadline: bound it here so the DB (which
+    // stores Number(deadline)) and the onchain value can never diverge.
+    if (
+      deadlineBig === null ||
+      deadlineBig <= BigInt(nowSec) ||
+      deadlineBig > 0xffffffffffffffffn
+    ) {
+      return bad(c, 400, 'invalid_deadline', 'deadline must be a future unix timestamp (uint64)');
     }
     const terms = parseBytes32(termsHash);
     if (terms === null) {
@@ -727,8 +745,13 @@ export function createJobsApp(
     if (id === null) return bad(c, 400, 'invalid_job_id');
     const listing = db.getJob(id);
     if (!listing) return bad(c, 404, 'job_not_found');
-    if (listing.state !== 'submitted') {
-      return bad(c, 409, 'wrong_state', `job is ${listing.state}, not submitted`);
+    if (listing.state !== 'submitted' && listing.state !== 'claimed') {
+      return bad(
+        c,
+        409,
+        'wrong_state',
+        `job is ${listing.state}; accept needs submitted/claimed`,
+      );
     }
     const parsed = await readBody(c);
     if (!parsed.ok) return bad(c, parsed.status, parsed.error);
@@ -891,6 +914,121 @@ export function createJobsApp(
       bountyUsdc: listing.bountyUsdc,
     });
     return c.json({ jobId: id, state: 'disputed', disputedAt: now });
+  });
+
+  // ---- terminal mirrors: refund / resolve ----
+  //
+  // These two endpoints are intentionally UNSIGNED. The escrow's refund()
+  // and resolveDispute() are permissionless onchain calls, and the API only
+  // MIRRORS a verified onchain event (JobRefunded / DisputeResolved) into
+  // the DB — there is no signature that could attest to anything the event
+  // doesn't already prove. The single-use txHash burn makes replays
+  // impossible; rate limits are per job rather than per author. Without
+  // these mirrors, refunded/arbitrated jobs would sit in stale DB states
+  // forever (the DB must never INVENT an outcome, but it must reflect real
+  // ones).
+  //
+  // Reorg note: like every txHash check in this API, verification is
+  // point-in-time against the RPC's current head. A deep reorg that un-happens
+  // the mirrored tx would leave a stale row; v0 accepts this (Ink finality
+  // is fast, and money movement is always re-verifiable onchain).
+
+  app.post('/:id/refund', async (c) => {
+    const id = jobIdParam(c);
+    if (id === null) return bad(c, 400, 'invalid_job_id');
+    const listing = db.getJob(id);
+    if (!listing) return bad(c, 404, 'job_not_found');
+    // Mirrors the escrow: refund() only succeeds from Open/Funded onchain.
+    if (listing.state !== 'open' && listing.state !== 'claimed') {
+      return bad(
+        c,
+        409,
+        'wrong_state',
+        `job is ${listing.state}; refund needs open/claimed`,
+      );
+    }
+    const parsed = await readBody(c);
+    if (!parsed.ok) return bad(c, parsed.status, parsed.error);
+    const { txHash } = parsed.body as Record<string, unknown>;
+
+    if (!limiter.take(`jobs-refund:${id}`, JOBS_ACTION_BUCKET)) {
+      return bad(c, 429, 'rate_limited', 'slow down');
+    }
+    const txCheck = checkTxHash(c, txHash);
+    if (!txCheck.ok) return txCheck.res;
+
+    // Verify the onchain refund: JobRefunded(escrowJobId) emitted by the
+    // escrow contract. The contract itself records WorkerGhosted for a
+    // claimed-but-undelivered bounty — the API never writes reputation.
+    const refunded = await verifyJobRefunded({
+      getReceipt,
+      txHash: txCheck.txHash,
+      escrow: config.escrow,
+      escrowJobId: BigInt(listing.escrowJobId),
+    });
+    if (!refunded.ok) {
+      return bad(c, receiptStatus(refunded.reason), 'refund_invalid', refunded.reason);
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const res = db.refundJob(id, txCheck.txHash, now);
+    if (res === 'tx_reused') return bad(c, 409, 'tx_hash_reused');
+    if (res !== 'ok') return bad(c, 409, 'wrong_state', 'job can no longer be refunded');
+
+    deps.onActivity?.({
+      kind: 'refunded',
+      jobId: id,
+      actor: listing.requester,
+      title: listing.title,
+      bountyUsdc: listing.bountyUsdc,
+    });
+    return c.json({ jobId: id, state: 'refunded' });
+  });
+
+  app.post('/:id/resolve', async (c) => {
+    const id = jobIdParam(c);
+    if (id === null) return bad(c, 400, 'invalid_job_id');
+    const listing = db.getJob(id);
+    if (!listing) return bad(c, 404, 'job_not_found');
+    if (listing.state !== 'disputed') {
+      return bad(c, 409, 'wrong_state', `job is ${listing.state}, not disputed`);
+    }
+    const parsed = await readBody(c);
+    if (!parsed.ok) return bad(c, parsed.status, parsed.error);
+    const { txHash } = parsed.body as Record<string, unknown>;
+
+    if (!limiter.take(`jobs-resolve:${id}`, JOBS_ACTION_BUCKET)) {
+      return bad(c, 429, 'rate_limited', 'slow down');
+    }
+    const txCheck = checkTxHash(c, txHash);
+    if (!txCheck.ok) return txCheck.res;
+
+    // Verify the onchain arbitration: DisputeResolved(escrowJobId, ...)
+    // emitted by the escrow contract. The contract recorded
+    // DisputeResolved + ArbitrationWon/Lost itself — the API only mirrors.
+    const resolved = await verifyDisputeResolved({
+      getReceipt,
+      txHash: txCheck.txHash,
+      escrow: config.escrow,
+      escrowJobId: BigInt(listing.escrowJobId),
+    });
+    if (!resolved.ok) {
+      return bad(c, receiptStatus(resolved.reason), 'resolve_invalid', resolved.reason);
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const res = db.resolveJob(id, txCheck.txHash, now);
+    if (res === 'tx_reused') return bad(c, 409, 'tx_hash_reused');
+    if (res !== 'ok') return bad(c, 409, 'wrong_state', 'job can no longer be resolved');
+
+    deps.onActivity?.({
+      kind: 'resolved',
+      jobId: id,
+      actor: listing.worker ?? listing.requester,
+      title: listing.title,
+      bountyUsdc: listing.bountyUsdc,
+    });
+    return c.json({ jobId: id, state: 'resolved' });
   });
 
   return app;

@@ -27,7 +27,7 @@ export type JobState =
   | 'refunded';
 
 /** txHash purposes burned in used_tx_hashes. */
-export type JobsTxPurpose = 'post' | 'claim' | 'accept' | 'dispute';
+export type JobsTxPurpose = 'post' | 'claim' | 'accept' | 'dispute' | 'refund' | 'resolve';
 
 export interface JobListing {
   id: number;
@@ -351,7 +351,15 @@ export class JobsDb {
     });
   }
 
-  /** submitted -> complete (requester accepted; release verified onchain). */
+  /** submitted -> complete (requester accepted; release verified onchain).
+   *
+   * `claimed` is also accepted as a source: confirmDelivery is a
+   * permissionless onchain call, so a worker can deliver without ever
+   * touching the API's submit endpoint. When a verified release() exists
+   * onchain, the DB mirrors it rather than stranding the listing in
+   * `claimed` forever. The release tx itself proves payer approval +
+   * worker delivery — nothing is invented.
+   */
   acceptJob(
     id: number,
     txHash: string,
@@ -360,7 +368,9 @@ export class JobsDb {
     return this.txn(() => {
       const listing = this.getJob(id);
       if (!listing) return 'not_found';
-      if (listing.state !== 'submitted') return 'wrong_state';
+      if (listing.state !== 'submitted' && listing.state !== 'claimed') {
+        return 'wrong_state';
+      }
       if (!this.markTxUsed('accept', txHash, id, now)) return 'tx_reused';
       this.db
         .prepare(
@@ -393,14 +403,54 @@ export class JobsDb {
     });
   }
 
-  /** disputed -> resolved (arbiter outcome mirrored; no endpoint in v0). */
-  resolveJob(id: number, now: number): 'ok' | 'not_found' | 'wrong_state' {
-    return this.transition(id, ['disputed'], 'resolved', now);
+  /** disputed -> resolved (arbiter outcome mirrored; resolve endpoint). */
+  resolveJob(
+    id: number,
+    txHash: string,
+    now: number,
+  ): 'ok' | 'not_found' | 'wrong_state' | 'tx_reused' {
+    return this.txn(() => {
+      const listing = this.getJob(id);
+      if (!listing) return 'not_found';
+      if (listing.state !== 'disputed') return 'wrong_state';
+      if (!this.markTxUsed('resolve', txHash, id, now)) return 'tx_reused';
+      this.db
+        .prepare(
+          "UPDATE job_listings SET state = 'resolved', updated_at = ? WHERE id = ?",
+        )
+        .run(now, id);
+      return 'ok';
+    });
   }
 
-  /** claimed|disputed -> refunded (deadline + refundDelay passed; no endpoint in v0). */
-  refundJob(id: number, now: number): 'ok' | 'not_found' | 'wrong_state' {
-    return this.transition(id, ['claimed', 'disputed'], 'refunded', now);
+  /**
+   * open|claimed -> refunded (deadline + refundDelay passed onchain; refund
+   * endpoint mirrors the JobRefunded event).
+   *
+   * `disputed` is deliberately NOT a source: the escrow's refund() reverts
+   * from Disputed onchain, so a disputed -> refunded row would invent an
+   * outcome that can never happen. `submitted` is excluded for the same
+   * reason (Delivered can't be refunded — the payer must release/dispute).
+   */
+  refundJob(
+    id: number,
+    txHash: string,
+    now: number,
+  ): 'ok' | 'not_found' | 'wrong_state' | 'tx_reused' {
+    return this.txn(() => {
+      const listing = this.getJob(id);
+      if (!listing) return 'not_found';
+      if (listing.state !== 'open' && listing.state !== 'claimed') {
+        return 'wrong_state';
+      }
+      if (!this.markTxUsed('refund', txHash, id, now)) return 'tx_reused';
+      this.db
+        .prepare(
+          "UPDATE job_listings SET state = 'refunded', updated_at = ? WHERE id = ?",
+        )
+        .run(now, id);
+      return 'ok';
+    });
   }
 
   /**

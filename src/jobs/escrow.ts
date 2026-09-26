@@ -44,7 +44,7 @@ export const IDENTITY_REGISTRY =
 
 /**
  * Four02ReputationRegistry V1 on Ink (deployed 2026-09-25) — SUPERSEDED.
- * Switch to the V2 address after Four02ReputationRegistryV2 deploys.
+ * Default for FOUR02_REPUTATION_REGISTRY until the V2 address is set.
  */
 export const REPUTATION_REGISTRY =
   '0x33E2c56035C059553a37a3A56199B5b5b3DA3365' as const;
@@ -57,6 +57,14 @@ export const BOUNTY_CREATED_TOPIC = keccak256(
 /** keccak256("BountyClaimed(uint256,address,uint256)") */
 export const BOUNTY_CLAIMED_TOPIC = keccak256(
   toHex('BountyClaimed(uint256,address,uint256)'),
+);
+
+/** keccak256("JobRefunded(uint256)") */
+export const JOB_REFUNDED_TOPIC = keccak256(toHex('JobRefunded(uint256)'));
+
+/** keccak256("DisputeResolved(uint256,uint256,uint256)") */
+export const DISPUTE_RESOLVED_TOPIC = keccak256(
+  toHex('DisputeResolved(uint256,uint256,uint256)'),
 );
 
 /** 4-byte selectors for the escrow calls we verify via tx calldata. */
@@ -168,6 +176,11 @@ export async function verifyBountyFunding(opts: {
 
   const escrowLc = opts.escrow.toLowerCase();
   let jobId: bigint | null = null;
+  // First mismatch reason, for a precise error when NOTHING fully matches.
+  // Mismatched events are skipped (not fatal): one tx can carry several
+  // BountyCreated events (e.g. a batched post), and a single underfunded
+  // sibling must not veto the fully-matching one.
+  let mismatchReason: string | null = null;
   for (const log of receipt.logs) {
     if (log.address.toLowerCase() !== escrowLc) continue;
     if (log.topics.length < 3) continue;
@@ -187,16 +200,24 @@ export async function verifyBountyFunding(opts: {
     } catch {
       continue;
     }
-    if (amount < opts.minUnits) return { ok: false, reason: 'bounty_underfunded' };
+    if (amount < opts.minUnits) {
+      mismatchReason ??= 'bounty_underfunded';
+      continue;
+    }
     if (deadline !== opts.expectedDeadline) {
-      return { ok: false, reason: 'deadline_mismatch' };
+      mismatchReason ??= 'deadline_mismatch';
+      continue;
     }
     if (termsHash.toLowerCase() !== opts.expectedTermsHash.toLowerCase()) {
-      return { ok: false, reason: 'terms_hash_mismatch' };
+      mismatchReason ??= 'terms_hash_mismatch';
+      continue;
     }
     jobId = BigInt(log.topics[1] as string);
+    break;
   }
-  if (jobId === null) return { ok: false, reason: 'no_bounty_created_event' };
+  if (jobId === null) {
+    return { ok: false, reason: mismatchReason ?? 'no_bounty_created_event' };
+  }
 
   // The event is emitted by the escrow; still require the USDC movement
   // itself (Transfer requester -> escrow >= bounty) — the blackjack buy-in
@@ -248,6 +269,70 @@ export async function verifyBountyClaimed(opts: {
     return { ok: true };
   }
   return { ok: false, reason: 'no_bounty_claimed_event' };
+}
+
+/**
+ * Verify a refund(uint256) receipt: JobRefunded(jobId) emitted by the
+ * escrow contract. Unlike release/raiseDispute, refund DOES emit an event,
+ * so logs — not calldata — are the binding.
+ */
+export async function verifyJobRefunded(opts: {
+  getReceipt: GetReceipt;
+  txHash: string;
+  escrow: Address;
+  escrowJobId: bigint;
+}): Promise<Check> {
+  if (malformedTxHash(opts.txHash)) {
+    return { ok: false, reason: 'malformed_tx_hash' };
+  }
+  const receipt = await opts.getReceipt(opts.txHash as Hex);
+  if (!receipt) return { ok: false, reason: 'receipt_not_found' };
+  if (receipt.status !== 'success') return { ok: false, reason: 'tx_failed' };
+
+  const escrowLc = opts.escrow.toLowerCase();
+  const jobTopic = uintTopic(opts.escrowJobId);
+  for (const log of receipt.logs) {
+    if (log.address.toLowerCase() !== escrowLc) continue;
+    if (log.topics.length < 2) continue;
+    if (log.topics[0]?.toLowerCase() !== JOB_REFUNDED_TOPIC.toLowerCase()) {
+      continue;
+    }
+    if (log.topics[1]?.toLowerCase() !== jobTopic) continue;
+    return { ok: true };
+  }
+  return { ok: false, reason: 'no_job_refunded_event' };
+}
+
+/**
+ * Verify a resolveDispute(uint256,uint256) receipt:
+ * DisputeResolved(jobId, providerAmount, payerAmount) emitted by the escrow
+ * contract. Like refund, this one DOES emit an event.
+ */
+export async function verifyDisputeResolved(opts: {
+  getReceipt: GetReceipt;
+  txHash: string;
+  escrow: Address;
+  escrowJobId: bigint;
+}): Promise<Check> {
+  if (malformedTxHash(opts.txHash)) {
+    return { ok: false, reason: 'malformed_tx_hash' };
+  }
+  const receipt = await opts.getReceipt(opts.txHash as Hex);
+  if (!receipt) return { ok: false, reason: 'receipt_not_found' };
+  if (receipt.status !== 'success') return { ok: false, reason: 'tx_failed' };
+
+  const escrowLc = opts.escrow.toLowerCase();
+  const jobTopic = uintTopic(opts.escrowJobId);
+  for (const log of receipt.logs) {
+    if (log.address.toLowerCase() !== escrowLc) continue;
+    if (log.topics.length < 2) continue;
+    if (log.topics[0]?.toLowerCase() !== DISPUTE_RESOLVED_TOPIC.toLowerCase()) {
+      continue;
+    }
+    if (log.topics[1]?.toLowerCase() !== jobTopic) continue;
+    return { ok: true };
+  }
+  return { ok: false, reason: 'no_dispute_resolved_event' };
 }
 
 /**
@@ -331,19 +416,24 @@ const SUMMARY_ABI = [
 ] as const;
 
 /**
- * summary(agentId) on the Four02ReputationRegistry (V1 address until V2
- * deploys — see REPUTATION_REGISTRY). Read-only;
+ * summary(agentId) on the Four02ReputationRegistry. Read-only;
  * returns null on RPC failure so the resume endpoint degrades to the DB
  * history instead of 500ing.
+ *
+ * The registry address comes from config (FOUR02_REPUTATION_REGISTRY):
+ * V1 (0x33E2c56035C059553a37a3A56199B5b5b3DA3365) is SUPERSEDED — switch
+ * the env var to the V2 address after Four02ReputationRegistryV2 deploys.
+ * No code change needed.
  */
 export function defaultReputationSummary(
   rpcUrl: string,
+  registry: Address = REPUTATION_REGISTRY,
 ): (agentId: bigint) => Promise<ReputationSummary | null> {
   const client = createPublicClient({ chain: ink, transport: http(rpcUrl) });
   return async (agentId: bigint) => {
     try {
       const r = await client.readContract({
-        address: REPUTATION_REGISTRY,
+        address: registry,
         abi: SUMMARY_ABI,
         functionName: 'summary',
         args: [agentId],
