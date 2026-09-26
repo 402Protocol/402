@@ -19,9 +19,10 @@ interface IIdentityRegistry {
 }
 
 /// @title TracesLicense
-/// @notice TRACES: 10,000 agent seat licenses on Ink. Each seat is paired
-///         1:1 with a canonical ERC-8004 agent identity at mint time —
-///         minting workers, not JPEGs.
+/// @notice TRACES: 10,000 agent seat licenses on Ink. The collection launches
+///         as a normal NFT drop (e.g. OpenSea); each seat becomes a license
+///         when paired 1:1 with a canonical ERC-8004 agent identity via
+///         pairSeat — minting workers, not JPEGs.
 /// @dev Non-upgradeable by design (same posture as AgentEscrow).
 ///      ERC-721C-compatible transfer gating via ERC721CCompat (see its docs
 ///      for why the Limit Break contracts are not inherited directly).
@@ -42,7 +43,7 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
     /// @notice ERC-2981 royalty: 5% to treasury.
     uint96 public constant ROYALTY_BPS = 500;
 
-    /// @notice ERC-8004 Identity Registry this collection pairs with.
+    /// @notice ERC-8004 Identity Registry seats pair against.
     /// @dev Immutable, set at deploy. On Ink mainnet this is
     ///      0x7274e874CA62410a93Bd8bf61c69d8045E399c02 (the live
     ///      IdentityRegistryUpgradeable) — NOT the 0x8004... vanity address,
@@ -58,6 +59,7 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
     error WalletCapExceeded();
     error IdentityNotOwnedByRecipient();
     error AgentAlreadyPaired();
+    error SeatAlreadyPaired();
     error TeamSupplyExhausted();
     error EmptyBatch();
     error ZeroAddress();
@@ -91,7 +93,7 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
     /// @notice Team claims used so far (cap: TEAM_SUPPLY).
     uint256 public teamMinted;
 
-    /// @notice seat tokenId => paired ERC-8004 agentId.
+    /// @notice seat tokenId => paired ERC-8004 agentId (0 = unpaired).
     mapping(uint256 => uint256) public seatToAgent;
     /// @notice ERC-8004 agentId => seat tokenId (0 = unpaired; one seat per identity).
     mapping(uint256 => uint256) public agentToSeat;
@@ -122,46 +124,69 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
     }
 
     // ------------------------------------------------------------------------
-    // Minting
+    // Minting (plain sale — no identity pairing at mint)
     // ------------------------------------------------------------------------
 
     /**
-     * @notice Mint one seat to `to`, paired with ERC-8004 `agentId`.
+     * @notice Mint one seat to `to`. No identity needed: this is a normal
+     *         NFT sale (e.g. an OpenSea drop). Pairing happens later via
+     *         pairSeat on the 402 site.
      * @dev The payer (msg.sender) may differ from the recipient: a human
-     *      pays, the agent's wallet receives. `to` MUST own `agentId`.
+     *      pays, the agent's wallet receives.
      */
-    function mint(address to, uint256 agentId) external nonReentrant {
+    function mint(address to) external nonReentrant {
         if (!mintOpen) revert MintClosed();
-        uint256 tokenId = _prepareMint(to, agentId, 1);
+        uint256 tokenId = _prepareMint(to, 1);
         paymentToken.safeTransferFrom(msg.sender, treasury, price);
-        _mintSeat(to, tokenId, agentId);
+        _mintSeat(to, tokenId);
     }
 
     /**
-     * @notice Mint several seats to `to` in one transaction (e.g. a 10-agent fleet).
-     * @dev Duplicate agentIds in the batch revert on the second occurrence.
+     * @notice Mint `n` seats to `to` in one transaction.
      */
-    function mintBatch(address to, uint256[] calldata agentIds) external nonReentrant {
+    function mintBatch(address to, uint256 n) external nonReentrant {
         if (!mintOpen) revert MintClosed();
-        uint256 n = agentIds.length;
         if (n == 0) revert EmptyBatch();
-        uint256 firstId = _prepareMint(to, agentIds[0], n);
+        uint256 firstId = _prepareMint(to, n);
         paymentToken.safeTransferFrom(msg.sender, treasury, price * n);
         for (uint256 i = 0; i < n; ++i) {
-            _mintSeat(to, firstId + i, agentIds[i]);
+            _mintSeat(to, firstId + i);
         }
     }
 
     /**
-     * @notice Founder-only free claims (team allocation). Same pairing and
-     *         wallet-cap rules as paid mints; price is 0. Works while the
-     *         public mint is still closed.
+     * @notice Founder-only free claims (team allocation). Same wallet-cap
+     *         rules as paid mints; price is 0. Works while the public mint
+     *         is still closed.
      */
-    function teamMint(address to, uint256 agentId) external nonReentrant onlyOwner {
+    function teamMint(address to) external nonReentrant onlyOwner {
         if (teamMinted >= TEAM_SUPPLY) revert TeamSupplyExhausted();
-        uint256 tokenId = _prepareMint(to, agentId, 1);
+        uint256 tokenId = _prepareMint(to, 1);
         teamMinted += 1;
-        _mintSeat(to, tokenId, agentId);
+        _mintSeat(to, tokenId);
+    }
+
+    // ------------------------------------------------------------------------
+    // Pairing (activation — done on the 402 site, post-mint)
+    // ------------------------------------------------------------------------
+
+    /**
+     * @notice Activate a seat: pair it 1:1 with an ERC-8004 agent identity.
+     *         Only the current seat holder can call; the caller must own
+     *         `agentId` in the Identity Registry, the seat must be unpaired,
+     *         and the agent must not already be paired to another seat.
+     * @dev This is the license activation step. Buy the NFT anywhere
+     *      (OpenSea drop, secondary); bring it here to make it a license.
+     *      To change an existing pairing, use repairSeat instead.
+     */
+    function pairSeat(uint256 tokenId, uint256 agentId) external {
+        address seatOwner = ownerOf(tokenId);
+        if (seatOwner != msg.sender) revert NotSeatOwner();
+        if (seatToAgent[tokenId] != 0) revert SeatAlreadyPaired();
+        _checkPairing(msg.sender, agentId);
+        seatToAgent[tokenId] = agentId;
+        agentToSeat[agentId] = tokenId;
+        emit SeatPaired(tokenId, agentId, msg.sender);
     }
 
     /**
@@ -169,8 +194,9 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
      *         call this; the new agent must be owned by the caller and unpaired.
      * @dev The secondary-market path: after buying a seat secondhand, the
      *      buyer re-pairs it to their own agent. The old agent's pairing is
-     *      cleared so it can pair with another seat later. The license
-     *      always follows the token holder.
+     *      cleared so it can pair with another seat later. Also works on a
+     *      never-paired seat (equivalent to pairSeat). The license always
+     *      follows the token holder.
      */
     function repairSeat(uint256 tokenId, uint256 newAgentId) external {
         address seatOwner = ownerOf(tokenId);
@@ -188,37 +214,26 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
 
     /**
      * @dev Shared pre-mint checks. Returns the first token ID of the batch.
-     *      Effects (nextTokenId bump) happen in _mintSeat per token so a
-     *      mid-batch revert leaves no gaps... (revert rolls back anyway;
-     *      sequential IDs are guaranteed because nextTokenId only moves
-     *      forward on successful mints).
+     *      Sequential IDs are guaranteed because nextTokenId only moves
+     *      forward on successful mints.
      */
-    function _prepareMint(address to, uint256 firstAgentId, uint256 n)
-        internal
-        view
-        returns (uint256 firstTokenId)
-    {
+    function _prepareMint(address to, uint256 n) internal view returns (uint256 firstTokenId) {
         if (to == address(0)) revert ZeroAddress();
         firstTokenId = nextTokenId;
         if (firstTokenId + n - 1 > MAX_SUPPLY) revert MaxSupplyReached();
         if (balanceOf(to) + n > MAX_PER_WALLET) revert WalletCapExceeded();
-        // Validate the first pairing eagerly for a clean error; the rest
-        // are validated inside _mintSeat as the batch is written.
-        _checkPairing(to, firstAgentId);
     }
 
+    /// @dev The caller must own `agentId` in the Identity Registry and the
+    ///      agent must not already be paired to a seat.
     function _checkPairing(address to, uint256 agentId) internal view {
         if (IDENTITY_REGISTRY.ownerOf(agentId) != to) revert IdentityNotOwnedByRecipient();
         if (agentToSeat[agentId] != 0) revert AgentAlreadyPaired();
     }
 
-    function _mintSeat(address to, uint256 tokenId, uint256 agentId) internal {
-        _checkPairing(to, agentId);
+    function _mintSeat(address to, uint256 tokenId) internal {
         nextTokenId = tokenId + 1;
-        seatToAgent[tokenId] = agentId;
-        agentToSeat[agentId] = tokenId;
         _safeMint(to, tokenId);
-        emit SeatPaired(tokenId, agentId, to);
     }
 
     // ------------------------------------------------------------------------

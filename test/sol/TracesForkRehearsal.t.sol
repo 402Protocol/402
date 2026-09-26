@@ -26,11 +26,12 @@ contract MockIdentityRegistry {
     }
 }
 
-/// @notice Ink-mainnet fork rehearsal for TracesLicense:
+/// @notice Ink-mainnet fork rehearsal for TracesLicense (OpenSea-drop model):
 ///         - deploys the real contract on a fork of Ink mainnet
 ///         - etches a mock 8004 registry at the canonical address (the live
 ///           Ink deployment is the 8004 team's placeholder; real impl pending)
-///         - runs the full mint flow against REAL Ink USDC
+///         - mints seats as a plain USDC sale (no identity needed), then
+///           activates them via pairSeat — the two-step flow
 contract TracesForkRehearsalTest is Test {
     // Live IdentityRegistryUpgradeable on Ink mainnet (verified). The
     // 0x8004... vanity address is still the 8004 team's placeholder.
@@ -42,8 +43,12 @@ contract TracesForkRehearsalTest is Test {
 
         // NOTE: etch the mock over the live registry address for a
         // deterministic rehearsal (we don't want to burn real agentIds).
+        // vm.etch copies code but NOT storage, so initialize the mock's
+        // nextId slot (slot 0) to 1 — otherwise the first register() returns
+        // agentId 0, which collides with the "unpaired" sentinel.
         MockIdentityRegistry mock = new MockIdentityRegistry();
         vm.etch(IDENTITY_REGISTRY, address(mock).code);
+        vm.store(IDENTITY_REGISTRY, bytes32(uint256(0)), bytes32(uint256(1)));
 
         address buyer = vm.addr(0xBEEF1234);
         address treasury = address(0xCAFE);
@@ -63,26 +68,35 @@ contract TracesForkRehearsalTest is Test {
         );
         console.log("deployed:", address(license));
 
-        // 2. Register 3 agent identities (mock at canonical address).
+        // 2. Open the mint, buy 2 seats in one batch with real USDC.
+        //    No identity needed — plain sale (OpenSea-drop model).
+        //    (buyer is the contract owner; approve comes from the buyer too.)
         vm.startPrank(buyer);
+        license.setMintOpen(true);
+        IERC20(INK_USDC).approve(address(license), price * 3);
+        license.mintBatch(buyer, 2);
+
+        // 3. Free team claim (also identity-free).
+        license.teamMint(buyer);
+
+        // 4. Seats are unpaired until activation.
+        assertEq(license.seatToAgent(1), 0, "seat 1 unpaired");
+        assertEq(license.seatToAgent(2), 0, "seat 2 unpaired");
+        assertEq(license.seatToAgent(3), 0, "team seat unpaired");
+
+        // 5. Register 3 agent identities (mock at canonical address),
+        //    then activate each seat via pairSeat.
         uint256 id1 = MockIdentityRegistry(IDENTITY_REGISTRY).register("ipfs://rehearsal/agent-1.json");
         uint256 id2 = MockIdentityRegistry(IDENTITY_REGISTRY).register("ipfs://rehearsal/agent-2.json");
         uint256 id3 = MockIdentityRegistry(IDENTITY_REGISTRY).register("ipfs://rehearsal/agent-3.json");
         console.log("agentIds:", id1, id2, id3);
 
-        // 3. Open the mint, buy 2 seats in one batch with real USDC.
-        license.setMintOpen(true);
-        IERC20(INK_USDC).approve(address(license), price * 2);
-        uint256[] memory ids = new uint256[](2);
-        ids[0] = id1;
-        ids[1] = id2;
-        license.mintBatch(buyer, ids);
-
-        // 4. Free team claim.
-        license.teamMint(buyer, id3);
+        license.pairSeat(1, id1);
+        license.pairSeat(2, id2);
+        license.pairSeat(3, id3);
         vm.stopPrank();
 
-        // 5. Assertions.
+        // 6. Assertions.
         assertEq(license.ownerOf(1), buyer, "seat 1 owner");
         assertEq(license.ownerOf(2), buyer, "seat 2 owner");
         assertEq(license.ownerOf(3), buyer, "team seat owner");

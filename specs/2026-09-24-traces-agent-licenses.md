@@ -80,19 +80,21 @@ Identity.MD seats: 10k licenses, real art, real USDC, no token games.
 - Contract baseURI: `ipfs://bafybeidhdxryx66t3sbrgnuagwtjjjteiddavvm55474sshyyh5tfnclxe/`,
   token IDs 1..10000, tokenURI = baseURI + tokenId.
 
-## Locked mint params (2026-09-24, founder)
+## Locked mint params (2026-09-24, founder; updated 2026-09-25 for OpenSea drop)
 - Price: TBD (set at deploy; was $10, redacted from all public copy).
 - Per-wallet cap: 10 seats (recipient wallet).
 - No whitelist / no allowlist. Pure public sequential mint.
-- Team: 100 free claims via owner-only `teamMint(to, agentId)`; each
-  recipient registers their own 8004 identity first so pairing is clean.
-  402 Manager, Swappy seats come out of this allocation.
+- Team: 100 free claims via owner-only `teamMint(to)`; no identity needed
+  at mint. 402 Manager, Swappy seats come out of this allocation.
 - Royalty: 5% ERC-2981 to treasury, ERC-721C from day one.
 - Payment: USDC on Ink (`0x2D270e6886d130D724215A266106e6832161EAEd`).
 - Token IDs 1..10000, sequential; baseURI
   `ipfs://bafybeidhdxryx66t3sbrgnuagwtjjjteiddavvm55474sshyyh5tfnclxe/`.
-- `mint(to, agentId)` + `mintBatch(to, agentIds[])`; recipient must own each
-  identity (`ownerOf(agentId) == to`); 1 seat per identity.
+- Two-step model: `mint(to)` / `mintBatch(to, n)` / `teamMint(to)` are
+  identity-free (OpenSea drop + plain sale); activation is
+  `pairSeat(tokenId, agentId)` on the 402 site — seat holder only, caller
+  must own the agent identity, one seat per identity; `repairSeat` for
+  re-pairing.
 
 ## Correction (2026-09-25): identity registry address
 - The 0x8004... vanity Identity Registry on Ink is the 8004 team's
@@ -110,6 +112,85 @@ Identity.MD seats: 10k licenses, real art, real USDC, no token games.
 - `initialOwner` is set TO the fresh wallet
   `0xE15B4338073db2aaD308bdFf4bBEd351857FaDEf` (ownership only, no funding
   needed).
+
+## 2026-09-25 — OpenSea drop: two-step model (mint → activation)
+
+Founder decision 2026-09-25: TRACES launches as a **normal NFT drop on
+OpenSea** (Ink chain is supported; Ink collections like Templars of the
+Storm already do real volume there). The 8004 identity pairing moves OFF
+the mint and becomes a post-mint **activation** step done on the 402 site.
+
+### Why two steps
+
+- The mint becomes a dumb, simple fixed-price USDC sale: less contract to
+  audit, less that can break, and it meets NFT buyers where they already
+  are (OpenSea).
+- The smart part — identity pairing, licensing, reputation — lives on our
+  site, where we control the UX: identity registration, seat pairing,
+  wallet seat auto-detection, re-pairing.
+- Tradeoff accepted: seats can trade as pure collectibles before ever being
+  paired. The license *activates* when paired; an unpaired seat is just art.
+
+### Contract changes (TracesLicense, pre-deploy)
+
+- `mint(address to)` — paid mint, **no identity needed**. Anyone can buy.
+- `mintBatch(address to, uint256 n)` — batch mint `n` seats (count, not an
+  identity list). `n == 0` reverts `EmptyBatch`.
+- `teamMint(address to)` — owner-only free claims, no identity needed.
+- NEW `pairSeat(uint256 tokenId, uint256 agentId)` — the activation. Rules:
+  only the current seat holder can call (`NotSeatOwner`); the seat must be
+  unpaired (`SeatAlreadyPaired`); the caller must own `agentId` in the
+  Identity Registry (`IdentityNotOwnedByRecipient`); the agent must not
+  already be paired (`AgentAlreadyPaired`). Sets the bidirectional
+  `seatToAgent` / `agentToSeat` pairing and emits
+  `SeatPaired(tokenId, agentId, holder)`.
+- `repairSeat(tokenId, newAgentId)` — unchanged. Still the secondary-market
+  re-pairing path; also works on a never-paired seat (equivalent to
+  `pairSeat` for first activation).
+- Everything else kept: 10k supply, sequential IDs 1..10000, 10-per-wallet
+  cap (team mints count), 100 free team mints, mint starts closed behind
+  `setMintOpen`, payer/recipient may differ, 5% ERC-2981 royalty, metadata
+  baseURI, ERC721Enumerable.
+- `SeatPaired` is now emitted by `pairSeat` (activation), not by mint.
+
+### Website flow (for the site builder)
+
+1. **Buy** — OpenSea drop (or any secondary). No wallet prep needed.
+2. **Register identity** — on the 402 site: the agent's wallet calls
+   `register(string)` on `0x7274e874CA62410a93Bd8bf61c69d8045E399c02`
+   and gets an agentId.
+3. **Activate** — site auto-detects the wallet's seats (`balanceOf` +
+   `tokenOfOwnerByIndex` + `seatToAgent`), user picks a seat and their
+   agentId, site calls `pairSeat(tokenId, agentId)`.
+4. **Re-pair** — secondary buyers (or agents switching identities) call
+   `repairSeat(tokenId, newAgentId)`; site shows pairing before/after.
+
+### FAQ seed (for the site FAQ)
+
+- *Do I need an agent to buy a seat?* No. Anyone can buy the NFT. You
+  only need an agent (an 8004 identity) when you activate the license.
+- *What does pairing do?* It binds the seat 1:1 to an agent identity.
+  That's what turns the NFT into a license: the agent can then work,
+  invoice, and build reputation in the 402 economy under that seat.
+- *Can one agent hold multiple seats?* No — one seat per identity. One
+  wallet can hold up to 10 seats, each paired to a different agent.
+- *I bought a seat secondhand and it's paired to someone else's agent.*
+  Use the re-pair flow: as the seat holder you can call
+  `repairSeat` to bind it to your own agent. The old pairing is cleared.
+- *Can I change my agent later?* Yes — `repairSeat` to a new identity
+  you own. The license always follows the seat holder.
+
+### Test state
+
+- 35/35 TracesLicenseTest green (mint-with-no-identity, pairSeat happy
+  path + all six reverts, repairSeat after pairing + on never-paired
+  seats, enumeration, caps, royalties, 721C).
+- Fork rehearsal rewritten for the two-step flow: deploy on Ink fork →
+  mint 2 + team mint with real USDC (all unpaired) → register 3 mock
+  identities → pairSeat each → full assertions green. (Also fixed: the
+  etched mock registry's storage slot for nextId is now initialized, so
+  rehearsal agentIds are 1,2,3 — agentId 0 would collide with the
+  "unpaired" sentinel.)
 
 ## 2026-09-25 — repairSeat (secondary-market re-pairing)
 - Problem found pre-deploy: seat<->agent pairing was written at mint and never
