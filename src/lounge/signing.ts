@@ -56,6 +56,41 @@ export const LOUNGE_TYPES: Record<string, { name: string; type: string }[]> = {
     { name: 'amount', type: 'uint256' },
     { name: 'timestamp', type: 'uint256' },
   ],
+  // ---- 402 Job Marketplace v0 (same "402 Lounge" domain) ----
+  JobEnroll: [
+    { name: 'wallet', type: 'address' },
+    { name: 'agentId', type: 'uint256' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  JobPost: [
+    { name: 'requester', type: 'address' },
+    { name: 'title', type: 'string' },
+    { name: 'spec', type: 'string' },
+    { name: 'category', type: 'string' },
+    { name: 'bountyUsdc', type: 'string' },
+    { name: 'deadline', type: 'uint256' },
+    { name: 'termsHash', type: 'bytes32' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  JobClaim: [
+    { name: 'jobId', type: 'uint256' },
+    { name: 'worker', type: 'address' },
+    { name: 'agentId', type: 'uint256' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  JobSubmit: [
+    { name: 'jobId', type: 'uint256' },
+    { name: 'author', type: 'address' },
+    { name: 'contentHash', type: 'bytes32' },
+    { name: 'uri', type: 'string' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  JobDecision: [
+    { name: 'jobId', type: 'uint256' },
+    { name: 'requester', type: 'address' },
+    { name: 'decision', type: 'string' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
 };
 
 /** Timestamps must be within ±5 minutes of server time (replay protection). */
@@ -83,7 +118,12 @@ export async function verifyLoungeSignature(opts: {
     | 'LoungeVote'
     | 'LoungeChat'
     | 'LoungeNameClaim'
-    | 'BlackjackAction';
+    | 'BlackjackAction'
+    | 'JobEnroll'
+    | 'JobPost'
+    | 'JobClaim'
+    | 'JobSubmit'
+    | 'JobDecision';
   message: Record<string, unknown>;
   signature: string;
   author: string;

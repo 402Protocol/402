@@ -141,6 +141,16 @@ CREATE TABLE IF NOT EXISTS oracle_queries (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_oracle_created ON oracle_queries(created_at);
+CREATE TABLE IF NOT EXISTS job_activity (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  job_id INTEGER NOT NULL,
+  actor TEXT,
+  title TEXT NOT NULL,
+  bounty_usdc TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_activity_created ON job_activity(created_at);
 `;
 
 /**
@@ -431,6 +441,47 @@ export class LoungeDb {
       endpoint: r.endpoint as string,
       symbol: r.symbol as string | null,
       priceUsd: r.price_usd as string | null,
+      createdAt: r.created_at as number,
+    }));
+  }
+
+  // ---- job board activity (the spectacle feed) ----
+
+  logJobActivity(a: {
+    kind: string;
+    jobId: number;
+    actor: string;
+    title: string;
+    bountyUsdc: string;
+    createdAt: number;
+  }): void {
+    this.db
+      .prepare(
+        'INSERT INTO job_activity (kind, job_id, actor, title, bounty_usdc, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(a.kind, a.jobId, a.actor, a.title, a.bountyUsdc, a.createdAt);
+  }
+
+  /** Recent job board events, newest first. */
+  recentJobActivity(limit: number): {
+    kind: string;
+    jobId: number;
+    actor: string | null;
+    title: string;
+    bountyUsdc: string | null;
+    createdAt: number;
+  }[] {
+    const rows = this.db
+      .prepare(
+        'SELECT kind, job_id, actor, title, bounty_usdc, created_at FROM job_activity ORDER BY created_at DESC, id DESC LIMIT ?',
+      )
+      .all(limit) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      kind: r.kind as string,
+      jobId: r.job_id as number,
+      actor: r.actor as string | null,
+      title: r.title as string,
+      bountyUsdc: r.bounty_usdc as string | null,
       createdAt: r.created_at as number,
     }));
   }

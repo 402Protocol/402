@@ -26,7 +26,8 @@
     "test:lounge": "tsx test/lounge.test.ts",
     "mcp": "tsx src/mcp/server.ts",
     "test:mcp": "tsx test/mcp.test.ts",
-    "test:oracle": "tsx test/oracle.test.ts"
+    "test:oracle": "tsx test/oracle.test.ts",
+    "test:jobs": "tsx test/jobs.test.ts"
   },
   "type": "module",
   "version": "0.3.0"

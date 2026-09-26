@@ -338,6 +338,15 @@ export function createLoungeApp(
     return c.json({ queries: db.recentOracleQueries(limit) });
   });
 
+  app.get('/job-activity', (c) => {
+    const limitRaw = parseInt(c.req.query('limit') ?? '20', 10);
+    const limit =
+      Number.isSafeInteger(limitRaw) && limitRaw > 0
+        ? Math.min(limitRaw, 100)
+        : 20;
+    return c.json({ events: db.recentJobActivity(limit) });
+  });
+
   app.post('/name-claim', async (c) => {
     const parsed = await readBody(c);
     if (!parsed.ok) return bad(c, parsed.status, parsed.error);

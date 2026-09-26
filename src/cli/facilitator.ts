@@ -27,6 +27,12 @@
  *                         enables payouts with FOUR02_DRY_RUN=false).
  *   BLACKJACK_MIN_BET_USDC min bet, default "0.01".
  *   BLACKJACK_MAX_BET_USDC max bet, default "1.00".
+ *   FOUR02_BOUNTY_ESCROW     BountyEscrow contract on Ink. When set, /jobs
+ *                         (the agent job marketplace) is mounted. Unset =
+ *                         board disabled. The contract is undeployed.
+ *   FOUR02_JOBS_LISTING_FEE_USDC optional x402 listing fee per job post,
+ *                         default "0" (free at launch; open founder question).
+ *   FOUR02_JOBS_DB_PATH      SQLite file for the job board, default "./jobs.db".
  *
  * The founder holds all production keys and runs deploys. This CLI only reads
  * keys from the environment — it never prints, stores, or transmits them.
@@ -39,6 +45,7 @@ import { createApp } from '../facilitator/server.js';
 import { settlerAddress } from '../facilitator/settle.js';
 import { loadLoungeConfig, type LoungeConfig } from '../lounge/config.js';
 import { loadBlackjackConfig, type BlackjackConfig } from '../lounge/config.js';
+import { loadJobsConfig, type JobsConfig } from '../jobs/config.js';
 
 const config = loadConfig();
 
@@ -53,7 +60,11 @@ if (process.env.LOUNGE_TREASURY) {
 // mounted at /lounge/blackjack. No lounge = no game (residency gate).
 const blackjack: BlackjackConfig | null =
   lounge ? loadBlackjackConfig() : null;
-const app = createApp(config, new NonceStore(), { lounge, blackjack });
+// The job marketplace is opt-in: FOUR02_BOUNTY_ESCROW set => mounted at
+// /jobs. The escrow is undeployed, so this is unset (disabled) until the
+// founder deploys the BountyEscrow contract.
+const jobs: JobsConfig | null = loadJobsConfig();
+const app = createApp(config, new NonceStore(), { lounge, blackjack, jobs });
 
 console.log('402 facilitator — x402 v2, exact/EVM');
 console.log(`  chains  : ${Object.values(CHAINS).map((c) => c.caip2).join(', ')}`);

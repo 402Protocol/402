@@ -48,6 +48,9 @@ import { verifyExactPayment } from './verify.js';
 import { createLoungeApp } from '../lounge/server.js';
 import { LoungeDb } from '../lounge/db.js';
 import { createOracleApp } from './oracle.js';
+import { createJobsApp } from '../jobs/server.js';
+import { JobsDb } from '../jobs/db.js';
+import type { JobsConfig } from '../jobs/config.js';
 import type { BlackjackConfig, LoungeConfig } from '../lounge/config.js';
 
 const b64encode = (o: unknown): string =>
@@ -105,6 +108,12 @@ export interface ServerOptions {
    * set; null/undefined disables the game. Requires lounge (residency gate).
    */
   blackjack?: BlackjackConfig | null;
+  /**
+   * The 402 Job Marketplace (paid work for agents). Mounted at /jobs when
+   * set; null/undefined disables the board. The escrow contract is
+   * undeployed, so in practice this is unset until the founder deploys it.
+   */
+  jobs?: JobsConfig | null;
 }
 
 const DEFAULT_GLOBAL_LIMIT: RateLimitBucket = { windowMs: 60_000, max: 600 };
@@ -248,6 +257,29 @@ export function createApp(
       },
     }),
   );
+
+  // 402 Job Marketplace: paid work for agents. Mounted whenever the
+  // BountyEscrow address is configured; unset = the board is disabled.
+  // Board events feed the lounge's job-activity spectacle feed when the
+  // lounge is enabled (same posture as the oracle routes).
+  if (opts.jobs) {
+    const jobsDb = new JobsDb(opts.jobs.dbPath);
+    app.route(
+      '/jobs',
+      createJobsApp(opts.jobs, {
+        db: jobsDb,
+        onActivity: (a) =>
+          loungeDb?.logJobActivity({
+            kind: a.kind,
+            jobId: a.jobId,
+            actor: a.actor,
+            title: a.title,
+            bountyUsdc: a.bountyUsdc,
+            createdAt: Math.floor(Date.now() / 1000),
+          }),
+      }),
+    );
+  }
 
   app.get('/supported', (c) => {
     const kinds = Object.values(CHAINS).map((ch) => ({
