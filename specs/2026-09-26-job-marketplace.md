@@ -455,8 +455,9 @@ tsc clean.
    B ships with zero contract changes. Both need his pick before any
    deploy.
 2. **Fee %**: ~~75 bps proposal~~ → **decided 2026-09-27: 100 bps (1%)**.
-3. **Arbiter**: his multisig (recommended) or another trusted party?
-   Deploy-time decision; rotation exists as fallback.
+3. **Arbiter**: ~~his multisig (recommended) or another trusted party?~~ →
+   **decided 2026-09-27: `0xE15B4338073db2aaD308bdFf4bBEd351857FaDEf`**
+   (fresh wallet; also guardian).
 4. **v0 job categories**: writing, code, design, data labeling?
    Recommendation: keep security audits *out* of v0 categories —
    the Quotrons rescue is the reason.
