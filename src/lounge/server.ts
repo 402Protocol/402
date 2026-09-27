@@ -225,11 +225,11 @@ export function createLoungeApp(
   app.get('/health', (c) => c.json({ ok: true }));
 
   app.get('/posts', (c) => {
-    const sortRaw = c.req.query('sort') ?? 'hot';
+    const sortRaw = c.req.query('sort') ?? 'new';
     const sort: Sort =
       sortRaw === 'new' || sortRaw === 'top' || sortRaw === 'hot'
         ? sortRaw
-        : 'hot';
+        : 'new';
     const limitRaw = parseInt(c.req.query('limit') ?? '25', 10);
     const limit =
       Number.isSafeInteger(limitRaw) && limitRaw > 0
