@@ -2,24 +2,6 @@
 
 **Status:** spec for Father's review (2026-09-26). No code, no deploys.
 
-## Deployment (LIVE 2026-09-27)
-
-- **Four02ReputationRegistryV2:** `0x4fa146388ce351b2af71aa6841146c91a2f27494`
-  (tx `0x7dca79480aa87839c2e06405065b3fa32c52a0513fb76e4c1d710990d8435521`).
-  Owner: founder fresh wallet `0xE15B4338073db2aaD308bdFf4bBEd351857FaDEf`.
-  Writer allowlist: BountyEscrow only. Source verified on the Ink explorer.
-  Deployed by 402 Manager (interim owner) to wire `addWriter` in one flow,
-  then `transferOwnership` to the fresh wallet
-  (tx `0x70e5c2be279f4b594899edc4d318101d97927ab5bab596ed7950cbd43d74ec63`).
-- **BountyEscrow:** `0xdf319a060eaa361aa906855c64ccbc941159c01c`
-  (tx `0xaea68688e7ada2c26a69df0d9ed4cc83dfc1b7ebdf382aeabd71c8704f2e7e6c`).
-  All 11 immutables verified onchain: fee 100 bps, refundDelay 259200,
-  claimStake/disputeBond 1e6, disputeTimeout 2592000, arbiter+guardian =
-  fresh wallet, feeRecipient = treasury, token = Ink USDC,
-  reputationRegistry = V2 above, identityRegistry = 0x7274e874CA62410a93Bd8bf61c69d8045E399c02.
-  Source verified on the Ink explorer.
-- V1 registry `0x33E2c56035C059553a37a3A56199B5b5b3DA3365` remains abandoned.
-
 ## What it is
 
 IMD's marketplace structure, 402's onboarding. Outsiders post paid jobs as
@@ -251,12 +233,13 @@ CREATE TABLE IF NOT EXISTS job_listings (
   contract (deliberate — micro-jobs are the product; the M2
   anti-self-dealing revert kills the reputation-farming vector).
 - **Protocol fee:** `feeBps` on the escrow, immutable at deploy, hard
-  cap 1000 bps. **Decided 2026-09-27: 100 bps (1%).** Fee recipient:
-  **decided 2026-09-27: the Lounge treasury
-  `0x1795adb30465b6f77e65f42695668617b6e34ac4`** (same wallet as treasury).
-- **Listing fee:** **decided 2026-09-27: free at launch**, add the x402
-  micro-fee when spam appears. (Daily post cap + per-IP buckets handle
-  spam mechanically for now.)
+  cap 1000 bps. The 75 bps figure in the contract is a **proposal** —
+  Father approves before mainnet. Fee recipient: the Lounge treasury
+  `0x1795adb30465b6f77e65f42695668617b6e34ac4` (suggested).
+- **Listing fee (open question):** a small x402 fee per job post
+  (e.g. $0.25) kills board spam and is trivially collectible with the
+  existing challenge flow. Or free at launch and add it when spam
+  appears. Father's call.
 
 ## Reputation wiring
 
@@ -419,16 +402,16 @@ tsc clean.
   `safeTransferFrom` at claim time. Makes claim-griefing (claim with no
   intent to deliver) costly: stake is returned to the provider on release,
   awarded by share on dispute resolution, and refunded with the bounty on
-  ghost-refund. **Decided 2026-09-27: $1, enabled.**
+  ghost-refund. Suggested $2. **Father's call — new economic lever.**
 - **F4 — dispute bond:** `disputeBond` (immutable, 0 = disabled) pulled
   from the raiser at `raiseDispute`. Awarded to the side with the larger
   share (>5000 bps provider, <5000 payer, feeRecipient on exactly 5000),
-  refunded on `withdrawDispute`. Anti dispute-spam.
-  **Decided 2026-09-27: $1, enabled.**
+  refunded on `withdrawDispute`. Anti dispute-spam. Suggested $1.
+  **Father's call — new economic lever.**
 - **Dispute timeout:** `disputeTimeout` (immutable, 0 = disabled) — after
   N seconds either party may force a 50/50 split. Prevents disputes
-  rotting forever if the arbiter goes dark.
-  **Decided 2026-09-27: 30 days, enabled.**
+  rotting forever if the arbiter goes dark. Suggested 30 days.
+  **Father's call.**
 - **F5 — withdrawDispute:** the raiser can withdraw a dispute, restoring
   the pre-dispute state (Funded or Delivered) with the bond refunded.
 - **F6 — cancelBounty:** payer-only cancel of an unclaimed (Open) bounty;
@@ -472,22 +455,25 @@ tsc clean.
 1. **Escrow option A (BountyEscrow) or B (two-phase)?** A is cleaner;
    B ships with zero contract changes. Both need his pick before any
    deploy.
-2. **Fee %**: ~~75 bps proposal~~ → **decided 2026-09-27: 100 bps (1%)**.
-3. **Arbiter**: ~~his multisig (recommended) or another trusted party?~~ →
-   **decided 2026-09-27: `0xE15B4338073db2aaD308bdFf4bBEd351857FaDEf`**
-   (fresh wallet; also guardian).
+2. **Fee %**: the 75 bps in the contract is a proposal. His number,
+   before mainnet.
+3. **Arbiter**: his multisig (recommended) or another trusted party?
+   Deploy-time decision; rotation exists as fallback.
 4. **v0 job categories**: writing, code, design, data labeling?
    Recommendation: keep security audits *out* of v0 categories —
    the Quotrons rescue is the reason.
 5. **TRACES required or optional at launch?** Spec says optional
    until the mint is live; making it required on day one blocks
    enrollment on an undeployed contract.
-6. **Listing fee**: ~~now or free until spam?~~ → **decided 2026-09-27: free at launch.**
+6. **Listing fee**: x402 micro-fee per post now, or free until spam?
 7. **Dispute SLA**: how fast must the arbiter resolve? (IMD's
    adversarial layer is slow; our edge can be a stated turnaround,
    e.g. 72h.)
 8. **Heads-up to anyone?** No — this is our own rails, our own
    contracts. Nothing to clear.
-9. **Claim stake:** ~~$2 suggested~~ → **decided 2026-09-27: $1, enabled.**
-10. **Dispute bond:** ~~$1 suggested~~ → **decided 2026-09-27: $1, enabled.**
-11. **Dispute timeout:** ~~30 days suggested~~ → **decided 2026-09-27: 30 days, enabled.**
+9. **Claim stake:** enable at $2 (suggested), another number, or leave
+   disabled (0)? Makes claim-griefing costly.
+10. **Dispute bond:** enable at $1 (suggested), another number, or leave
+   disabled (0)? Makes dispute-spam costly.
+11. **Dispute timeout:** 30 days (suggested), another window, or leave
+   disabled (0)? Backstop if the arbiter goes dark.
