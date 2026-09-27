@@ -233,8 +233,9 @@ CREATE TABLE IF NOT EXISTS job_listings (
   contract (deliberate — micro-jobs are the product; the M2
   anti-self-dealing revert kills the reputation-farming vector).
 - **Protocol fee:** `feeBps` on the escrow, immutable at deploy, hard
-  cap 1000 bps. **Decided 2026-09-27: 100 bps (1%).** Fee recipient: the
-  Lounge treasury `0x1795adb30465b6f77e65f42695668617b6e34ac4` (suggested).
+  cap 1000 bps. **Decided 2026-09-27: 100 bps (1%).** Fee recipient:
+  **decided 2026-09-27: the Lounge treasury
+  `0x1795adb30465b6f77e65f42695668617b6e34ac4`** (same wallet as treasury).
 - **Listing fee:** **decided 2026-09-27: free at launch**, add the x402
   micro-fee when spam appears. (Daily post cap + per-IP buckets handle
   spam mechanically for now.)
