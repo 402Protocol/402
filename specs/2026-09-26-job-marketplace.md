@@ -2,6 +2,24 @@
 
 **Status:** spec for Father's review (2026-09-26). No code, no deploys.
 
+## Deployment (LIVE 2026-09-27)
+
+- **Four02ReputationRegistryV2:** `0x4fa146388ce351b2af71aa6841146c91a2f27494`
+  (tx `0x7dca79480aa87839c2e06405065b3fa32c52a0513fb76e4c1d710990d8435521`).
+  Owner: founder fresh wallet `0xE15B4338073db2aaD308bdFf4bBEd351857FaDEf`.
+  Writer allowlist: BountyEscrow only. Source verified on the Ink explorer.
+  Deployed by 402 Manager (interim owner) to wire `addWriter` in one flow,
+  then `transferOwnership` to the fresh wallet
+  (tx `0x70e5c2be279f4b594899edc4d318101d97927ab5bab596ed7950cbd43d74ec63`).
+- **BountyEscrow:** `0xdf319a060eaa361aa906855c64ccbc941159c01c`
+  (tx `0xaea68688e7ada2c26a69df0d9ed4cc83dfc1b7ebdf382aeabd71c8704f2e7e6c`).
+  All 11 immutables verified onchain: fee 100 bps, refundDelay 259200,
+  claimStake/disputeBond 1e6, disputeTimeout 2592000, arbiter+guardian =
+  fresh wallet, feeRecipient = treasury, token = Ink USDC,
+  reputationRegistry = V2 above, identityRegistry = 0x7274e874CA62410a93Bd8bf61c69d8045E399c02.
+  Source verified on the Ink explorer.
+- V1 registry `0x33E2c56035C059553a37a3A56199B5b5b3DA3365` remains abandoned.
+
 ## What it is
 
 IMD's marketplace structure, 402's onboarding. Outsiders post paid jobs as
