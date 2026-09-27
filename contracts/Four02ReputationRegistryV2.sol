@@ -131,6 +131,7 @@ contract Four02ReputationRegistryV2 is Ownable {
     event WeightsUpdated(uint256 onTimeWeightBps, uint256 lateWeightBps);
     event GhostPenaltyUpdated(uint256 ghostPenaltyUsdc);
     event DecayWindowUpdated(uint256 decayWindow);
+    event PairCompletionCapUpdated(uint256 pairCompletionCap);
 
     // ------------------------------------------------------------------------
     // Errors
@@ -138,6 +139,7 @@ contract Four02ReputationRegistryV2 is Ownable {
 
     error NotWriter();
     error ZeroAddress();
+    error NotContract(); // addWriter: writers must be contracts, not EOAs
     error ZeroAgentId();
     error EmptyClientList();
     error FeedbackIndexOutOfBounds();
@@ -145,6 +147,7 @@ contract Four02ReputationRegistryV2 is Ownable {
     error BadWeight();
     error BadGhostPenalty();
     error BadDecayWindow();
+    error BadPairCap();
 
     // ------------------------------------------------------------------------
     // State
@@ -203,6 +206,35 @@ contract Four02ReputationRegistryV2 is Ownable {
     /// (decayWindow * 10_000) and (value * decayWeight * weightBps) inside
     /// uint256 for every reachable input.
     uint256 public constant MAX_DECAY_WINDOW = 3650 days;
+    /// @notice Upper bound for setPairCompletionCap. The cap is a count, not
+    /// a value, so 1000 is far beyond any honest pair's completions while
+    /// keeping the mapping math trivially safe.
+    uint256 public constant MAX_PAIR_COMPLETION_CAP = 1000;
+
+    /// @notice agentId => counterparty => counted EscrowCompleted events.
+    /// @dev F1 anti-farming: two colluding wallets can recycle bounty capital
+    /// (the M2 guard only blocks same-wallet self-dealing) and manufacture a
+    /// perfect worker resume for ~$40/50 jobs. Completions beyond
+    /// pairCompletionCap from the same (agentId, counterparty) pair are still
+    /// appended to the raw log (sunlight preserved) but excluded from the
+    /// score math via _eventCounted.
+    mapping(uint256 => mapping(address => uint64)) private _pairCompletions;
+
+    /// @notice agentId => event index (at append time) => whether the event
+    /// counts in the derived score views (_reliability, _disputeRate).
+    /// @dev Only EscrowCompleted events can be uncounted (F1 pair cap).
+    /// Ghost and dispute events are NEVER capped: accountability signals are
+    /// uncapped by design. The 8004 read interface (readFeedback et al.)
+    /// shows ALL events regardless — sunlight, not scoring, is its job.
+    mapping(uint256 => mapping(uint256 => bool)) private _eventCounted;
+
+    /// @notice Max COUNTED EscrowCompleted events per (agentId, counterparty)
+    /// pair. Default 5: an honest worker rarely completes 5+ paid jobs for
+    /// the same payer without the relationship being real economic activity
+    /// (and even then, the raw events stay visible). Owner-retunable like the
+    /// other score params; applies prospectively to newly recorded events
+    /// (already-marked events keep their counted/uncounted flags).
+    uint256 public pairCompletionCap = 5;
 
     // ------------------------------------------------------------------------
     // Constructor
@@ -249,11 +281,26 @@ contract Four02ReputationRegistryV2 is Ownable {
                 counterparty: counterparty
             })
         );
-        _writerEventIdx[agentId][msg.sender].push(events[agentId].length - 1);
+        uint256 newIndex = events[agentId].length - 1;
+        _writerEventIdx[agentId][msg.sender].push(newIndex);
         if (!_writerSeen[agentId][msg.sender]) {
             _writerSeen[agentId][msg.sender] = true;
             _writersOf[agentId].push(msg.sender);
         }
+        // F1: cap COUNTED completions per (agentId, counterparty) pair. The
+        // event is always appended (sunlight); beyond the cap it is simply
+        // excluded from the score views. Ghost/dispute events are never
+        // capped — accountability is uncapped.
+        bool counted = true;
+        if (eventType == EventType.EscrowCompleted) {
+            uint64 pairCount = _pairCompletions[agentId][counterparty];
+            if (pairCount >= pairCompletionCap) {
+                counted = false;
+            } else {
+                _pairCompletions[agentId][counterparty] = pairCount + 1;
+            }
+        }
+        _eventCounted[agentId][newIndex] = counted;
         if (eventType == EventType.DisputeWithdrawn) {
             _disputeWithdrawn[agentId][refId] = true;
         }
@@ -269,8 +316,16 @@ contract Four02ReputationRegistryV2 is Ownable {
     // ------------------------------------------------------------------------
 
     /// @notice Authorize a 402 protocol contract to record commerce events.
+    /// @dev Writers must be contracts: an EOA can sign transactions
+    /// directly, so allowlisting one would hand a single key unconstrained,
+    /// unaudited reputation-write power over every agentId — outside the
+    /// "trusted protocol contract" assumption the allowlist documents. A
+    /// malicious owner could still deploy a malicious writer contract, but
+    /// that is at least a deliberate, reviewable deployment, not a pasted
+    /// address.
     function addWriter(address writer) external onlyOwner {
         if (writer == address(0)) revert ZeroAddress();
+        if (writer.code.length == 0) revert NotContract();
         isWriter[writer] = true;
         emit WriterAdded(writer);
     }
@@ -318,6 +373,20 @@ contract Four02ReputationRegistryV2 is Ownable {
         emit DecayWindowUpdated(decayWindow_);
     }
 
+    /// @notice Retune the per-pair completion cap (F1 anti-farming).
+    /// @param pairCompletionCap_ Max COUNTED EscrowCompleted events per
+    ///        (agentId, counterparty) pair; at most MAX_PAIR_COMPLETION_CAP.
+    ///        Applies to subsequently recorded events: events already marked
+    ///        counted/uncounted keep their flags (no history migration, and
+    ///        no silent rewrite of past scores). 0 is allowed (no completion
+    ///        ever counts) but not recommended — it neuters the disputeRate
+    ///        denominator for escrow completions.
+    function setPairCompletionCap(uint256 pairCompletionCap_) external onlyOwner {
+        if (pairCompletionCap_ > MAX_PAIR_COMPLETION_CAP) revert BadPairCap();
+        pairCompletionCap = pairCompletionCap_;
+        emit PairCompletionCapUpdated(pairCompletionCap_);
+    }
+
     // ------------------------------------------------------------------------
     // Derived scores (views over the raw log)
     // ------------------------------------------------------------------------
@@ -340,8 +409,10 @@ contract Four02ReputationRegistryV2 is Ownable {
     ///      never withdrawn or resolved). A resolved dispute is no longer
     ///      active — the arbitration outcome stays visible in
     ///      arbitrationRecord. Completed commerce = escrows completed +
-    ///      invoices paid (on time or late). Returns 0 when there is no
-    ///      (undecayed) completed commerce.
+    ///      invoices paid (on time or late). F2: with no (undecayed)
+    ///      completed commerce but active dispute signals, returns 10000
+    ///      (a worker with only ghosts/disputes must not show a clean 0);
+    ///      returns 0 only when there are no signals at all.
     function disputeRate(uint256 agentId) external view returns (uint256) {
         return _disputeRate(agentId);
     }
@@ -500,6 +571,7 @@ contract Four02ReputationRegistryV2 is Ownable {
         uint256 totalVal;
         uint256 n = evts.length;
         for (uint256 i; i < n; i++) {
+            if (!_eventCounted[agentId][i]) continue; // F1: over-cap completions don't score
             CommerceEvent storage e = evts[i];
             uint256 w = _decayNumerator(e.timestamp);
             if (w == 0) continue;
@@ -531,6 +603,7 @@ contract Four02ReputationRegistryV2 is Ownable {
         uint256 completedW;
         uint256 n = evts.length;
         for (uint256 i; i < n; i++) {
+            if (!_eventCounted[agentId][i]) continue; // F1: over-cap completions don't score
             CommerceEvent storage e = evts[i];
             uint256 w = _decayNumerator(e.timestamp);
             if (w == 0) continue;
@@ -555,7 +628,7 @@ contract Four02ReputationRegistryV2 is Ownable {
                 completedW += w;
             }
         }
-        if (completedW == 0) return 0;
+        if (completedW == 0) return disputeW > 0 ? 10_000 : 0;
         return (10_000 * disputeW) / completedW;
     }
 

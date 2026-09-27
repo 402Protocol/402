@@ -132,7 +132,8 @@ contract BountyEscrowTest is Test {
             REFUND_DELAY,
             guardian,
             address(identityRegistry),
-            address(repRegistry)
+            address(repRegistry),
+            0, 0, 0
         );
         // escrowNoRep proves the try/catch: payouts work even when the
         // registry never allowlisted this writer.
@@ -144,7 +145,8 @@ contract BountyEscrowTest is Test {
             REFUND_DELAY,
             guardian,
             address(identityRegistry),
-            address(repRegistry)
+            address(repRegistry),
+            0, 0, 0
         );
         repRegistry.addWriter(address(escrow));
         identityRegistry.setOwner(AGENT_ID, worker);
@@ -205,14 +207,16 @@ contract BountyEscrowTest is Test {
             REFUND_DELAY,
             guardian,
             address(identityRegistry),
-            address(repRegistry)
+            address(repRegistry),
+            0, 0, 0
         );
     }
 
     function test_Constructor_RevertsOnZeroIdentityRegistry() public {
         vm.expectRevert(BountyEscrow.ZeroAddress.selector);
         new BountyEscrow(
-            address(usdc), arbiter, feeRecipient, FEE_BPS, REFUND_DELAY, guardian, address(0), address(repRegistry)
+            address(usdc), arbiter, feeRecipient, FEE_BPS, REFUND_DELAY, guardian, address(0), address(repRegistry),
+            0, 0, 0
         );
     }
 
@@ -226,7 +230,10 @@ contract BountyEscrowTest is Test {
             REFUND_DELAY,
             guardian,
             address(identityRegistry),
-            makeAddr("eoa-no-code")
+            makeAddr("eoa-no-code"),
+            0,
+            0,
+            0
         );
     }
 
@@ -340,7 +347,8 @@ contract BountyEscrowTest is Test {
             REFUND_DELAY,
             guardian,
             address(evil),
-            address(repRegistry)
+            address(repRegistry),
+            0, 0, 0
         );
         vm.prank(payer);
         usdc.approve(address(evilEscrow), type(uint256).max);

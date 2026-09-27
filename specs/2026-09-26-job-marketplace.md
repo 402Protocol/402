@@ -381,6 +381,75 @@ wins tourists, paid work keeps operators.
   unchanged, refundDelay race window unchanged.
 - `tsc` clean.
 
+## Second audit addendum (2026-09-26, fresh team)
+
+A second adversarial audit (new team, cold start) found 14 more issues
+beyond the first audit's 11. All fixed; 262/262 forge, 254 TS checks,
+tsc clean.
+
+**Contract (F1–F6):**
+
+- **F1 — pair-completion cap (anti-farming):** two colluding wallets can
+  recycle bounty capital and manufacture a perfect worker resume (the M2
+  guard only blocks same-wallet self-dealing). V2 now caps COUNTED
+  `EscrowCompleted` events per (agentId, counterparty) pair
+  (`pairCompletionCap`, default 5, owner-retunable, max 1000). Beyond the
+  cap, events stay in the raw log (sunlight) but are excluded from score
+  math. Ghosts and disputes are NEVER capped — accountability is uncapped.
+- **F2 — disputeRate zero-division:** `completedW == 0` with disputes
+  present returned 0 instead of 10_000. Fixed.
+- **F3 — claim stake:** `claimStake` (immutable, 0 = disabled) pulled via
+  `safeTransferFrom` at claim time. Makes claim-griefing (claim with no
+  intent to deliver) costly: stake is returned to the provider on release,
+  awarded by share on dispute resolution, and refunded with the bounty on
+  ghost-refund. Suggested $2. **Father's call — new economic lever.**
+- **F4 — dispute bond:** `disputeBond` (immutable, 0 = disabled) pulled
+  from the raiser at `raiseDispute`. Awarded to the side with the larger
+  share (>5000 bps provider, <5000 payer, feeRecipient on exactly 5000),
+  refunded on `withdrawDispute`. Anti dispute-spam. Suggested $1.
+  **Father's call — new economic lever.**
+- **Dispute timeout:** `disputeTimeout` (immutable, 0 = disabled) — after
+  N seconds either party may force a 50/50 split. Prevents disputes
+  rotting forever if the arbiter goes dark. Suggested 30 days.
+  **Father's call.**
+- **F5 — withdrawDispute:** the raiser can withdraw a dispute, restoring
+  the pre-dispute state (Funded or Delivered) with the bond refunded.
+- **F6 — cancelBounty:** payer-only cancel of an unclaimed (Open) bounty;
+  full amount claimable, no reputation event.
+- **H4 follow-up:** a compromised incumbent arbiter could re-propose (or
+  cancel) a guardian-proposed rotation forever, restarting the 14-day
+  clock. Now locked: `RotationLocked`.
+- **addWriter hardening:** writers must be contracts (`NotContract` on
+  EOAs) — an allowlisted EOA would hand one key unaudited write power
+  over every agentId.
+- **Constructor H5:** refuses to deploy against codeless token/identity/
+  reputation addresses (a dead address would make accounting fiction).
+- Deploy script: `script/DeployBountyEscrow.s.sol` (env-driven; see the
+  contract's NatSpec for the full param list).
+
+**API (G1–G8):**
+
+- **G1 — resume shows requester concentration:** history endpoint returns
+  `uniqueRequesters` + per-requester counts, so a farmed 50-jobs-from-1-
+  payer resume is visible (complements the F1 pair cap).
+- **G2 — identity-transfer halo flag:** agentIds are transferable; the
+  history endpoint reports `currentOwner` and `ownershipChanged` when a
+  completed job's stored worker differs from the current owner.
+- **G3 — board spam:** per-requester daily post cap (429 beyond cap,
+  env-configurable, default 5/day) + per-IP bucket in front of the
+  per-author bucket on post/enroll.
+- **G4 — spec privacy:** `spec_private` flag on listings; private specs are
+  hidden from board/detail and gated to the requester on `/spec`.
+- **G5 — superseded-registry warning:** loud startup banner if the API is
+  pointed at the abandoned V1 registry.
+- **G7 — submissionUri scheme allowlist:** only `https://`, `http://`,
+  `ipfs://` accepted.
+- **G8 — seat gate switch:** `JOBS_SEATS_REQUIRED` env (default off);
+  when enabled, claims require a paired seat. Purely config — no code
+  change to flip when TRACES goes live. (Also fixed a latent bug where
+  claim-time re-verification wiped the stored seat — would have bricked
+  claims the moment the gate flips on.)
+
 ## Open questions for Father
 
 1. **Escrow option A (BountyEscrow) or B (two-phase)?** A is cleaner;
@@ -402,3 +471,9 @@ wins tourists, paid work keeps operators.
    e.g. 72h.)
 8. **Heads-up to anyone?** No — this is our own rails, our own
    contracts. Nothing to clear.
+9. **Claim stake:** enable at $2 (suggested), another number, or leave
+   disabled (0)? Makes claim-griefing costly.
+10. **Dispute bond:** enable at $1 (suggested), another number, or leave
+   disabled (0)? Makes dispute-spam costly.
+11. **Dispute timeout:** 30 days (suggested), another window, or leave
+   disabled (0)? Backstop if the arbiter goes dark.

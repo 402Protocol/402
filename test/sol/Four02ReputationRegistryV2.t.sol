@@ -5,6 +5,12 @@ import {Test} from "forge-std/src/Test.sol";
 import {Four02ReputationRegistryV2} from "../../contracts/Four02ReputationRegistryV2.sol";
 import {Four02ReputationRegistry} from "../../contracts/Four02ReputationRegistry.sol";
 
+/// @notice Stand-in writer contract: addWriter requires writers to be
+/// contracts (an EOA writer would hand a bare key unconstrained,
+/// unaudited reputation-write power), so the suite's writers are minimal
+/// contracts. Tests spoof msg.sender via vm.prank(writer) as before.
+contract MockWriter {}
+
 /// @notice Tests for Four02ReputationRegistryV2: enum encoding stability vs
 ///         V1, all ten event types, reliability math (value weighting, 365d
 ///         decay, WorkerGhosted penalty), dispute-rate math (ghost counts in
@@ -14,8 +20,8 @@ contract Four02ReputationRegistryV2Test is Test {
     Four02ReputationRegistryV2 internal reg;
 
     address internal owner = address(0xA11CE);
-    address internal writer = address(0xBEEF);
-    address internal writer2 = address(0xBEEF2);
+    address internal writer; // set in setUp: must be a contract (addWriter enforces it)
+    address internal writer2; // set in setUp
     address internal stranger = address(0xCAFE);
     address internal counterparty = address(0xD00D);
 
@@ -38,6 +44,11 @@ contract Four02ReputationRegistryV2Test is Test {
 
     function setUp() public {
         reg = new Four02ReputationRegistryV2(owner);
+        // Writers must be contracts: addWriter reverts for EOAs, so the
+        // suite's writers are minimal contracts (msg.sender is still spoofed
+        // via vm.prank in the helpers — prank works for contract addresses).
+        writer = address(new MockWriter());
+        writer2 = address(new MockWriter());
         vm.prank(owner);
         reg.addWriter(writer);
     }
@@ -430,8 +441,15 @@ contract Four02ReputationRegistryV2Test is Test {
     // Dispute rate
     // ------------------------------------------------------------------------
 
-    function test_DisputeRate_NoCompletedCommerceIsZero() public {
+    // F2: with dispute signals but zero completed commerce, the rate is
+    // 10000 (100%) — a worker with only disputes must not show a clean 0.
+    function test_DisputeRate_DisputeOnlyIsMaxed() public {
         _record(AGENT, Four02ReputationRegistryV2.EventType.DisputeOpened, 0, bytes32(uint256(1)));
+        assertEq(reg.disputeRate(AGENT), 10_000);
+    }
+
+    // F2: with NO signals at all the rate is still 0 (not 10000).
+    function test_DisputeRate_NoSignalsIsZero() public {
         assertEq(reg.disputeRate(AGENT), 0);
     }
 
@@ -463,9 +481,11 @@ contract Four02ReputationRegistryV2Test is Test {
         assertEq(reg.disputeRate(AGENT), 10_000);
     }
 
-    function test_DisputeRate_GhostWithNoCompletedCommerceIsZero() public {
+    // F2: a worker with only ghost/dispute signals and zero completed
+    // commerce now shows 10000 (100%), not a misleading clean 0.
+    function test_DisputeRate_GhostWithNoCompletedCommerceIsMaxed() public {
         _record(AGENT, Four02ReputationRegistryV2.EventType.WorkerGhosted, 0, bytes32(uint256(1)));
-        assertEq(reg.disputeRate(AGENT), 0);
+        assertEq(reg.disputeRate(AGENT), 10_000);
     }
 
     function test_DisputeRate_ResolvedDisputeDoesNotCount() public {

@@ -91,6 +91,15 @@ export const LOUNGE_TYPES: Record<string, { name: string; type: string }[]> = {
     { name: 'decision', type: 'string' },
     { name: 'timestamp', type: 'uint256' },
   ],
+  // Gated read of a private job spec: the accessor signs the exact job id
+  // they claim the right to read. The server then checks the accessor is
+  // the requester or the claimed worker — the signature alone proves
+  // nothing about authorization, only about who is asking.
+  JobSpecAccess: [
+    { name: 'jobId', type: 'uint256' },
+    { name: 'accessor', type: 'address' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
 };
 
 /** Timestamps must be within ±5 minutes of server time (replay protection). */
@@ -123,7 +132,8 @@ export async function verifyLoungeSignature(opts: {
     | 'JobPost'
     | 'JobClaim'
     | 'JobSubmit'
-    | 'JobDecision';
+    | 'JobDecision'
+    | 'JobSpecAccess';
   message: Record<string, unknown>;
   signature: string;
   author: string;

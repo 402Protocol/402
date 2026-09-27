@@ -29,10 +29,25 @@ export interface JobsConfig {
   dbPath: string;
   /** Four02ReputationRegistry address for the worker-resume reads. */
   reputationRegistry: Address;
+  /** Per-requester rolling-24h post cap (JOBS_DAILY_POST_CAP, default 50). */
+  dailyPostCap: number;
+  /**
+   * When true, POST /jobs/:id/claim requires the worker's enrollment to
+   * carry a non-null TRACES seat token id (JOBS_SEATS_REQUIRED). Default
+   * off; the flip is config-only (no code change).
+   */
+  seatsRequired: boolean;
 }
 
 /** Default listing fee: free at launch. */
 export const DEFAULT_JOBS_LISTING_FEE_USDC = '0';
+
+/** Default per-requester daily post cap (board-spam control). */
+export const DEFAULT_JOBS_DAILY_POST_CAP = 50;
+
+/** The superseded V1 registry: its writer allowlist is empty, so any resume
+ * read against it returns all-zeros. */
+export const SUPERSEDED_REPUTATION_REGISTRY_V1 = REPUTATION_REGISTRY;
 
 /**
  * Load the jobs config. Returns null when FOUR02_BOUNTY_ESCROW is unset —
@@ -61,12 +76,39 @@ export function loadJobsConfig(
   if (!isAddress(reputationRegistry)) {
     throw new Error('FOUR02_REPUTATION_REGISTRY is not a valid Ethereum address');
   }
-  return {
+  const dailyPostCapRaw = env.JOBS_DAILY_POST_CAP ?? String(DEFAULT_JOBS_DAILY_POST_CAP);
+  if (!/^\d+$/.test(dailyPostCapRaw)) {
+    throw new Error('JOBS_DAILY_POST_CAP must be a positive integer');
+  }
+  const dailyPostCap = parseInt(dailyPostCapRaw, 10);
+  if (dailyPostCap <= 0) {
+    throw new Error('JOBS_DAILY_POST_CAP must be a positive integer');
+  }
+  const seatsRequiredRaw = (env.JOBS_SEATS_REQUIRED ?? '').trim().toLowerCase();
+  const seatsRequired = seatsRequiredRaw === 'true' || seatsRequiredRaw === '1';
+  const cfg: JobsConfig = {
     escrow: getAddress(escrow),
     listingFeeUsdc,
     listingFeeUnits: parseUnits(listingFeeUsdc, USDC_DECIMALS),
     rpcUrl: env.INK_RPC_URL ?? INK_RPC_URL,
     dbPath: env.FOUR02_JOBS_DB_PATH ?? './jobs.db',
     reputationRegistry: getAddress(reputationRegistry),
+    dailyPostCap,
+    seatsRequired,
   };
+  // G5: the V1 registry is SUPERSEDED and its writer allowlist is empty —
+  // every reputation summary read against it returns all-zeros, so worker
+  // resumes would silently show zero history. Loud on startup so the
+  // missing V2 env var can't go unnoticed.
+  if (cfg.reputationRegistry.toLowerCase() === SUPERSEDED_REPUTATION_REGISTRY_V1.toLowerCase()) {
+    console.warn(
+      '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n' +
+      '!!! 402 JOBS: FOUR02_REPUTATION_REGISTRY is the SUPERSEDED V1\n' +
+      `!!! (${SUPERSEDED_REPUTATION_REGISTRY_V1})\n` +
+      '!!! Its writer allowlist is EMPTY — worker resumes read all-zeros.\n' +
+      '!!! Set FOUR02_REPUTATION_REGISTRY to the V2 address after it deploys.\n' +
+      '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!',
+    );
+  }
+  return cfg;
 }

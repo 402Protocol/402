@@ -4,11 +4,12 @@
  *   npx tsx test/jobs.test.ts
  *
  * Integration tests against createJobsApp with a mocked chain layer:
- * getReceipt / getTransaction / identityOwner / reputationSummary are all
+ * getReceipt / getOnchainJob / identityOwner / reputationSummary are all
  * in-memory, and the RPC URL is a dead localhost (never called). Throwaway
  * in-process keys; nothing is broadcast, no real funds.
  */
 import assert from 'node:assert/strict';
+import { tmpdir } from 'node:os';
 import { Hono } from 'hono';
 import {
   type Address,
@@ -26,11 +27,12 @@ import { JobsDb } from '../src/jobs/db.js';
 import {
   BOUNTY_CLAIMED_TOPIC,
   BOUNTY_CREATED_TOPIC,
+  DISPUTE_RAISED_TOPIC,
   DISPUTE_RESOLVED_TOPIC,
   JOB_REFUNDED_TOPIC,
-  RAISE_DISPUTE_SELECTOR,
-  RELEASE_SELECTOR,
-  type GetTransaction,
+  JOB_RELEASED_TOPIC,
+  type GetOnchainJob,
+  type OnchainJob,
   type ReputationSummary,
 } from '../src/jobs/escrow.js';
 import { createJobsApp, type JobActivityEvent } from '../src/jobs/server.js';
@@ -51,13 +53,14 @@ const nowSec = () => Math.floor(Date.now() / 1000);
 // ---- mocked chain layer -----------------------------------------------------
 
 const receipts = new Map<string, ReceiptLike>();
-const transactions = new Map<string, { from: string; to: string | null; input: string }>();
 const owners = new Map<string, Address>(); // agentId -> owner
+// onchain job state for POST /jobs/:id/sync, keyed by escrow job id
+const onchainJobs = new Map<string, OnchainJob>();
 
 const getReceipt: GetReceipt = async (h: Hex) =>
   receipts.get(h.toLowerCase()) ?? null;
-const getTransaction: GetTransaction = async (h: Hex) =>
-  transactions.get(h.toLowerCase()) ?? null;
+const getOnchainJob: GetOnchainJob = async (_escrow, escrowJobId) =>
+  onchainJobs.get(escrowJobId.toString()) ?? null;
 const identityOwner = async (agentId: bigint): Promise<Address | null> =>
   owners.get(agentId.toString()) ?? null;
 const reputationSummary = async (): Promise<ReputationSummary> => ({
@@ -76,6 +79,10 @@ function jobsConfig() {
     FOUR02_BOUNTY_ESCROW: escrowAddr,
     FOUR02_JOBS_DB_PATH: ':memory:',
     INK_RPC_URL: 'http://localhost:1', // dead localhost: never called, mocks injected
+    // Generous cap: the shared app posts dozens of jobs across the suite;
+    // it must not be coupled to the production daily cap (G3 proves the cap
+    // 429s on a dedicated app with a small cap).
+    JOBS_DAILY_POST_CAP: '10000',
   });
   assert.ok(cfg);
   return cfg;
@@ -88,10 +95,13 @@ function makeApp(): Hono {
     createJobsApp(jobsConfig(), {
       db: new JobsDb(':memory:'),
       getReceipt,
-      getTransaction,
+      getOnchainJob,
       identityOwner,
       reputationSummary,
       onActivity,
+      // Generous bucket: the suite must not be coupled to the production
+      // rate-limit budget (a dedicated test below proves the default 429s).
+      rateLimitBucket: { windowMs: 60_000, max: 10_000 },
     }),
   );
   return parent;
@@ -164,19 +174,73 @@ function fundingReceipt(jobId: bigint, amount: bigint, deadline: bigint, termsHa
   };
 }
 
-function claimReceipt(jobId: bigint, agentId: bigint): ReceiptLike {
+function claimReceipt(jobId: bigint, agentId: bigint, claimer?: string): ReceiptLike {
   return {
     status: 'success',
-    logs: [bountyClaimedLog(jobId, worker.address, agentId)],
+    logs: [bountyClaimedLog(jobId, claimer ?? worker.address, agentId)],
   };
 }
 
-function callTx(selector: string, jobId: bigint, from: string) {
+function jobReleasedLog(jobId: bigint) {
   return {
-    from,
-    to: escrowAddr,
-    input: (selector + encodeAbiParameters([{ type: 'uint256' }], [jobId]).slice(2)).toLowerCase(),
+    address: escrowAddr,
+    topics: [JOB_RELEASED_TOPIC, uintTopic(jobId)],
+    data: encodeAbiParameters(
+      [{ type: 'uint256' }, { type: 'uint256' }],
+      [50_000_000n, 1_000_000n],
+    ),
   };
+}
+
+function disputeRaisedLog(jobId: bigint, raiser: string) {
+  return {
+    address: escrowAddr,
+    topics: [DISPUTE_RAISED_TOPIC, uintTopic(jobId), addrTopic(raiser)],
+    data: '0x',
+  };
+}
+
+const ZERO_ADDR = '0x0000000000000000000000000000000000000000' as Address;
+
+/**
+ * Post a job with FIXED immutable terms (deadline/termsHash/amount) so
+ * POST /jobs/:id/sync fixtures can match them exactly.
+ */
+async function postFixedJob(
+  seed: string,
+  escrowJobId: bigint,
+): Promise<{ jobId: number; deadline: number; termsHash: Hex }> {
+  const deadline = 1893456000; // 2030-01-01T00:00:00Z, fixed
+  const spec = 'Write a 500-word explainer on x402 micropayments.';
+  const termsHash = keccak256(toHex(spec)).toLowerCase() as Hex;
+  const body = await signedPost({ deadline: deadline.toString(), spec });
+  const h = txHash(seed);
+  receipts.set(
+    h.toLowerCase(),
+    fundingReceipt(escrowJobId, parseUnits('25.00', 6), BigInt(deadline), termsHash),
+  );
+  const res = await postJson(app, '/jobs', { ...body, txHash: h });
+  assert.equal(res.status, 201);
+  return { jobId: res.body.jobId as number, deadline, termsHash };
+}
+
+/** Mock an onchain BountyEscrow job for POST /jobs/:id/sync. */
+function mockChainJob(
+  escrowJobId: bigint,
+  state: number,
+  fixed: { deadline: number; termsHash: Hex },
+  over: Partial<OnchainJob> = {},
+): void {
+  onchainJobs.set(escrowJobId.toString(), {
+    payer: requester.address,
+    provider: ZERO_ADDR,
+    agentId: 0n,
+    amount: parseUnits('25.00', 6),
+    deadline: BigInt(fixed.deadline),
+    termsHash: fixed.termsHash,
+    state,
+    ...over,
+  });
 }
 
 function txHash(seed: string): Hex {
@@ -187,7 +251,7 @@ function txHash(seed: string): Hex {
 
 async function sign(
   account: ReturnType<typeof privateKeyToAccount>,
-  primaryType: 'JobEnroll' | 'JobPost' | 'JobClaim' | 'JobSubmit' | 'JobDecision',
+  primaryType: 'JobEnroll' | 'JobPost' | 'JobClaim' | 'JobSubmit' | 'JobDecision' | 'JobSpecAccess',
   message: Record<string, unknown>,
 ): Promise<Hex> {
   return account.signTypedData({
@@ -268,6 +332,7 @@ async function postFundedJob(seed: string, escrowJobId: bigint): Promise<number>
 async function enrollWorkerWallet(
   account: ReturnType<typeof privateKeyToAccount>,
   agentId: bigint,
+  target: Hono = app,
 ) {
   const message = {
     wallet: account.address,
@@ -275,7 +340,7 @@ async function enrollWorkerWallet(
     timestamp: BigInt(nowSec()),
   };
   const signature = await sign(account, 'JobEnroll', message);
-  return postJson(app, '/jobs/enroll', {
+  return postJson(target, '/jobs/enroll', {
     wallet: account.address,
     agentId: agentId.toString(),
     timestamp: Number(message.timestamp),
@@ -283,9 +348,9 @@ async function enrollWorkerWallet(
   });
 }
 
-async function claimJob(jobId: number, agentId: bigint, seed: string) {
+async function claimJob(jobId: number, agentId: bigint, seed: string, target: Hono = app) {
   const h = txHash(seed);
-  const listing = (await getJson(app, `/jobs/${jobId}`)).body.job as Record<string, unknown>;
+  const listing = (await getJson(target, `/jobs/${jobId}`)).body.job as Record<string, unknown>;
   receipts.set(h.toLowerCase(), claimReceipt(BigInt(listing.escrowJobId as string), agentId));
   const message = {
     jobId: BigInt(jobId),
@@ -294,7 +359,7 @@ async function claimJob(jobId: number, agentId: bigint, seed: string) {
     timestamp: BigInt(nowSec()),
   };
   const signature = await sign(worker, 'JobClaim', message);
-  return postJson(app, `/jobs/${jobId}/claim`, {
+  return postJson(target, `/jobs/${jobId}/claim`, {
     worker: worker.address,
     agentId: agentId.toString(),
     timestamp: Number(message.timestamp),
@@ -519,16 +584,63 @@ await check('claim where ownerOf(agentId) != worker -> 403 identity_mismatch', a
   owners.set(AGENT_ID.toString(), worker.address); // restore
 });
 
-await check('valid claim -> 200 claimed; double-claim -> 409', async () => {
+await check('valid claim -> 200 claimed; same-tx retry -> 409 tx_hash_reused', async () => {
   const jobId = await postFundedJob('post-5', 5n);
   const res = await claimJob(jobId, AGENT_ID, 'claim-5');
   assert.equal(res.status, 200);
   assert.equal(res.body.state, 'claimed');
-  const again = await claimJob(jobId, AGENT_ID, 'claim-5b');
+  const again = await claimJob(jobId, AGENT_ID, 'claim-5');
   assert.equal(again.status, 409);
-  assert.equal(again.body.error, 'wrong_state');
+  assert.equal(again.body.error, 'tx_hash_reused');
   const got = await getJson(app, `/jobs/${jobId}`);
   assert.equal((got.body.job as Record<string, unknown>).workerAgentId, AGENT_ID.toString());
+});
+
+await check('claim is idempotent: re-claim with a fresh tx + same worker/agentId -> 200', async () => {
+  const jobId = await postFundedJob('post-5c', 50n);
+  const first = await claimJob(jobId, AGENT_ID, 'claim-5c');
+  assert.equal(first.status, 200);
+  // A second, distinct-but-valid claim mirror (e.g. after POST /jobs/:id/sync
+  // bound the worker from chain) replays the same onchain truth: 200, no
+  // state change, no conflict.
+  const second = await claimJob(jobId, AGENT_ID, 'claim-5d');
+  assert.equal(second.status, 200);
+  assert.equal(second.body.state, 'claimed');
+  assert.equal(second.body.worker, worker.address);
+});
+
+await check('claim with a conflicting worker+agentId -> 409 claim_conflict', async () => {
+  const jobId = await postFundedJob('post-5e', 51n);
+  const first = await claimJob(jobId, AGENT_ID, 'claim-5e');
+  assert.equal(first.status, 200);
+  // A verified BountyClaimed event binding a DIFFERENT worker contradicts the
+  // mirrored row (impossible onchain — claimBounty cannot run twice — so this
+  // is a canary, not a retry).
+  const other = privateKeyToAccount(generatePrivateKey());
+  const otherAgentId = 777001n;
+  const h = txHash('claim-5f');
+  receipts.set(
+    h.toLowerCase(),
+    claimReceipt(51n, otherAgentId, other.address),
+  );
+  const message = {
+    jobId: BigInt(jobId),
+    worker: other.address,
+    agentId: otherAgentId,
+    timestamp: BigInt(nowSec()),
+  };
+  const signature = await sign(other, 'JobClaim', message);
+  const res = await postJson(app, `/jobs/${jobId}/claim`, {
+    worker: other.address,
+    agentId: otherAgentId.toString(),
+    timestamp: Number(message.timestamp),
+    signature,
+    txHash: h,
+  });
+  assert.equal(res.status, 409);
+  assert.equal(res.body.error, 'claim_conflict');
+  const got = await getJson(app, `/jobs/${jobId}`);
+  assert.equal((got.body.job as Record<string, unknown>).worker, worker.address);
 });
 
 // ---- submit / accept happy path ----
@@ -588,11 +700,7 @@ await check('happy path: claim -> submit -> accept -> complete', async () => {
 
   // Accept with a mocked release(escrowJobId) tx from the requester.
   const h = txHash('accept-7');
-  receipts.set(h.toLowerCase(), { status: 'success', logs: [] });
-  transactions.set(
-    h.toLowerCase(),
-    callTx(RELEASE_SELECTOR, 7n, requester.address),
-  );
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [jobReleasedLog(7n)] });
   const message = {
     jobId: BigInt(jobId),
     requester: requester.address,
@@ -618,8 +726,7 @@ await check('happy path: claim -> submit -> accept -> complete', async () => {
 await check('accept in the wrong state -> 409', async () => {
   const jobId = await postFundedJob('post-8', 8n); // still open
   const h = txHash('accept-8');
-  receipts.set(h.toLowerCase(), { status: 'success', logs: [] });
-  transactions.set(h.toLowerCase(), callTx(RELEASE_SELECTOR, 8n, requester.address));
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [jobReleasedLog(8n)] });
   const message = {
     jobId: BigInt(jobId),
     requester: requester.address,
@@ -644,8 +751,7 @@ await check('accept by a non-requester -> 403 not_the_requester', async () => {
   await claimJob(jobId, AGENT_ID, 'claim-9');
   await submitDeliverable(jobId);
   const h = txHash('accept-9');
-  receipts.set(h.toLowerCase(), { status: 'success', logs: [] });
-  transactions.set(h.toLowerCase(), callTx(RELEASE_SELECTOR, 9n, stranger.address));
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [jobReleasedLog(9n)] });
   const message = {
     jobId: BigInt(jobId),
     requester: stranger.address,
@@ -670,8 +776,7 @@ await check('accept with a release tx for the wrong job -> 402 release_invalid',
   await claimJob(jobId, AGENT_ID, 'claim-10');
   await submitDeliverable(jobId);
   const h = txHash('accept-10');
-  receipts.set(h.toLowerCase(), { status: 'success', logs: [] });
-  transactions.set(h.toLowerCase(), callTx(RELEASE_SELECTOR, 999n, requester.address));
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [jobReleasedLog(999n)] });
   const message = {
     jobId: BigInt(jobId),
     requester: requester.address,
@@ -693,11 +798,19 @@ await check('accept with a release tx for the wrong job -> 402 release_invalid',
 
 // ---- dispute path ----
 
-async function raiseDispute(jobId: number, escrowJobId: bigint, byRequester: boolean, seed: string) {
+async function raiseDispute(
+  jobId: number,
+  escrowJobId: bigint,
+  byRequester: boolean,
+  seed: string,
+  target: Hono = app,
+) {
   const signer = byRequester ? requester : worker;
   const h = txHash(seed);
-  receipts.set(h.toLowerCase(), { status: 'success', logs: [] });
-  transactions.set(h.toLowerCase(), callTx(RAISE_DISPUTE_SELECTOR, escrowJobId, signer.address));
+  receipts.set(
+    h.toLowerCase(),
+    { status: 'success', logs: [disputeRaisedLog(escrowJobId, signer.address)] },
+  );
   const message = {
     jobId: BigInt(jobId),
     requester: signer.address,
@@ -705,7 +818,7 @@ async function raiseDispute(jobId: number, escrowJobId: bigint, byRequester: boo
     timestamp: BigInt(nowSec()),
   };
   const signature = await sign(signer, 'JobDecision', message);
-  return postJson(app, `/jobs/${jobId}/dispute`, {
+  return postJson(target, `/jobs/${jobId}/dispute`, {
     jobId,
     requester: signer.address,
     decision: 'dispute',
@@ -742,8 +855,10 @@ await check('dispute by a third party -> 403 not_a_party', async () => {
   const jobId = await postFundedJob('post-13', 13n);
   await claimJob(jobId, AGENT_ID, 'claim-13');
   const h = txHash('dispute-13');
-  receipts.set(h.toLowerCase(), { status: 'success', logs: [] });
-  transactions.set(h.toLowerCase(), callTx(RAISE_DISPUTE_SELECTOR, 13n, stranger.address));
+  receipts.set(
+    h.toLowerCase(),
+    { status: 'success', logs: [disputeRaisedLog(13n, stranger.address)] },
+  );
   const message = {
     jobId: BigInt(jobId),
     requester: stranger.address,
@@ -769,8 +884,7 @@ await check('dispute on a completed job -> 409 wrong_state', async () => {
   await submitDeliverable(jobId);
   // accept it first
   const h = txHash('accept-14');
-  receipts.set(h.toLowerCase(), { status: 'success', logs: [] });
-  transactions.set(h.toLowerCase(), callTx(RELEASE_SELECTOR, 14n, requester.address));
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [jobReleasedLog(14n)] });
   const amsg = {
     jobId: BigInt(jobId),
     requester: requester.address,
@@ -793,19 +907,43 @@ await check('dispute on a completed job -> 409 wrong_state', async () => {
 });
 
 await check('txHash replay on accept -> 409 tx_hash_reused', async () => {
-  const h = txHash('accept-7'); // burned by the first accept
-  // Job 9 is still submitted (its accept attempt was 403, before the burn).
-  const got = await getJson(app, `/jobs/9`);
+  // Job A: full accept burns txHash h.
+  const jobA = await postFundedJob('post-7r', 700n);
+  await claimJob(jobA, AGENT_ID, 'claim-7r');
+  await submitDeliverable(jobA);
+  const h = txHash('accept-7r');
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [jobReleasedLog(700n)] });
+  const msgA = {
+    jobId: BigInt(jobA),
+    requester: requester.address,
+    decision: 'accept',
+    timestamp: BigInt(nowSec()),
+  };
+  const sigA = await sign(requester, 'JobDecision', msgA);
+  const accepted = await postJson(app, `/jobs/${jobA}/accept`, {
+    jobId: jobA,
+    requester: requester.address,
+    decision: 'accept',
+    timestamp: Number(msgA.timestamp),
+    signature: sigA,
+    txHash: h,
+  });
+  assert.equal(accepted.status, 200);
+  // Job B is still submitted: replaying h against it must 409, not verify.
+  const jobB = await postFundedJob('post-9r', 701n);
+  await claimJob(jobB, AGENT_ID, 'claim-9r');
+  await submitDeliverable(jobB);
+  const got = await getJson(app, `/jobs/${jobB}`);
   assert.equal((got.body.job as Record<string, unknown>).state, 'submitted');
   const message = {
-    jobId: 9n,
+    jobId: BigInt(jobB),
     requester: requester.address,
     decision: 'accept',
     timestamp: BigInt(nowSec()),
   };
   const signature = await sign(requester, 'JobDecision', message);
-  const res = await postJson(app, `/jobs/9/accept`, {
-    jobId: 9,
+  const res = await postJson(app, `/jobs/${jobB}/accept`, {
+    jobId: jobB,
     requester: requester.address,
     decision: 'accept',
     timestamp: Number(message.timestamp),
@@ -836,7 +974,7 @@ await check('job-activity flows into the lounge feed', async () => {
   const jobsApp = createJobsApp(cfg, {
     db: new JobsDb(':memory:'),
     getReceipt,
-    getTransaction,
+    getOnchainJob,
     identityOwner,
     reputationSummary,
     onActivity: (a) => {
@@ -990,7 +1128,7 @@ await check('refund mirror: open job + JobRefunded event -> refunded', async () 
   assert.equal(res.body.state, 'refunded');
   const got = await getJson(app, `/jobs/${jobId}`);
   assert.equal((got.body.job as Record<string, unknown>).state, 'refunded');
-  assert.equal(activity.length, before + 1);
+  assert.equal(activity.length, before + 2); // posted + refunded
   assert.equal(activity[activity.length - 1]?.kind, 'refunded');
 });
 
@@ -1058,7 +1196,7 @@ await check('resolve mirror: disputed + DisputeResolved event -> resolved', asyn
   assert.equal(res.body.state, 'resolved');
   const got = await getJson(app, `/jobs/${jobId}`);
   assert.equal((got.body.job as Record<string, unknown>).state, 'resolved');
-  assert.equal(activity.length, before + 1);
+  assert.equal(activity.length, before + 4); // posted + claimed + disputed + resolved
   assert.equal(activity[activity.length - 1]?.kind, 'resolved');
 });
 
@@ -1088,8 +1226,7 @@ await check('accept mirrors a verified release even when API submit was skipped'
   assert.equal(claimed.status, 200);
   // No submitDeliverable: the worker called confirmDelivery onchain directly.
   const h = txHash('accept-30');
-  receipts.set(h.toLowerCase(), { status: 'success', logs: [] });
-  transactions.set(h.toLowerCase(), callTx(RELEASE_SELECTOR, 30n, requester.address));
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [jobReleasedLog(30n)] });
   const message = {
     jobId: BigInt(jobId),
     requester: requester.address,
@@ -1155,6 +1292,1123 @@ await check('loadJobsConfig honors FOUR02_REPUTATION_REGISTRY; malformed throws'
   assert.throws(() =>
     loadJobsConfig({ FOUR02_BOUNTY_ESCROW: escrowAddr, FOUR02_REPUTATION_REGISTRY: 'nope' }),
   );
+});
+
+
+
+// ---- new audit findings (2026-09-26) ----
+
+// Event-only verification: accept/dispute verify the escrow's OWN events,
+// never tx.from — so multisig/smart-wallet parties (whose outer tx.from is
+// a relayer or an EOA submitter) verify exactly like EOAs. The receipts
+// below carry only logs; no transaction lookup exists anymore.
+
+await check('accept verifies the JobReleased event alone (multisig-safe)', async () => {
+  const jobId = await postFundedJob('post-40', 40n);
+  await claimJob(jobId, AGENT_ID, 'claim-40');
+  await submitDeliverable(jobId);
+  const h = txHash('accept-40');
+  // Only the event log — no transaction, no from-address anywhere.
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [jobReleasedLog(40n)] });
+  const message = {
+    jobId: BigInt(jobId),
+    requester: requester.address,
+    decision: 'accept',
+    timestamp: BigInt(nowSec()),
+  };
+  const signature = await sign(requester, 'JobDecision', message);
+  const res = await postJson(app, `/jobs/${jobId}/accept`, {
+    jobId,
+    requester: requester.address,
+    decision: 'accept',
+    timestamp: Number(message.timestamp),
+    signature,
+    txHash: h,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.state, 'complete');
+});
+
+await check('accept with a receipt lacking JobReleased -> 402 release_invalid', async () => {
+  const jobId = await postFundedJob('post-41', 41n);
+  await claimJob(jobId, AGENT_ID, 'claim-41');
+  await submitDeliverable(jobId);
+  const h = txHash('accept-41');
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [] });
+  const message = {
+    jobId: BigInt(jobId),
+    requester: requester.address,
+    decision: 'accept',
+    timestamp: BigInt(nowSec()),
+  };
+  const signature = await sign(requester, 'JobDecision', message);
+  const res = await postJson(app, `/jobs/${jobId}/accept`, {
+    jobId,
+    requester: requester.address,
+    decision: 'accept',
+    timestamp: Number(message.timestamp),
+    signature,
+    txHash: h,
+  });
+  assert.equal(res.status, 402);
+  assert.equal(res.body.error, 'release_invalid');
+});
+
+await check('dispute with DisputeRaised for the wrong job -> 402 dispute_invalid', async () => {
+  const jobId = await postFundedJob('post-42', 42n);
+  await claimJob(jobId, AGENT_ID, 'claim-42');
+  const h = txHash('dispute-42');
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [disputeRaisedLog(999n, worker.address)] });
+  const message = {
+    jobId: BigInt(jobId),
+    requester: requester.address,
+    decision: 'dispute',
+    timestamp: BigInt(nowSec()),
+  };
+  const signature = await sign(requester, 'JobDecision', message);
+  const res = await postJson(app, `/jobs/${jobId}/dispute`, {
+    jobId,
+    requester: requester.address,
+    decision: 'dispute',
+    timestamp: Number(message.timestamp),
+    signature,
+    txHash: h,
+  });
+  assert.equal(res.status, 402);
+  assert.equal(res.body.error, 'dispute_invalid');
+});
+
+await check('dispute with DisputeRaised by someone else -> 402 dispute_invalid', async () => {
+  const jobId = await postFundedJob('post-43', 43n);
+  await claimJob(jobId, AGENT_ID, 'claim-43');
+  const h = txHash('dispute-43');
+  // The event binds the RAISER (topic), not tx.from: a raiser mismatch fails.
+  receipts.set(
+    h.toLowerCase(),
+    { status: 'success', logs: [disputeRaisedLog(43n, stranger.address)] },
+  );
+  const message = {
+    jobId: BigInt(jobId),
+    requester: requester.address,
+    decision: 'dispute',
+    timestamp: BigInt(nowSec()),
+  };
+  const signature = await sign(requester, 'JobDecision', message);
+  const res = await postJson(app, `/jobs/${jobId}/dispute`, {
+    jobId,
+    requester: requester.address,
+    decision: 'dispute',
+    timestamp: Number(message.timestamp),
+    signature,
+    txHash: h,
+  });
+  assert.equal(res.status, 402);
+  assert.equal(res.body.error, 'dispute_invalid');
+});
+
+// EIP-712: a signature for one primaryType is rejected at another endpoint.
+
+await check('EIP-712 cross-type replay: JobClaim signature rejected at /submit', async () => {
+  const jobId = await postFundedJob('post-44', 44n);
+  await claimJob(jobId, AGENT_ID, 'claim-44');
+  const contentHash = keccak256(toHex('the work'));
+  const claimMsg = {
+    jobId: BigInt(jobId),
+    worker: worker.address,
+    agentId: AGENT_ID,
+    timestamp: BigInt(nowSec()),
+  };
+  const claimSig = await sign(worker, 'JobClaim', claimMsg);
+  const res = await postJson(app, `/jobs/${jobId}/submit`, {
+    jobId,
+    author: worker.address,
+    contentHash,
+    uri: 'ipfs://bafytest',
+    timestamp: Number(claimMsg.timestamp),
+    signature: claimSig, // wrong primaryType: JobClaim, not JobSubmit
+  });
+  assert.equal(res.status, 401);
+  assert.equal(res.body.error, 'bad_signature');
+});
+
+// ---- POST /jobs/:id/sync: DB <-> chain reconciliation ----
+
+await check('sync: onchain Open -> no-op, no activity', async () => {
+  const before = activity.length;
+  const { jobId } = await postFixedJob('post-50', 50n);
+  mockChainJob(50n, 1, { deadline: 1893456000, termsHash: keccak256(toHex('Write a 500-word explainer on x402 micropayments.')).toLowerCase() as Hex });
+  const res = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.body.synced, false);
+  assert.equal(res.body.state, 'open');
+  assert.equal(res.body.onchainState, 'open');
+  assert.equal(activity.length, before + 1); // only the post
+});
+
+await check('sync: direct onchain claim binds worker+agentId; submit then works', async () => {
+  const { jobId } = await postFixedJob('post-51', 51n);
+  const termsHash = keccak256(toHex('Write a 500-word explainer on x402 micropayments.')).toLowerCase() as Hex;
+  mockChainJob(
+    51n,
+    2, // Funded
+    { deadline: 1893456000, termsHash },
+    { provider: worker.address, agentId: AGENT_ID },
+  );
+  const res = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.body.synced, true);
+  assert.equal(res.body.state, 'claimed');
+  assert.equal(res.body.onchainState, 'funded');
+  const got = await getJson(app, `/jobs/${jobId}`);
+  const job = got.body.job as Record<string, unknown>;
+  assert.equal(job.worker, worker.address);
+  assert.equal(job.workerAgentId, AGENT_ID.toString());
+  // The idempotent /claim path accepts the original claim tx without an
+  // enrollment row (the sync->claim flow: the chain already proved identity).
+  const h = txHash('claim-51');
+  receipts.set(h.toLowerCase(), claimReceipt(51n, AGENT_ID));
+  const message = {
+    jobId: BigInt(jobId),
+    worker: worker.address,
+    agentId: AGENT_ID,
+    timestamp: BigInt(nowSec()),
+  };
+  const signature = await sign(worker, 'JobClaim', message);
+  const claim = await postJson(app, `/jobs/${jobId}/claim`, {
+    worker: worker.address,
+    agentId: AGENT_ID.toString(),
+    timestamp: Number(message.timestamp),
+    signature,
+    txHash: h,
+  });
+  assert.equal(claim.status, 200);
+  assert.equal(claim.body.state, 'claimed');
+  // The chain-bound worker can now submit through the API (the binding is real).
+  const sub = await submitDeliverable(jobId);
+  assert.equal(sub.status, 200);
+});
+
+await check('sync: direct onchain release -> complete', async () => {
+  const before = activity.length;
+  const { jobId } = await postFixedJob('post-52', 52n);
+  const termsHash = keccak256(toHex('Write a 500-word explainer on x402 micropayments.')).toLowerCase() as Hex;
+  mockChainJob(
+    52n,
+    4, // Released
+    { deadline: 1893456000, termsHash },
+    { provider: worker.address, agentId: AGENT_ID },
+  );
+  const res = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.body.synced, true);
+  assert.equal(res.body.state, 'complete');
+  assert.equal(activity.length, before + 2); // posted + completed
+  assert.equal(activity[activity.length - 1]?.kind, 'completed');
+});
+
+await check('sync: onchain Delivered maps to claimed (no offchain metadata)', async () => {
+  const { jobId } = await postFixedJob('post-53', 53n);
+  const termsHash = keccak256(toHex('Write a 500-word explainer on x402 micropayments.')).toLowerCase() as Hex;
+  mockChainJob(
+    53n,
+    3, // Delivered
+    { deadline: 1893456000, termsHash },
+    { provider: worker.address, agentId: AGENT_ID },
+  );
+  const res = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.body.synced, true);
+  assert.equal(res.body.state, 'claimed');
+  assert.equal(res.body.onchainState, 'delivered');
+});
+
+await check('sync: direct onchain dispute -> disputed, then resolve -> resolved', async () => {
+  const { jobId } = await postFixedJob('post-54', 54n);
+  const termsHash = keccak256(toHex('Write a 500-word explainer on x402 micropayments.')).toLowerCase() as Hex;
+  const fixed = { deadline: 1893456000, termsHash };
+  mockChainJob(54n, 5, fixed, { provider: worker.address, agentId: AGENT_ID });
+  const d = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(d.status, 200);
+  assert.equal(d.body.state, 'disputed');
+  mockChainJob(54n, 6, fixed, { provider: worker.address, agentId: AGENT_ID });
+  const r = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(r.status, 200);
+  assert.equal(r.body.synced, true);
+  assert.equal(r.body.state, 'resolved');
+});
+
+await check('sync: direct onchain refund from open (unclaimed) -> refunded', async () => {
+  const { jobId } = await postFixedJob('post-55', 55n);
+  const termsHash = keccak256(toHex('Write a 500-word explainer on x402 micropayments.')).toLowerCase() as Hex;
+  // provider stays zero: nobody ever claimed.
+  mockChainJob(55n, 7, { deadline: 1893456000, termsHash });
+  const res = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.body.synced, true);
+  assert.equal(res.body.state, 'refunded');
+  const got = await getJson(app, `/jobs/${jobId}`);
+  assert.equal((got.body.job as Record<string, unknown>).worker, null);
+});
+
+await check('sync: unknown onchain job -> 503 sync_unavailable', async () => {
+  const { jobId } = await postFixedJob('post-56', 56n);
+  // No mockChainJob call: getOnchainJob returns null.
+  const res = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(res.status, 503);
+  assert.equal(res.body.error, 'sync_unavailable');
+});
+
+await check('sync: terms mismatch -> 409 sync_mismatch', async () => {
+  const { jobId } = await postFixedJob('post-57', 57n);
+  const termsHash = keccak256(toHex('Write a 500-word explainer on x402 micropayments.')).toLowerCase() as Hex;
+  // Wrong amount onchain: the listing says 25.00 USDC.
+  mockChainJob(
+    57n,
+    2,
+    { deadline: 1893456000, termsHash },
+    { provider: worker.address, agentId: AGENT_ID, amount: parseUnits('24.00', 6) },
+  );
+  const res = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(res.status, 409);
+  assert.equal(res.body.error, 'sync_mismatch');
+  const got = await getJson(app, `/jobs/${jobId}`);
+  assert.equal((got.body.job as Record<string, unknown>).state, 'open');
+});
+
+await check('sync: wrong payer -> 409 sync_mismatch', async () => {
+  const { jobId } = await postFixedJob('post-58', 58n);
+  const termsHash = keccak256(toHex('Write a 500-word explainer on x402 micropayments.')).toLowerCase() as Hex;
+  mockChainJob(
+    58n,
+    2,
+    { deadline: 1893456000, termsHash },
+    { payer: stranger.address, provider: worker.address, agentId: AGENT_ID },
+  );
+  const res = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(res.status, 409);
+  assert.equal(res.body.error, 'sync_mismatch');
+});
+
+await check('sync: terminal row -> 409 wrong_state', async () => {
+  const { jobId } = await postFixedJob('post-59', 59n);
+  const termsHash = keccak256(toHex('Write a 500-word explainer on x402 micropayments.')).toLowerCase() as Hex;
+  const fixed = { deadline: 1893456000, termsHash };
+  mockChainJob(59n, 4, fixed, { provider: worker.address, agentId: AGENT_ID });
+  const first = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(first.body.state, 'complete');
+  const res = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(res.status, 409);
+  assert.equal(res.body.error, 'wrong_state');
+});
+
+await check('sync: never rolls back (db ahead of chain)', async () => {
+  const before = activity.length;
+  const { jobId } = await postFixedJob('post-60', 60n);
+  await claimJob(jobId, AGENT_ID, 'claim-60');
+  const termsHash = keccak256(toHex('Write a 500-word explainer on x402 micropayments.')).toLowerCase() as Hex;
+  // Chain says Open (e.g. a reorged-away claim, or a stale RPC): the DB must
+  // NOT move backward.
+  mockChainJob(60n, 1, { deadline: 1893456000, termsHash });
+  const res = await postJson(app, `/jobs/${jobId}/sync`, {});
+  assert.equal(res.status, 200);
+  assert.equal(res.body.synced, false);
+  assert.equal(res.body.note, 'db_ahead_of_chain');
+  const got = await getJson(app, `/jobs/${jobId}`);
+  assert.equal((got.body.job as Record<string, unknown>).state, 'claimed');
+  assert.equal(activity.length, before + 2); // posted + claimed; the sync fired nothing
+});
+
+await check('sync: unknown job id -> 404', async () => {
+  const res = await postJson(app, '/jobs/99999/sync', {});
+  assert.equal(res.status, 404);
+});
+
+// ---- deadline precision: values above Number.MAX_SAFE_INTEGER are rejected ----
+
+await check('post with deadline 2^53 -> 400 invalid_deadline', async () => {
+  const body = await signedPost({ deadline: (2n ** 53n).toString() });
+  const h = txHash('deadline-2p53');
+  receipts.set(
+    h.toLowerCase(),
+    fundingReceipt(
+      61n,
+      parseUnits('25.00', 6),
+      2n ** 53n,
+      body.termsHash as string,
+    ),
+  );
+  const res = await postJson(app, '/jobs', { ...body, txHash: h });
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'invalid_deadline');
+});
+
+// ---- stored XSS: submissionUri is escaped once revealed ----
+
+async function submitDeliverableWithUri(jobId: number, uri: string) {
+  const contentHash = keccak256(toHex('the work'));
+  const message = {
+    jobId: BigInt(jobId),
+    author: worker.address,
+    contentHash,
+    uri,
+    timestamp: BigInt(nowSec()),
+  };
+  const signature = await sign(worker, 'JobSubmit', message);
+  return postJson(app, `/jobs/${jobId}/submit`, {
+    jobId,
+    author: worker.address,
+    contentHash,
+    uri,
+    timestamp: Number(message.timestamp),
+    signature,
+  });
+}
+
+await check('completed submissionUri is HTML-escaped (stored XSS)', async () => {
+  const jobId = await postFundedJob('post-62', 62n);
+  await claimJob(jobId, AGENT_ID, 'claim-62');
+  const evil = 'https://x"><script>alert(1)</script>';
+  const sub = await submitDeliverableWithUri(jobId, evil);
+  assert.equal(sub.status, 200);
+  // Hidden before completion...
+  const pre = await getJson(app, `/jobs/${jobId}`);
+  assert.equal((pre.body.job as Record<string, unknown>).submissionUri, null);
+  const h = txHash('accept-62');
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [jobReleasedLog(62n)] });
+  const message = {
+    jobId: BigInt(jobId),
+    requester: requester.address,
+    decision: 'accept',
+    timestamp: BigInt(nowSec()),
+  };
+  const signature = await sign(requester, 'JobDecision', message);
+  const accepted = await postJson(app, `/jobs/${jobId}/accept`, {
+    jobId,
+    requester: requester.address,
+    decision: 'accept',
+    timestamp: Number(message.timestamp),
+    signature,
+    txHash: h,
+  });
+  assert.equal(accepted.status, 200);
+  const got = await getJson(app, `/jobs/${jobId}`);
+  const uri = (got.body.job as Record<string, unknown>).submissionUri as string;
+  assert.ok(!uri.includes('<script>'), 'raw script tag must not be rendered');
+  assert.ok(uri.includes('&lt;script&gt;'), 'script tag must be escaped');
+  assert.ok(uri.includes('&quot;'), 'quote must be escaped');
+});
+
+// ---- agentId zero is rejected (the escrow always reverts on it) ----
+
+await check('enroll with agentId 0 -> 400 invalid_agent_id', async () => {
+  const acct = privateKeyToAccount(generatePrivateKey());
+  const message = { wallet: acct.address, agentId: 0n, timestamp: BigInt(nowSec()) };
+  const signature = await sign(acct, 'JobEnroll', message);
+  const res = await postJson(app, '/jobs/enroll', {
+    wallet: acct.address,
+    agentId: '0',
+    timestamp: Number(message.timestamp),
+    signature,
+  });
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'invalid_agent_id');
+});
+
+await check('claim with agentId 0 -> 400 invalid_agent_id', async () => {
+  const jobId = await postFundedJob('post-63', 63n);
+  const h = txHash('claim-63-zero');
+  receipts.set(h.toLowerCase(), claimReceipt(63n, 0n));
+  const message = {
+    jobId: BigInt(jobId),
+    worker: worker.address,
+    agentId: 0n,
+    timestamp: BigInt(nowSec()),
+  };
+  const signature = await sign(worker, 'JobClaim', message);
+  const res = await postJson(app, `/jobs/${jobId}/claim`, {
+    worker: worker.address,
+    agentId: '0',
+    timestamp: Number(message.timestamp),
+    signature,
+    txHash: h,
+  });
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'invalid_agent_id');
+});
+
+// ---- body limit counts UTF-8 bytes, not UTF-16 code units ----
+
+await check('body limit counts UTF-8 bytes (multibyte) -> 413', async () => {
+  // 100k emoji = 200k UTF-16 code units (under the old unit count) but
+  // 400k UTF-8 bytes (over the 256 KiB cap).
+  const big = '🧪'.repeat(100_000);
+  const res = await postJson(app, '/jobs/enroll', {
+    wallet: worker.address,
+    agentId: AGENT_ID.toString(),
+    timestamp: nowSec(),
+    signature: '0x',
+    extra: big,
+  });
+  assert.equal(res.status, 413);
+  assert.equal(res.body.error, 'body_too_large');
+});
+
+await check('body limit control: 200k ASCII bytes stays under the cap', async () => {
+  const ok = 'a'.repeat(200_000); // 200k bytes < 256 KiB
+  const res = await postJson(app, '/jobs/enroll', {
+    wallet: worker.address,
+    agentId: AGENT_ID.toString(),
+    timestamp: nowSec(),
+    signature: '0x',
+    extra: ok,
+  });
+  assert.notEqual(res.status, 413);
+});
+
+// ---- refund/resolve: invalid attempts must not burn the shared mirror budget ----
+
+function makeStrictApp(): Hono {
+  const parent = new Hono();
+  parent.route(
+    '/jobs',
+    createJobsApp(jobsConfig(), {
+      db: new JobsDb(':memory:'),
+      getReceipt,
+      getOnchainJob,
+      identityOwner,
+      reputationSummary,
+      // Default production bucket: proves invalid attempts don't consume it.
+    }),
+  );
+  return parent;
+}
+
+async function postFundedJobOn(
+  target: Hono,
+  seed: string,
+  escrowJobId: bigint,
+): Promise<number> {
+  const body = await signedPost();
+  const h = txHash(seed);
+  receipts.set(
+    h.toLowerCase(),
+    fundingReceipt(
+      escrowJobId,
+      parseUnits(body.bountyUsdc as string, 6),
+      BigInt(body.deadline as string),
+      body.termsHash as string,
+    ),
+  );
+  const res = await postJson(target, '/jobs', { ...body, txHash: h });
+  assert.equal(res.status, 201);
+  return res.body.jobId as number;
+}
+
+await check('refund: malformed attempts do not burn the shared mirror budget', async () => {
+  const strict = makeStrictApp();
+  const jobId = await postFundedJobOn(strict, 'post-70', 70n); // open
+  // 35 malformed attempts: 400 each, and none may consume the 30/min budget.
+  for (let i = 0; i < 35; i++) {
+    const r = await postJson(strict, `/jobs/${jobId}/refund`, { txHash: 'garbage' });
+    assert.equal(r.status, 400);
+  }
+  // A valid mirror still succeeds (it would 429 if junk had burned budget).
+  const h = txHash('refund-70');
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [jobRefundedLog(70n)] });
+  const res = await postJson(strict, `/jobs/${jobId}/refund`, { txHash: h });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.state, 'refunded');
+});
+
+await check('resolve: malformed attempts do not burn the shared mirror budget', async () => {
+  const strict = makeStrictApp();
+  const jobId = await postFundedJobOn(strict, 'post-71', 71n);
+  await enrollWorkerWallet(worker, AGENT_ID, strict);
+  await claimJob(jobId, AGENT_ID, 'claim-71', strict);
+  const d = await raiseDispute(jobId, 71n, false, 'dispute-71', strict);
+  assert.equal(d.status, 200);
+  for (let i = 0; i < 35; i++) {
+    const r = await postJson(strict, `/jobs/${jobId}/resolve`, { txHash: '0x1234' });
+    assert.equal(r.status, 400);
+  }
+  const h = txHash('resolve-71');
+  receipts.set(h.toLowerCase(), { status: 'success', logs: [disputeResolvedLog(71n)] });
+  const res = await postJson(strict, `/jobs/${jobId}/resolve`, { txHash: h });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.state, 'resolved');
+});
+
+await check('default bucket still 429s when genuinely exhausted', async () => {
+  const strict = makeStrictApp();
+  const acct = privateKeyToAccount(generatePrivateKey());
+  let last = 200;
+  for (let i = 0; i < 31; i++) {
+    const message = { wallet: acct.address, agentId: AGENT_ID, timestamp: BigInt(nowSec()) };
+    const signature = await sign(acct, 'JobEnroll', message);
+    const r = await postJson(strict, '/jobs/enroll', {
+      wallet: acct.address,
+      agentId: AGENT_ID.toString(),
+      timestamp: Number(message.timestamp),
+      signature,
+    });
+    last = r.status;
+  }
+  assert.equal(last, 429);
+});
+
+// ---- G1–G8: 2026-09-26 fix batch ----
+
+// owners is the shared identity-registry mock: pin AGENT_ID to the worker
+// wallet for the appended tests (each test below re-pins as needed).
+owners.set(AGENT_ID.toString(), worker.address);
+
+function freshJobsStack(
+  env: Record<string, string | undefined> = {},
+  extra: { ipRateLimitBucket?: { windowMs: number; max: number } } = {},
+): { app: Hono; db: JobsDb } {
+  const cfg = loadJobsConfig({
+    FOUR02_BOUNTY_ESCROW: escrowAddr,
+    FOUR02_JOBS_DB_PATH: ':memory:',
+    INK_RPC_URL: 'http://localhost:1',
+    ...env,
+  });
+  assert.ok(cfg);
+  const db = new JobsDb(':memory:');
+  const parent = new Hono();
+  parent.route(
+    '/jobs',
+    createJobsApp(cfg, {
+      db,
+      getReceipt,
+      getOnchainJob,
+      identityOwner,
+      reputationSummary,
+      onActivity,
+      // Generous author bucket: these tests exercise the NEW controls, not
+      // the shared one (G6 passes its own small IP bucket explicitly).
+      rateLimitBucket: { windowMs: 60_000, max: 10_000 },
+      ...extra,
+    }),
+  );
+  return { app: parent, db };
+}
+
+/** postFundedJob with target app + body overrides (e.g. specPrivate). */
+async function postFundedJobOver(
+  target: Hono,
+  seed: string,
+  escrowJobId: bigint,
+  over: Record<string, unknown> = {},
+): Promise<number> {
+  const body = await signedPost(over);
+  const h = txHash(seed);
+  receipts.set(
+    h.toLowerCase(),
+    fundingReceipt(
+      escrowJobId,
+      parseUnits(body.bountyUsdc as string, 6),
+      BigInt(body.deadline as string),
+      body.termsHash as string,
+    ),
+  );
+  const res = await postJson(target, '/jobs', { ...body, txHash: h });
+  assert.equal(res.status, 201);
+  return res.body.jobId as number;
+}
+
+async function postJsonHeaders(
+  target: Hono,
+  path: string,
+  body: unknown,
+  headers: Record<string, string>,
+) {
+  const res = await target.request(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+}
+
+/** Seed a listing straight into the DB (bypasses HTTP/onchain ceremony). */
+function seedListing(
+  db: JobsDb,
+  o: { requester: string; seed: string; escrowJobId: string; now: number },
+): number {
+  const res = db.createListing({
+    escrowJobId: o.escrowJobId,
+    escrow: escrowAddr,
+    requester: getAddress(o.requester),
+    title: 'Seeded job',
+    spec: 'seeded spec',
+    specHash: keccak256(toHex('seeded spec')),
+    category: 'writing',
+    bountyUsdc: '1.00',
+    deadline: o.now + 86400,
+    txHash: txHash(o.seed),
+    now: o.now,
+  });
+  assert.ok(res.ok);
+  return (res as { ok: true; id: number }).id;
+}
+
+// ---- G1: requester concentration on the resume ----
+
+await check('G1: history returns uniqueRequesters + per-requester job counts', async () => {
+  const { app: a1, db: d1 } = freshJobsStack();
+  const r2 = privateKeyToAccount(generatePrivateKey());
+  const now = nowSec();
+  for (const [req, seed] of [
+    [requester.address, 'g1-a'],
+    [requester.address, 'g1-b'],
+    [r2.address, 'g1-c'],
+  ] as const) {
+    const id = seedListing(d1, { requester: req, seed, escrowJobId: `g1-${seed}`, now });
+    assert.equal(d1.claimJob(id, worker.address, AGENT_ID.toString(), txHash(`${seed}-claim`), now), 'ok');
+  }
+  const res = await getJson(a1, `/jobs/worker/${AGENT_ID}/history`);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.uniqueRequesters, 2);
+  const byReq = res.body.jobsByRequester as Record<string, number>;
+  assert.equal(byReq[getAddress(requester.address)], 2);
+  assert.equal(byReq[getAddress(r2.address)], 1);
+  assert.equal((res.body.jobs as unknown[]).length, 3);
+});
+
+// ---- G2: identity-transfer halo ----
+
+await check('G2: ownershipChanged when a finished job predates the current owner', async () => {
+  const { app: a2, db: d2 } = freshJobsStack();
+  const now = nowSec();
+  const id = seedListing(d2, { requester: requester.address, seed: 'g2-a', escrowJobId: 'g2-a', now });
+  assert.equal(d2.claimJob(id, worker.address, AGENT_ID.toString(), txHash('g2-a-claim'), now), 'ok');
+  assert.equal(d2.acceptJob(id, txHash('g2-a-accept'), now), 'ok'); // complete
+  const newOwner = privateKeyToAccount(generatePrivateKey());
+  owners.set(AGENT_ID.toString(), newOwner.address);
+  try {
+    const res = await getJson(a2, `/jobs/worker/${AGENT_ID}/history`);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.currentOwner, getAddress(newOwner.address));
+    assert.equal(res.body.ownershipChanged, true);
+  } finally {
+    owners.set(AGENT_ID.toString(), worker.address);
+  }
+});
+
+await check('G2: no halo when the owner did the work; refunded/ghosted jobs excluded', async () => {
+  const { app: a2b, db: d2b } = freshJobsStack();
+  const now = nowSec();
+  owners.set(AGENT_ID.toString(), worker.address);
+  // completed by the current owner -> no halo
+  const id = seedListing(d2b, { requester: requester.address, seed: 'g2-b', escrowJobId: 'g2-b', now });
+  assert.equal(d2b.claimJob(id, worker.address, AGENT_ID.toString(), txHash('g2-b-claim'), now), 'ok');
+  assert.equal(d2b.acceptJob(id, txHash('g2-b-accept'), now), 'ok');
+  // refunded (ghosted) by a DIFFERENT wallet -> must not count as finished work
+  const id2 = seedListing(d2b, { requester: requester.address, seed: 'g2-c', escrowJobId: 'g2-c', now });
+  const ghost = privateKeyToAccount(generatePrivateKey());
+  assert.equal(d2b.claimJob(id2, ghost.address, AGENT_ID.toString(), txHash('g2-c-claim'), now), 'ok');
+  assert.equal(d2b.refundJob(id2, txHash('g2-c-refund'), now), 'ok');
+  const res = await getJson(a2b, `/jobs/worker/${AGENT_ID}/history`);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.currentOwner, getAddress(worker.address));
+  assert.equal(res.body.ownershipChanged, false);
+});
+
+await check('G2: registry outage -> currentOwner null, ownershipChanged false (no false halo)', async () => {
+  const { app: a2c } = freshJobsStack();
+  owners.delete(AGENT_ID.toString());
+  try {
+    const res = await getJson(a2c, `/jobs/worker/${AGENT_ID}/history`);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.currentOwner, null);
+    assert.equal(res.body.ownershipChanged, false);
+  } finally {
+    owners.set(AGENT_ID.toString(), worker.address);
+  }
+});
+
+// ---- G3: per-requester daily post cap ----
+
+await check('G3: posting beyond JOBS_DAILY_POST_CAP -> 429 daily_post_cap_exceeded', async () => {
+  const { app: a3 } = freshJobsStack({ JOBS_DAILY_POST_CAP: '2' });
+  await postFundedJobOver(a3, 'g3-a', 301n);
+  await postFundedJobOver(a3, 'g3-b', 302n);
+  const body = await signedPost({ title: 'third post' });
+  const h = txHash('g3-c');
+  receipts.set(
+    h.toLowerCase(),
+    fundingReceipt(303n, parseUnits('25.00', 6), BigInt(body.deadline as string), body.termsHash as string),
+  );
+  const r = await postJson(a3, '/jobs', { ...body, txHash: h });
+  assert.equal(r.status, 429);
+  assert.equal(r.body.error, 'daily_post_cap_exceeded');
+});
+
+await check('G3: config defaults the cap to 50; malformed values throw', () => {
+  const def = loadJobsConfig({ FOUR02_BOUNTY_ESCROW: escrowAddr });
+  assert.ok(def);
+  assert.equal(def.dailyPostCap, 50);
+  assert.throws(() =>
+    loadJobsConfig({ FOUR02_BOUNTY_ESCROW: escrowAddr, JOBS_DAILY_POST_CAP: 'many' }),
+  );
+  assert.throws(() =>
+    loadJobsConfig({ FOUR02_BOUNTY_ESCROW: escrowAddr, JOBS_DAILY_POST_CAP: '0' }),
+  );
+});
+
+// ---- G4: spec privacy ----
+
+await check('G4: private spec hidden on board/detail, specHash kept', async () => {
+  const body = await signedPost({ specPrivate: true, title: 'Private brief' });
+  const h = txHash('g4-priv');
+  receipts.set(
+    h.toLowerCase(),
+    fundingReceipt(401n, parseUnits('25.00', 6), BigInt(body.deadline as string), body.termsHash as string),
+  );
+  const pr = await postJson(app, '/jobs', { ...body, txHash: h });
+  assert.equal(pr.status, 201);
+  const jobId = pr.body.jobId as number;
+
+  const board = await getJson(app, '/jobs?limit=100');
+  const row = (board.body.jobs as Record<string, unknown>[]).find((j) => j.id === jobId);
+  assert.ok(row, 'job on board');
+  assert.equal(row.spec, null);
+  assert.equal(row.specPrivate, true);
+  assert.equal(row.specHash, (body.termsHash as string).toLowerCase());
+
+  const det = await getJson(app, `/jobs/${jobId}`);
+  assert.equal((det.body.job as Record<string, unknown>).spec, null);
+  assert.equal((det.body.job as Record<string, unknown>).specPrivate, true);
+});
+
+await check('G4: specPrivate must be a boolean when present', async () => {
+  const body = await signedPost({ specPrivate: 'yes', title: 'Bad flag' });
+  const res = await postJson(app, '/jobs', { ...body, txHash: txHash('g4-badflag') });
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'invalid_spec_private');
+});
+
+async function specAccess(
+  target: Hono,
+  account: ReturnType<typeof privateKeyToAccount>,
+  jobId: number,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const message = {
+    jobId: BigInt(jobId),
+    accessor: account.address,
+    timestamp: BigInt(nowSec()),
+  };
+  const signature = await sign(account, 'JobSpecAccess', message);
+  return postJson(target, `/jobs/${jobId}/spec`, {
+    jobId,
+    accessor: account.address,
+    timestamp: Number(message.timestamp),
+    signature,
+  });
+}
+
+await check('G4: /spec serves the requester, 403s strangers, 401s bad signatures', async () => {
+  const body = await signedPost({ specPrivate: true, title: 'Gated brief' });
+  const h = txHash('g4-gate');
+  receipts.set(
+    h.toLowerCase(),
+    fundingReceipt(402n, parseUnits('25.00', 6), BigInt(body.deadline as string), body.termsHash as string),
+  );
+  const pr = await postJson(app, '/jobs', { ...body, txHash: h });
+  assert.equal(pr.status, 201);
+  const jobId = pr.body.jobId as number;
+
+  // stranger -> 403
+  const s = await specAccess(app, stranger, jobId);
+  assert.equal(s.status, 403);
+  assert.equal(s.body.error, 'not_authorized');
+
+  // requester -> 200 with the full spec
+  const r = await specAccess(app, requester, jobId);
+  assert.equal(r.status, 200);
+  assert.equal(r.body.spec, body.spec);
+
+  // wrong signer for the claimed accessor -> 401
+  const message = {
+    jobId: BigInt(jobId),
+    accessor: requester.address,
+    timestamp: BigInt(nowSec()),
+  };
+  const forged = await sign(stranger, 'JobSpecAccess', message);
+  const f = await postJson(app, `/jobs/${jobId}/spec`, {
+    jobId,
+    accessor: requester.address,
+    timestamp: Number(message.timestamp),
+    signature: forged,
+  });
+  assert.equal(f.status, 401);
+  assert.equal(f.body.error, 'bad_signature');
+
+  // claimed worker -> 200
+  owners.set(AGENT_ID.toString(), worker.address);
+  const er = await enrollWorkerWallet(worker, AGENT_ID);
+  assert.ok(er.status === 201 || er.status === 200);
+  const cr = await claimJob(jobId, AGENT_ID, 'claim-g4');
+  assert.equal(cr.status, 200);
+  const w = await specAccess(app, worker, jobId);
+  assert.equal(w.status, 200);
+  assert.equal(w.body.spec, body.spec);
+});
+
+await check('G4: spec_private migrates onto pre-existing DBs (default public)', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const p = `${tmpdir()}/jobs-migrate-${Date.now()}-${process.pid}.db`;
+  const old = new DatabaseSync(p);
+  old.exec(
+    `CREATE TABLE job_listings (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       escrow_job_id TEXT NOT NULL, escrow TEXT NOT NULL, requester TEXT NOT NULL,
+       worker TEXT, worker_agent_id TEXT, title TEXT NOT NULL, spec TEXT NOT NULL,
+       spec_hash TEXT NOT NULL, category TEXT NOT NULL, bounty_usdc TEXT NOT NULL,
+       deadline INTEGER NOT NULL, state TEXT NOT NULL, submission_hash TEXT,
+       submission_uri TEXT, disputed_at INTEGER, created_at INTEGER NOT NULL,
+       updated_at INTEGER NOT NULL
+     )`,
+  );
+  old.close();
+  const migrated = new JobsDb(p);
+  try {
+    const res = migrated.createListing({
+      escrowJobId: 'g4m',
+      escrow: escrowAddr,
+      requester: getAddress(requester.address),
+      title: 't',
+      spec: 's',
+      specHash: keccak256(toHex('s')),
+      category: 'writing',
+      bountyUsdc: '1.00',
+      deadline: nowSec() + 100,
+      txHash: txHash('g4-mig'),
+      now: nowSec(),
+    });
+    assert.ok(res.ok);
+    const got = migrated.getJob((res as { ok: true; id: number }).id);
+    assert.equal(got?.specPrivate, false);
+    // and the new column is writable on the migrated table
+    const res2 = migrated.createListing({
+      escrowJobId: 'g4m2',
+      escrow: escrowAddr,
+      requester: getAddress(requester.address),
+      title: 't',
+      spec: 's',
+      specPrivate: true,
+      specHash: keccak256(toHex('s')),
+      category: 'writing',
+      bountyUsdc: '1.00',
+      deadline: nowSec() + 100,
+      txHash: txHash('g4-mig2'),
+      now: nowSec(),
+    });
+    assert.ok(res2.ok);
+    assert.equal(migrated.getJob((res2 as { ok: true; id: number }).id)?.specPrivate, true);
+  } finally {
+    migrated.close();
+  }
+});
+
+// ---- G5: superseded-registry warning ----
+
+await check('G5: default (V1) registry logs a loud warning at config load', () => {
+  const orig = console.warn;
+  const lines: string[] = [];
+  console.warn = (...args: unknown[]) => {
+    lines.push(args.map(String).join(' '));
+  };
+  try {
+    loadJobsConfig({ FOUR02_BOUNTY_ESCROW: escrowAddr });
+  } finally {
+    console.warn = orig;
+  }
+  assert.ok(
+    lines.some(
+      (l) =>
+        l.includes('SUPERSEDED') &&
+        l.includes('0x33E2c56035C059553a37a3A56199B5b5b3DA3365') &&
+        l.includes('all-zeros'),
+    ),
+    `expected loud warning, got: ${lines.join(' | ')}`,
+  );
+});
+
+await check('G5: no warning when a non-V1 registry is configured', () => {
+  const orig = console.warn;
+  const lines: string[] = [];
+  console.warn = (...args: unknown[]) => {
+    lines.push(args.map(String).join(' '));
+  };
+  try {
+    loadJobsConfig({
+      FOUR02_BOUNTY_ESCROW: escrowAddr,
+      FOUR02_REPUTATION_REGISTRY: '0x0000000000000000000000000000000000000001',
+    });
+  } finally {
+    console.warn = orig;
+  }
+  assert.equal(lines.length, 0);
+});
+
+// ---- G6: per-IP rate limiting ----
+
+await check('G6: per-IP bucket 429s enroll spam from fresh wallets behind one IP', async () => {
+  const { app: a6 } = freshJobsStack({}, { ipRateLimitBucket: { windowMs: 60_000, max: 2 } });
+  const ip = { 'x-forwarded-for': '203.0.113.9' };
+  const enroll = async (seed: number) => {
+    const acct = privateKeyToAccount(generatePrivateKey());
+    const agentId = 1000n + BigInt(seed);
+    owners.set(agentId.toString(), acct.address);
+    const message = { wallet: acct.address, agentId, timestamp: BigInt(nowSec()) };
+    const signature = await sign(acct, 'JobEnroll', message);
+    return postJsonHeaders(a6, '/jobs/enroll', {
+      wallet: acct.address,
+      agentId: agentId.toString(),
+      timestamp: Number(message.timestamp),
+      signature,
+    }, ip);
+  };
+  assert.equal((await enroll(1)).status, 201);
+  assert.equal((await enroll(2)).status, 201);
+  const third = await enroll(3);
+  assert.equal(third.status, 429);
+  assert.equal(third.body.error, 'rate_limited');
+  // a different IP is unaffected (per-IP granularity, not a global brake)
+  owners.set('9999', stranger.address);
+  const otherMsg = { wallet: stranger.address, agentId: 9999n, timestamp: BigInt(nowSec()) };
+  const other = await postJsonHeaders(a6, '/jobs/enroll', {
+    wallet: stranger.address,
+    agentId: '9999',
+    timestamp: Number(otherMsg.timestamp),
+    signature: await sign(stranger, 'JobEnroll', otherMsg),
+  }, { 'x-forwarded-for': '203.0.113.10' });
+  assert.equal(other.status, 201);
+  owners.delete('9999');
+});
+
+await check('G6: per-IP bucket 429s post spam behind one IP', async () => {
+  const { app: a6b } = freshJobsStack({}, { ipRateLimitBucket: { windowMs: 60_000, max: 2 } });
+  const ip = { 'x-forwarded-for': '203.0.113.11' };
+  const postOne = async (seed: string, escrowJobId: bigint) => {
+    const body = await signedPost();
+    const h = txHash(seed);
+    receipts.set(
+      h.toLowerCase(),
+      fundingReceipt(escrowJobId, parseUnits('25.00', 6), BigInt(body.deadline as string), body.termsHash as string),
+    );
+    const res = await a6b.request('/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...ip },
+      body: JSON.stringify({ ...body, txHash: h }),
+    });
+    return res.status;
+  };
+  assert.equal(await postOne('g6-a', 501n), 201);
+  assert.equal(await postOne('g6-b', 502n), 201);
+  assert.equal(await postOne('g6-c', 503n), 429);
+});
+
+// ---- G7: submissionUri scheme allowlist ----
+
+await check('G7: submit rejects non-allowlisted URI schemes', async () => {
+  const jobId = await postFundedJob('post-g7', 601n);
+  const ok = await claimJob(jobId, AGENT_ID, 'claim-g7');
+  assert.equal(ok.status, 200);
+  for (const badUri of [
+    'javascript:alert(1)',
+    'data:text/html,<h1>x</h1>',
+    'ftp://example.com/work.zip',
+    'file:///etc/passwd',
+    'JAVASCRIPT:alert(1)',
+  ]) {
+    const contentHash = keccak256(toHex('the work'));
+    const message = {
+      jobId: BigInt(jobId),
+      author: worker.address,
+      contentHash,
+      uri: badUri,
+      timestamp: BigInt(nowSec()),
+    };
+    const signature = await sign(worker, 'JobSubmit', message);
+    const res = await postJson(app, `/jobs/${jobId}/submit`, {
+      jobId,
+      author: worker.address,
+      contentHash,
+      uri: badUri,
+      timestamp: Number(message.timestamp),
+      signature,
+    });
+    assert.equal(res.status, 400, badUri);
+    assert.equal(res.body.error, 'invalid_uri_scheme');
+  }
+});
+
+await check('G7: submit still accepts https/http/ipfs URIs (case-insensitive)', async () => {
+  for (const [seed, escrowJobId, goodUri] of [
+    ['post-g7b', 602n, 'https://example.com/work.zip'],
+    ['post-g7c', 603n, 'HTTPS://EXAMPLE.COM/WORK.ZIP'],
+    ['post-g7d', 604n, 'http://example.com/work.zip'],
+  ] as const) {
+    const jobId = await postFundedJob(seed, escrowJobId);
+    const ok = await claimJob(jobId, AGENT_ID, `claim-${seed}`);
+    assert.equal(ok.status, 200);
+    const contentHash = keccak256(toHex('the work'));
+    const message = {
+      jobId: BigInt(jobId),
+      author: worker.address,
+      contentHash,
+      uri: goodUri,
+      timestamp: BigInt(nowSec()),
+    };
+    const signature = await sign(worker, 'JobSubmit', message);
+    const res = await postJson(app, `/jobs/${jobId}/submit`, {
+      jobId,
+      author: worker.address,
+      contentHash,
+      uri: goodUri,
+      timestamp: Number(message.timestamp),
+      signature,
+    });
+    assert.equal(res.status, 200, goodUri);
+  }
+});
+
+// ---- G8: seat gate ----
+
+await check('G8: JOBS_SEATS_REQUIRED=1 -> claim without a seat fails closed', async () => {
+  const { app: a8 } = freshJobsStack({ JOBS_SEATS_REQUIRED: '1' });
+  owners.set(AGENT_ID.toString(), worker.address);
+  const jobId = await postFundedJobOver(a8, 'g8-a', 701n);
+  const er = await enrollWorkerWallet(worker, AGENT_ID, a8);
+  assert.ok(er.status === 201 || er.status === 200, `enroll: ${er.status}`);
+  const cr = await claimJob(jobId, AGENT_ID, 'claim-g8-a', a8);
+  assert.equal(cr.status, 403);
+  assert.equal(cr.body.error, 'seat_required');
+});
+
+await check('G8: claim with a seat succeeds and the seat survives re-verification', async () => {
+  const { app: a8b, db: d8b } = freshJobsStack({ JOBS_SEATS_REQUIRED: 'true' });
+  owners.set(AGENT_ID.toString(), worker.address);
+  const jobId = await postFundedJobOver(a8b, 'g8-b', 702n);
+  d8b.enrollWorker({
+    wallet: getAddress(worker.address),
+    agentId: AGENT_ID.toString(),
+    seatTokenId: '42',
+    now: nowSec(),
+  });
+  const cr = await claimJob(jobId, AGENT_ID, 'claim-g8-b', a8b);
+  assert.equal(cr.status, 200);
+  // the claim-time re-verification must not wipe the seat (fail-closed gate
+  // would brick the worker on their NEXT claim otherwise)
+  assert.equal(d8b.getWorker(worker.address)?.seatTokenId, '42');
+});
+
+await check('G8: seat gate defaults off (existing claim flow unchanged)', () => {
+  const cfg = loadJobsConfig({ FOUR02_BOUNTY_ESCROW: escrowAddr });
+  assert.ok(cfg);
+  assert.equal(cfg.seatsRequired, false);
 });
 
 console.log(`\njobs: ${passed} checks passed`);

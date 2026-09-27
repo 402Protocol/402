@@ -4,12 +4,16 @@
  *   POST /jobs                      -> create listing (signed JobPost + funding txHash)
  *   GET  /jobs?status=&category=&limit= -> public board, newest first
  *   GET  /jobs/:id                  -> public detail
+ *   POST /jobs/:id/spec             -> gated private-spec read (signed JobSpecAccess)
  *   POST /jobs/:id/claim            -> enrolled worker claims (signed JobClaim + claim txHash)
  *   POST /jobs/:id/submit           -> worker submits deliverable (signed JobSubmit)
  *   POST /jobs/:id/accept           -> requester accepts (signed JobDecision + release txHash)
  *   POST /jobs/:id/dispute          -> either party disputes (signed JobDecision + raiseDispute txHash)
  *   POST /jobs/:id/refund           -> mirror an onchain refund (refund txHash, permissionless)
  *   POST /jobs/:id/resolve          -> mirror an onchain arbitration (resolveDispute txHash, permissionless)
+ *   POST /jobs/:id/sync            -> reconcile a listing with the onchain
+ *                                     job (direct contract calls bypassing
+ *                                     the API), forward-only, permissionless
  *   POST /jobs/enroll               -> worker enrollment (signed JobEnroll + onchain ownerOf check)
  *   GET  /jobs/workers/:wallet      -> enrollment record
  *   GET  /jobs/worker/:agentId/history -> DB history + onchain reputation summary
@@ -48,15 +52,17 @@ import type { GetReceipt } from '../lounge/types.js';
 import type { JobsConfig } from './config.js';
 import { JobsDb, type JobListing, type JobsTxPurpose, type JobState } from './db.js';
 import {
-  defaultGetTransaction,
+  defaultGetOnchainJob,
   defaultIdentityOwner,
   defaultReputationSummary,
   verifyBountyClaimed,
   verifyBountyFunding,
+  verifyDisputeRaised,
   verifyDisputeResolved,
-  verifyEscrowCall,
   verifyJobRefunded,
-  type GetTransaction,
+  verifyRelease,
+  ONCHAIN_JOB_STATES,
+  type GetOnchainJob,
   type IdentityOwner,
   type ReputationSummary,
 } from './escrow.js';
@@ -89,6 +95,17 @@ export const JOB_URI_MAX = 2048;
 /** Signed-action cadence: 30 writes/minute per wallet, after validation. */
 export const JOBS_ACTION_BUCKET = { windowMs: 60_000, max: 30 };
 
+/**
+ * Per-IP cadence on the sybil-exposed endpoints (post + enroll): coarser
+ * than the per-author bucket, so one IP minting wallets can't dodge the
+ * author limit forever. 120/min is 4x the author budget — wide enough for
+ * a NAT'd office, tight enough to slow a spammer.
+ */
+export const JOBS_IP_BUCKET = { windowMs: 60_000, max: 120 };
+
+/** Rolling window for the per-requester daily post cap (G3). */
+export const JOBS_POST_CAP_WINDOW_SECONDS = 24 * 60 * 60;
+
 export interface JobActivityEvent {
   kind:
     | 'posted'
@@ -107,11 +124,34 @@ export interface JobActivityEvent {
 export interface JobsDeps {
   db?: JobsDb;
   getReceipt?: GetReceipt;
-  getTransaction?: GetTransaction;
   identityOwner?: IdentityOwner;
+  /** Onchain job reader for POST /jobs/:id/sync (eth_call getJob). */
+  getOnchainJob?: GetOnchainJob;
   reputationSummary?: (agentId: bigint) => Promise<ReputationSummary | null>;
   /** Fired after every board event (the Lounge's job-activity feed). */
   onActivity?: (a: JobActivityEvent) => void;
+  /**
+   * Override the shared rate-limit bucket. Production uses
+   * JOBS_ACTION_BUCKET; tests pass a generous bucket so the suite isn't
+   * coupled to the production budget (a dedicated test below still proves
+   * the default bucket 429s).
+   */
+  rateLimitBucket?: { windowMs: number; max: number };
+  /**
+   * Override the per-IP bucket. Defaults to rateLimitBucket when set
+   * (tests stay decoupled) and JOBS_IP_BUCKET in production.
+   */
+  ipRateLimitBucket?: { windowMs: number; max: number };
+}
+
+/** Client IP for the per-IP bucket: first X-Forwarded-For hop, 'unknown' when absent. */
+function clientIp(c: Context): string {
+  const fwd = c.req.header('x-forwarded-for');
+  if (fwd) {
+    const first = fwd.split(',')[0]?.trim();
+    if (first) return first;
+  }
+  return 'unknown';
 }
 
 function parseUint(v: unknown): bigint | null {
@@ -161,7 +201,10 @@ function parseBountyUsdc(v: unknown): bigint | null {
 
 /**
  * Public job shape. The submission URI is deliverable access, so it is
- * only revealed once the job is complete — until then, hashes only.
+ * only revealed once the job is complete — until then, hashes only. A
+ * private spec is withheld entirely (null) while the specHash stays public
+ * (it is the onchain termsHash, public by definition); the full spec is
+ * served only via the signed POST /jobs/:id/spec endpoint.
  */
 function publicJob(l: JobListing): Record<string, unknown> {
   return {
@@ -172,13 +215,17 @@ function publicJob(l: JobListing): Record<string, unknown> {
     worker: l.worker,
     workerAgentId: l.workerAgentId,
     title: escapeHtml(l.title),
-    spec: escapeHtml(l.spec),
+    spec: l.specPrivate ? null : escapeHtml(l.spec),
+    specPrivate: l.specPrivate,
+    specHash: l.specHash,
     category: l.category,
     bountyUsdc: l.bountyUsdc,
     deadline: l.deadline,
     state: l.state,
     submissionHash: l.submissionHash,
-    submissionUri: l.state === 'complete' ? l.submissionUri : null,
+    // Escaped like title/spec: the URI is worker-supplied content the site
+    // renders, so it gets the same output encoding (stored-XSS hygiene).
+    submissionUri: l.state === 'complete' ? escapeHtml(l.submissionUri ?? '') : null,
     disputedAt: l.disputedAt,
     createdAt: l.createdAt,
     updatedAt: l.updatedAt,
@@ -192,13 +239,14 @@ export function createJobsApp(
   const app = new Hono();
   const db = deps.db ?? new JobsDb(config.dbPath);
   const getReceipt = deps.getReceipt ?? defaultGetReceipt(config.rpcUrl);
-  const getTransaction =
-    deps.getTransaction ?? defaultGetTransaction(config.rpcUrl);
+  const getOnchainJob = deps.getOnchainJob ?? defaultGetOnchainJob(config.rpcUrl);
   const identityOwner = deps.identityOwner ?? defaultIdentityOwner(config.rpcUrl);
   const reputationSummary =
     deps.reputationSummary ??
     defaultReputationSummary(config.rpcUrl, config.reputationRegistry);
   const limiter = new AuthorRateLimiter();
+  const bucket = deps.rateLimitBucket ?? JOBS_ACTION_BUCKET;
+  const ipBucket = deps.ipRateLimitBucket ?? deps.rateLimitBucket ?? JOBS_IP_BUCKET;
 
   async function readBody(
     c: Context,
@@ -212,7 +260,10 @@ export function createJobsApp(
     } catch {
       return { ok: false, status: 400, error: 'unreadable_body' };
     }
-    if (text.length > JOBS_MAX_BODY_BYTES) {
+    // Byte-count, not text.length: the cap is documented in bytes, and
+    // multibyte UTF-8 (e.g. emoji, 4 bytes per code point) must not slip
+    // past a UTF-16-code-unit count.
+    if (Buffer.byteLength(text, 'utf8') > JOBS_MAX_BODY_BYTES) {
       return { ok: false, status: 413, error: 'body_too_large' };
     }
     try {
@@ -273,6 +324,11 @@ export function createJobsApp(
     if (agentIdBig === null) {
       return bad(c, 400, 'invalid_agent_id', 'agentId must be a uint256');
     }
+    // The escrow's claimBounty reverts on agentId 0 (ZeroAgentId): fail fast
+    // here instead of enrolling an identity that can never claim.
+    if (agentIdBig === 0n) {
+      return bad(c, 400, 'invalid_agent_id', 'agentId must be nonzero');
+    }
     const ts = parseTimestamp(timestamp);
     if (ts === null || !timestampFresh(ts)) {
       return bad(c, 401, 'stale_timestamp', 'timestamp must be within ±5 minutes');
@@ -288,8 +344,14 @@ export function createJobsApp(
     });
     if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
 
-    // Rate limit AFTER the request is otherwise valid.
-    if (!limiter.take(`jobs-enroll:${wallet.toLowerCase()}`, JOBS_ACTION_BUCKET)) {
+    // Rate limit AFTER the request is otherwise valid. The per-IP bucket
+    // runs FIRST: author buckets alone are sybil-bypassable (mint wallets,
+    // dodge the per-wallet limit), so a coarser IP-level brake sits in
+    // front of the per-author one.
+    if (!limiter.take(`jobs-enroll-ip:${clientIp(c)}`, ipBucket)) {
+      return bad(c, 429, 'rate_limited', 'slow down');
+    }
+    if (!limiter.take(`jobs-enroll:${wallet.toLowerCase()}`, bucket)) {
       return bad(c, 429, 'rate_limited', 'slow down');
     }
 
@@ -339,14 +401,55 @@ export function createJobsApp(
       return bad(c, 400, 'invalid_agent_id', 'agentId must be a uint256');
     }
     const agentId = agentIdBig.toString();
-    const jobs = db.jobsForAgent(agentId).map(publicJob);
+    const listings = db.jobsForAgent(agentId);
+    const jobs = listings.map(publicJob);
     let reputation: ReputationSummary | null = null;
     try {
       reputation = await reputationSummary(agentIdBig);
     } catch {
       reputation = null;
     }
-    return c.json({ agentId, jobs, reputation });
+    // G1: requester concentration. A resume of 50 jobs from 1 requester
+    // smells farmed; the per-requester counts make that visible.
+    const jobsByRequester: Record<string, number> = {};
+    for (const l of listings) {
+      jobsByRequester[l.requester] = (jobsByRequester[l.requester] ?? 0) + 1;
+    }
+    // G2: identity-transfer halo. Agent ids are transferable NFTs, so a
+    // buyer inherits the whole resume. Compare the CURRENT registry owner
+    // against the worker wallet stored on each finished job: any mismatch
+    // means the resume's work was done by a previous owner.
+    let currentOwner: Address | null = null;
+    try {
+      currentOwner = await identityOwner(agentIdBig);
+    } catch {
+      currentOwner = null;
+    }
+    let ownershipChanged = false;
+    if (currentOwner !== null) {
+      const ownerLc = currentOwner.toLowerCase();
+      // 'complete' and 'resolved' are the finished-work states (refunded =
+      // ghosted, disputed = in flight). The stored worker is the wallet
+      // that actually did the work, bound trustlessly at claim time.
+      ownershipChanged = listings.some(
+        (l) =>
+          (l.state === 'complete' || l.state === 'resolved') &&
+          l.worker !== null &&
+          l.worker.toLowerCase() !== ownerLc,
+      );
+      currentOwner = getAddress(currentOwner);
+    }
+    // When the registry check is unavailable, currentOwner is null and
+    // ownershipChanged stays false (cannot determine — not "changed").
+    return c.json({
+      agentId,
+      jobs,
+      reputation,
+      uniqueRequesters: Object.keys(jobsByRequester).length,
+      jobsByRequester,
+      currentOwner,
+      ownershipChanged,
+    });
   });
 
   // ---- board ----
@@ -359,6 +462,7 @@ export function createJobsApp(
       requester,
       title,
       spec,
+      specPrivate,
       category,
       bountyUsdc,
       deadline,
@@ -376,6 +480,14 @@ export function createJobsApp(
     }
     if (typeof spec !== 'string' || spec.length === 0 || spec.length > JOB_SPEC_MAX) {
       return bad(c, 400, 'invalid_spec', `spec must be 1-${JOB_SPEC_MAX} chars`);
+    }
+    // Unsigned read-visibility flag: the spec ITSELF is signed (and its
+    // hash is the onchain termsHash), so the flag can't smuggle content —
+    // it only decides whether the API withholds the spec from public
+    // reads. Kept out of the JobPost typed message so existing signers
+    // keep verifying (adding a field would break their signatures).
+    if (specPrivate !== undefined && typeof specPrivate !== 'boolean') {
+      return bad(c, 400, 'invalid_spec_private', 'specPrivate must be a boolean');
     }
     if (typeof category !== 'string') {
       return bad(c, 400, 'invalid_category');
@@ -402,14 +514,17 @@ export function createJobsApp(
     }
     const deadlineBig = parseUint(deadline);
     const nowSec = Math.floor(Date.now() / 1000);
-    // The escrow takes a uint64 deadline: bound it here so the DB (which
-    // stores Number(deadline)) and the onchain value can never diverge.
+    // The escrow takes a uint64 deadline, but the DB stores Number(deadline)
+    // and SQLite INTEGERs are 64-bit signed: beyond Number.MAX_SAFE_INTEGER
+    // the DB value would silently round and diverge from the exact onchain
+    // value, and beyond 2^63-1 the INSERT itself can overflow. Bound it here
+    // so the DB and the onchain value can never diverge.
     if (
       deadlineBig === null ||
       deadlineBig <= BigInt(nowSec) ||
-      deadlineBig > 0xffffffffffffffffn
+      deadlineBig > BigInt(Number.MAX_SAFE_INTEGER)
     ) {
-      return bad(c, 400, 'invalid_deadline', 'deadline must be a future unix timestamp (uint64)');
+      return bad(c, 400, 'invalid_deadline', 'deadline must be a future unix timestamp (uint64, within Number.MAX_SAFE_INTEGER)');
     }
     const terms = parseBytes32(termsHash);
     if (terms === null) {
@@ -449,8 +564,24 @@ export function createJobsApp(
     });
     if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
 
-    // Rate limit AFTER the request is otherwise valid.
-    if (!limiter.take(`jobs-post:${requester.toLowerCase()}`, JOBS_ACTION_BUCKET)) {
+    // Per-IP bucket first (sybil brake), then the daily post cap, then the
+    // per-author bucket — all AFTER the request is otherwise valid, so
+    // failed attempts burn no quota.
+    if (!limiter.take(`jobs-post-ip:${clientIp(c)}`, ipBucket)) {
+      return bad(c, 429, 'rate_limited', 'slow down');
+    }
+    if (
+      db.countListingsSince(requester, nowSec - JOBS_POST_CAP_WINDOW_SECONDS) >=
+      config.dailyPostCap
+    ) {
+      return bad(
+        c,
+        429,
+        'daily_post_cap_exceeded',
+        `at most ${config.dailyPostCap} listings per requester per 24h`,
+      );
+    }
+    if (!limiter.take(`jobs-post:${requester.toLowerCase()}`, bucket)) {
       return bad(c, 429, 'rate_limited', 'slow down');
     }
 
@@ -497,6 +628,7 @@ export function createJobsApp(
       requester: getAddress(requester),
       title,
       spec,
+      specPrivate: specPrivate === true,
       specHash: terms,
       category,
       bountyUsdc: bountyUsdc as string,
@@ -559,6 +691,70 @@ export function createJobsApp(
     return c.json({ job: publicJob(listing) });
   });
 
+  // ---- gated private-spec read ----
+  //
+  // A private spec is withheld from every public read (board, detail,
+  // resume) and served here ONLY to the requester or the claimed worker.
+  // The accessor signs a JobSpecAccess typed message; the signature proves
+  // WHO is asking, and the server then checks that wallet is a party to
+  // the job. For a public spec the endpoint is redundant (the spec is on
+  // the board already) but harmless — the same two-party gate applies.
+
+  app.post('/:id/spec', async (c) => {
+    const id = jobIdParam(c);
+    if (id === null) return bad(c, 400, 'invalid_job_id');
+    const listing = db.getJob(id);
+    if (!listing) return bad(c, 404, 'job_not_found');
+    const parsed = await readBody(c);
+    if (!parsed.ok) return bad(c, parsed.status, parsed.error);
+    const b = parsed.body as Record<string, unknown>;
+    const { jobId, accessor, timestamp, signature } = b;
+
+    if (typeof accessor !== 'string' || !isAddress(accessor)) {
+      return bad(c, 400, 'invalid_accessor');
+    }
+    const ts = parseTimestamp(timestamp);
+    if (ts === null || !timestampFresh(ts)) {
+      return bad(c, 401, 'stale_timestamp', 'timestamp must be within ±5 minutes');
+    }
+    if (typeof signature !== 'string') {
+      return bad(c, 400, 'missing_signature');
+    }
+    if (jobId !== undefined && parseUint(jobId)?.toString() !== String(id)) {
+      return bad(c, 400, 'job_id_mismatch', 'signed jobId does not match the URL');
+    }
+    const sig = await verifyLoungeSignature({
+      primaryType: 'JobSpecAccess',
+      message: { jobId: BigInt(id), accessor, timestamp: ts },
+      signature,
+      author: accessor,
+    });
+    if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
+
+    if (!limiter.take(`jobs-spec:${accessor.toLowerCase()}`, bucket)) {
+      return bad(c, 429, 'rate_limited', 'slow down');
+    }
+
+    const acc = accessor.toLowerCase();
+    const isRequester = acc === listing.requester.toLowerCase();
+    const isWorker =
+      listing.worker !== null && acc === listing.worker.toLowerCase();
+    if (!isRequester && !isWorker) {
+      return bad(
+        c,
+        403,
+        'not_authorized',
+        'only the requester or the claimed worker may read this spec',
+      );
+    }
+    return c.json({
+      jobId: id,
+      spec: listing.spec,
+      specHash: listing.specHash,
+      specPrivate: listing.specPrivate,
+    });
+  });
+
   // ---- lifecycle ----
 
   app.post('/:id/claim', async (c) => {
@@ -566,7 +762,10 @@ export function createJobsApp(
     if (id === null) return bad(c, 400, 'invalid_job_id');
     const listing = db.getJob(id);
     if (!listing) return bad(c, 404, 'job_not_found');
-    if (listing.state !== 'open') {
+    // 'claimed' is allowed through for the idempotent path: when a worker
+    // claimed onchain directly (or a sync mirrored it), presenting the real
+    // claim tx must succeed rather than 409.
+    if (listing.state !== 'open' && listing.state !== 'claimed') {
       return bad(c, 409, 'wrong_state', `job is ${listing.state}, not open`);
     }
     const parsed = await readBody(c);
@@ -580,6 +779,9 @@ export function createJobsApp(
     const agentIdBig = parseUint(agentId);
     if (agentIdBig === null) {
       return bad(c, 400, 'invalid_agent_id', 'agentId must be a uint256');
+    }
+    if (agentIdBig === 0n) {
+      return bad(c, 400, 'invalid_agent_id', 'agentId must be nonzero');
     }
     const ts = parseTimestamp(timestamp);
     if (ts === null || !timestampFresh(ts)) {
@@ -597,46 +799,62 @@ export function createJobsApp(
     if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
 
     // Rate limit AFTER the request is otherwise valid.
-    if (!limiter.take(`jobs-claim:${worker.toLowerCase()}`, JOBS_ACTION_BUCKET)) {
+    if (!limiter.take(`jobs-claim:${worker.toLowerCase()}`, bucket)) {
       return bad(c, 429, 'rate_limited', 'slow down');
     }
     const txCheck = checkTxHash(c, txHash);
     if (!txCheck.ok) return txCheck.res;
 
-    // Enrollment gate: the claimant must be enrolled, and the claimed
-    // agent id must be the enrolled one. A stale DB row can never claim —
-    // identity is re-checked onchain below, the source of truth.
-    const enrollment = db.getWorker(worker);
-    if (!enrollment) {
-      return bad(c, 403, 'not_enrolled', 'enroll at POST /jobs/enroll first');
+    const alreadyClaimed = listing.state === 'claimed';
+    if (!alreadyClaimed) {
+      // Enrollment gate: the claimant must be enrolled, and the claimed
+      // agent id must be the enrolled one. A stale DB row can never claim —
+      // identity is re-checked onchain below, the source of truth. Skipped
+      // on the idempotent path: the outcome is already mirrored and the
+      // verified claim tx below is the proof.
+      const enrollment = db.getWorker(worker);
+      if (!enrollment) {
+        return bad(c, 403, 'not_enrolled', 'enroll at POST /jobs/enroll first');
+      }
+      if (enrollment.agentId !== agentIdBig.toString()) {
+        return bad(
+          c,
+          403,
+          'agent_not_enrolled',
+          'this agent id is not enrolled for the claiming wallet',
+        );
+      }
+      // G8: optional TRACES seat gate. When JOBS_SEATS_REQUIRED is on, the
+      // claimant's enrollment must carry a seat token id — fail closed.
+      // The flip is config-only: no code change, just the env var.
+      if (config.seatsRequired && !enrollment.seatTokenId) {
+        return bad(
+          c,
+          403,
+          'seat_required',
+          'claiming requires a TRACES seat (JOBS_SEATS_REQUIRED is on)',
+        );
+      }
+      const owner = await identityOwner(agentIdBig);
+      if (owner === null) {
+        return bad(c, 503, 'identity_check_unavailable', 'could not reach the identity registry');
+      }
+      if (owner.toLowerCase() !== worker.toLowerCase()) {
+        return bad(
+          c,
+          403,
+          'identity_mismatch',
+          `registry ownerOf(${agentIdBig}) is not ${getAddress(worker)}`,
+        );
+      }
+      // Refresh the verification timestamp on a successful onchain re-check.
+      const now = Math.floor(Date.now() / 1000);
+      db.enrollWorker({
+        wallet: getAddress(worker),
+        agentId: agentIdBig.toString(),
+        now,
+      });
     }
-    if (enrollment.agentId !== agentIdBig.toString()) {
-      return bad(
-        c,
-        403,
-        'agent_not_enrolled',
-        'this agent id is not enrolled for the claiming wallet',
-      );
-    }
-    const owner = await identityOwner(agentIdBig);
-    if (owner === null) {
-      return bad(c, 503, 'identity_check_unavailable', 'could not reach the identity registry');
-    }
-    if (owner.toLowerCase() !== worker.toLowerCase()) {
-      return bad(
-        c,
-        403,
-        'identity_mismatch',
-        `registry ownerOf(${agentIdBig}) is not ${getAddress(worker)}`,
-      );
-    }
-    // Refresh the verification timestamp on a successful onchain re-check.
-    const now = Math.floor(Date.now() / 1000);
-    db.enrollWorker({
-      wallet: getAddress(worker),
-      agentId: agentIdBig.toString(),
-      now,
-    });
 
     // Verify the onchain claim: claimBounty(jobId, agentId) really ran,
     // binding this worker + agent id to the escrow's bounty.
@@ -652,6 +870,20 @@ export function createJobsApp(
       return bad(c, receiptStatus(claimed.reason), 'claim_invalid', claimed.reason);
     }
 
+    if (alreadyClaimed) {
+      // Idempotent: the verified BountyClaimed event binds this exact
+      // worker + agent id, so a row mismatch is a genuine conflict, not a
+      // retry (a second valid claimBounty tx cannot exist onchain).
+      if (
+        listing.worker?.toLowerCase() !== getAddress(worker).toLowerCase() ||
+        listing.workerAgentId !== agentIdBig.toString()
+      ) {
+        return bad(c, 409, 'claim_conflict', 'job is claimed by a different worker');
+      }
+      return c.json({ jobId: id, state: 'claimed', worker: getAddress(worker) });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
     const res = db.claimJob(
       id,
       getAddress(worker),
@@ -698,6 +930,23 @@ export function createJobsApp(
     if (typeof uri !== 'string' || uri.length === 0 || uri.length > JOB_URI_MAX) {
       return bad(c, 400, 'invalid_uri', `uri must be 1-${JOB_URI_MAX} chars`);
     }
+    // Scheme allowlist: the URI is rendered by the site and fetched by the
+    // requester, so javascript:/data:/vbscript: and other exotic schemes are
+    // rejected at the door. The HTML escaping on output stays (stored-XSS
+    // hygiene for whatever the allowed schemes can still carry).
+    const uriScheme = uri.toLowerCase();
+    if (
+      !uriScheme.startsWith('https://') &&
+      !uriScheme.startsWith('http://') &&
+      !uriScheme.startsWith('ipfs://')
+    ) {
+      return bad(
+        c,
+        400,
+        'invalid_uri_scheme',
+        'submission uri must use https://, http://, or ipfs://',
+      );
+    }
     const ts = parseTimestamp(timestamp);
     if (ts === null || !timestampFresh(ts)) {
       return bad(c, 401, 'stale_timestamp', 'timestamp must be within ±5 minutes');
@@ -722,7 +971,7 @@ export function createJobsApp(
     });
     if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
 
-    if (!limiter.take(`jobs-submit:${author.toLowerCase()}`, JOBS_ACTION_BUCKET)) {
+    if (!limiter.take(`jobs-submit:${author.toLowerCase()}`, bucket)) {
       return bad(c, 429, 'rate_limited', 'slow down');
     }
 
@@ -745,12 +994,17 @@ export function createJobsApp(
     if (id === null) return bad(c, 400, 'invalid_job_id');
     const listing = db.getJob(id);
     if (!listing) return bad(c, 404, 'job_not_found');
-    if (listing.state !== 'submitted' && listing.state !== 'claimed') {
+    if (
+      listing.state !== 'submitted' &&
+      listing.state !== 'claimed' &&
+      listing.state !== 'complete'
+    ) {
       return bad(
         c,
         409,
         'wrong_state',
-        `job is ${listing.state}; accept needs submitted/claimed`,
+        `job is ${listing.state}; accept needs submitted/claimed ` +
+          `(if the worker claimed onchain directly, POST /jobs/${id}/sync first)`,
       );
     }
     const parsed = await readBody(c);
@@ -790,28 +1044,33 @@ export function createJobsApp(
     });
     if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
 
-    if (!limiter.take(`jobs-accept:${requester.toLowerCase()}`, JOBS_ACTION_BUCKET)) {
+    if (!limiter.take(`jobs-accept:${requester.toLowerCase()}`, bucket)) {
       return bad(c, 429, 'rate_limited', 'slow down');
     }
     const txCheck = checkTxHash(c, txHash);
     if (!txCheck.ok) return txCheck.res;
 
-    // Verify the onchain release: release(escrowJobId) called by the
-    // requester on the escrow contract. This is what pays the worker —
-    // the escrow's release() itself calls
-    // Four02ReputationRegistryV2.recordCommerceEvent, so the API never
-    // writes reputation; it only mirrors the verified outcome.
-    const released = await verifyEscrowCall({
+    // Verify the onchain release: the escrow emitted JobReleased(escrowJobId)
+    // on a successful receipt. The event is the binding — only release()
+    // emits it, and release() reverts unless the requester (payer) called it
+    // from Delivered, so no tx.from check is needed (or wanted: a multisig
+    // payer's outer tx.from is an EOA submitter). The EIP-712 signature
+    // above already authenticated the requester; the event proves the money
+    // moved.
+    const released = await verifyRelease({
       getReceipt,
-      getTransaction,
       txHash: txCheck.txHash,
       escrow: config.escrow,
-      from: getAddress(requester),
-      fn: 'release',
       escrowJobId: BigInt(listing.escrowJobId),
     });
     if (!released.ok) {
       return bad(c, receiptStatus(released.reason), 'release_invalid', released.reason);
+    }
+
+    // Idempotent: only one release() can ever succeed onchain for a job, so
+    // a verified event against an already-complete row is the same outcome.
+    if (listing.state === 'complete') {
+      return c.json({ jobId: id, state: 'complete' });
     }
 
     const now = Math.floor(Date.now() / 1000);
@@ -834,8 +1093,18 @@ export function createJobsApp(
     if (id === null) return bad(c, 400, 'invalid_job_id');
     const listing = db.getJob(id);
     if (!listing) return bad(c, 404, 'job_not_found');
-    if (listing.state !== 'claimed' && listing.state !== 'submitted') {
-      return bad(c, 409, 'wrong_state', `job is ${listing.state}; disputes need claimed/submitted`);
+    if (
+      listing.state !== 'claimed' &&
+      listing.state !== 'submitted' &&
+      listing.state !== 'disputed'
+    ) {
+      return bad(
+        c,
+        409,
+        'wrong_state',
+        `job is ${listing.state}; disputes need claimed/submitted ` +
+          `(if the action happened onchain directly, POST /jobs/${id}/sync first)`,
+      );
     }
     const parsed = await readBody(c);
     if (!parsed.ok) return bad(c, parsed.status, parsed.error);
@@ -880,25 +1149,33 @@ export function createJobsApp(
     });
     if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
 
-    if (!limiter.take(`jobs-dispute:${signer.toLowerCase()}`, JOBS_ACTION_BUCKET)) {
+    if (!limiter.take(`jobs-dispute:${signer.toLowerCase()}`, bucket)) {
       return bad(c, 429, 'rate_limited', 'slow down');
     }
     const txCheck = checkTxHash(c, txHash);
     if (!txCheck.ok) return txCheck.res;
 
-    // Verify the onchain dispute: raiseDispute(escrowJobId) called by the
-    // disputing party on the escrow contract.
-    const disputed = await verifyEscrowCall({
+    // Verify the onchain dispute: the escrow emitted DisputeRaised(jobId,
+    // raiser) with the raiser matching the disputing party. The event is the
+    // binding — only raiseDispute() emits it, and it reverts unless a party
+    // called it from Funded/Delivered. The raiser topic (not tx.from) is
+    // checked so multisig parties verify the same way EOAs do.
+    const disputed = await verifyDisputeRaised({
       getReceipt,
-      getTransaction,
       txHash: txCheck.txHash,
       escrow: config.escrow,
-      from: getAddress(signer),
-      fn: 'raiseDispute',
       escrowJobId: BigInt(listing.escrowJobId),
+      raiser: getAddress(signer),
     });
     if (!disputed.ok) {
       return bad(c, receiptStatus(disputed.reason), 'dispute_invalid', disputed.reason);
+    }
+
+    // Idempotent: only one raiseDispute() can ever succeed onchain for a
+    // job, so a verified event against an already-disputed row is the same
+    // outcome.
+    if (listing.state === 'disputed') {
+      return c.json({ jobId: id, state: 'disputed', disputedAt: listing.disputedAt });
     }
 
     const now = Math.floor(Date.now() / 1000);
@@ -939,7 +1216,12 @@ export function createJobsApp(
     const listing = db.getJob(id);
     if (!listing) return bad(c, 404, 'job_not_found');
     // Mirrors the escrow: refund() only succeeds from Open/Funded onchain.
-    if (listing.state !== 'open' && listing.state !== 'claimed') {
+    // 'refunded' is allowed through for the idempotent path.
+    if (
+      listing.state !== 'open' &&
+      listing.state !== 'claimed' &&
+      listing.state !== 'refunded'
+    ) {
       return bad(
         c,
         409,
@@ -951,11 +1233,15 @@ export function createJobsApp(
     if (!parsed.ok) return bad(c, parsed.status, parsed.error);
     const { txHash } = parsed.body as Record<string, unknown>;
 
-    if (!limiter.take(`jobs-refund:${id}`, JOBS_ACTION_BUCKET)) {
-      return bad(c, 429, 'rate_limited', 'slow down');
-    }
+    // txHash validity is checked BEFORE the rate limit (the file's own
+    // convention: limits apply after the request is otherwise valid), so a
+    // stranger can't burn this job's shared mirror budget with malformed or
+    // already-burned hashes.
     const txCheck = checkTxHash(c, txHash);
     if (!txCheck.ok) return txCheck.res;
+    if (!limiter.take(`jobs-refund:${id}`, bucket)) {
+      return bad(c, 429, 'rate_limited', 'slow down');
+    }
 
     // Verify the onchain refund: JobRefunded(escrowJobId) emitted by the
     // escrow contract. The contract itself records WorkerGhosted for a
@@ -968,6 +1254,11 @@ export function createJobsApp(
     });
     if (!refunded.ok) {
       return bad(c, receiptStatus(refunded.reason), 'refund_invalid', refunded.reason);
+    }
+
+    // Idempotent: only one refund() can ever succeed onchain for a job.
+    if (listing.state === 'refunded') {
+      return c.json({ jobId: id, state: 'refunded' });
     }
 
     const now = Math.floor(Date.now() / 1000);
@@ -990,18 +1281,21 @@ export function createJobsApp(
     if (id === null) return bad(c, 400, 'invalid_job_id');
     const listing = db.getJob(id);
     if (!listing) return bad(c, 404, 'job_not_found');
-    if (listing.state !== 'disputed') {
+    // 'resolved' is allowed through for the idempotent path.
+    if (listing.state !== 'disputed' && listing.state !== 'resolved') {
       return bad(c, 409, 'wrong_state', `job is ${listing.state}, not disputed`);
     }
     const parsed = await readBody(c);
     if (!parsed.ok) return bad(c, parsed.status, parsed.error);
     const { txHash } = parsed.body as Record<string, unknown>;
 
-    if (!limiter.take(`jobs-resolve:${id}`, JOBS_ACTION_BUCKET)) {
-      return bad(c, 429, 'rate_limited', 'slow down');
-    }
+    // txHash validity before the rate limit (same convention as refund):
+    // malformed or replayed hashes must not burn the job's mirror budget.
     const txCheck = checkTxHash(c, txHash);
     if (!txCheck.ok) return txCheck.res;
+    if (!limiter.take(`jobs-resolve:${id}`, bucket)) {
+      return bad(c, 429, 'rate_limited', 'slow down');
+    }
 
     // Verify the onchain arbitration: DisputeResolved(escrowJobId, ...)
     // emitted by the escrow contract. The contract recorded
@@ -1014,6 +1308,11 @@ export function createJobsApp(
     });
     if (!resolved.ok) {
       return bad(c, receiptStatus(resolved.reason), 'resolve_invalid', resolved.reason);
+    }
+
+    // Idempotent: only one resolveDispute() can ever succeed onchain.
+    if (listing.state === 'resolved') {
+      return c.json({ jobId: id, state: 'resolved' });
     }
 
     const now = Math.floor(Date.now() / 1000);
@@ -1029,6 +1328,160 @@ export function createJobsApp(
       bountyUsdc: listing.bountyUsdc,
     });
     return c.json({ jobId: id, state: 'resolved' });
+  });
+
+  // ---- onchain reconciliation: sync ----
+  //
+  // POST /jobs/:id/sync advances a listing toward the VERIFIED onchain job
+  // state, for actions taken directly against the escrow contract WITHOUT
+  // touching the API (claimBounty / confirmDelivery / release /
+  // raiseDispute / resolveDispute / refund called from a site UI or the
+  // worker's own agent). Without this, such listings strand in stale DB
+  // states forever — the signed endpoints can't mirror them (claim is
+  // enrollment-gated; accept needs submitted|claimed) and the unsigned
+  // mirrors only cover refund/resolve.
+  //
+  // Unsigned and permissionless BY DESIGN: the proof is the escrow
+  // contract's own getJob view, not a signature — there is no signature
+  // that could attest to anything the chain doesn't already prove, and the
+  // endpoint only ever mirrors the chain (forward-only, never backward,
+  // never into or out of a terminal row). The onchain immutable terms
+  // (payer/amount/deadline/termsHash) must match the listing or the sync
+  // refuses (fail closed). Rate limited per job; the eth_call is cheap.
+  //
+  // Reorg note: like every check in this API, the read is point-in-time
+  // against the RPC's current head. A deep reorg that un-happens the
+  // onchain transition would leave a stale row; v0 accepts this (Ink
+  // finality is fast, and money movement is always re-verifiable onchain).
+  // The sync NEVER rolls a row back, so a lying/stale RPC read can only
+  // fail to advance, never corrupt.
+
+  /** Onchain JobState number -> DB target + activity kind, if syncable. */
+  const SYNC_TARGETS: Record<
+    number,
+    { db: 'claimed' | 'disputed' | 'complete' | 'resolved' | 'refunded'; activity: JobActivityEvent['kind'] }
+  > = {
+    2: { db: 'claimed', activity: 'claimed' }, // Funded
+    3: { db: 'claimed', activity: 'claimed' }, // Delivered (accept-from-claimed covers the release)
+    4: { db: 'complete', activity: 'completed' }, // Released
+    5: { db: 'disputed', activity: 'disputed' }, // Disputed
+    6: { db: 'resolved', activity: 'resolved' }, // Resolved
+    7: { db: 'refunded', activity: 'refunded' }, // Refunded
+  };
+
+  app.post('/:id/sync', async (c) => {
+    const id = jobIdParam(c);
+    if (id === null) return bad(c, 400, 'invalid_job_id');
+    const listing = db.getJob(id);
+    if (!listing) return bad(c, 404, 'job_not_found');
+    if (
+      listing.state === 'complete' ||
+      listing.state === 'resolved' ||
+      listing.state === 'refunded'
+    ) {
+      return bad(c, 409, 'wrong_state', `job is ${listing.state}; terminal`);
+    }
+
+    if (!limiter.take(`jobs-sync:${id}`, bucket)) {
+      return bad(c, 429, 'rate_limited', 'slow down');
+    }
+
+    const onchain = await getOnchainJob(
+      getAddress(listing.escrow),
+      BigInt(listing.escrowJobId),
+    );
+    if (!onchain) {
+      return bad(
+        c,
+        503,
+        'sync_unavailable',
+        'could not read the escrow job onchain (unknown job or RPC unreachable)',
+      );
+    }
+    // Bind the onchain job to THIS listing. The escrow job id was verified
+    // against the funding receipt at post time, but the immutable terms must
+    // still match — otherwise the row and the chain disagree about what was
+    // funded (wrong job, DB corruption, or a lying RPC): fail closed.
+    const listedAmount = parseBountyUsdc(listing.bountyUsdc);
+    const termsMatch =
+      onchain.payer.toLowerCase() === listing.requester.toLowerCase() &&
+      listedAmount !== null &&
+      listedAmount === onchain.amount &&
+      BigInt(listing.deadline) === onchain.deadline &&
+      listing.specHash.toLowerCase() === onchain.termsHash.toLowerCase();
+    if (!termsMatch) {
+      return bad(
+        c,
+        409,
+        'sync_mismatch',
+        'onchain job terms (payer/amount/deadline/termsHash) do not match the listing',
+      );
+    }
+    const onchainState = ONCHAIN_JOB_STATES[onchain.state] ?? 'unknown';
+    if (onchain.state === 0 || onchain.state === 1) {
+      // None: the listing was funded (verified BountyCreated event), so the
+      // job must exist — a reorg is the only explanation. Open: nothing to do
+      // (but if the DB already advanced past open, say so — never roll back).
+      if (onchain.state === 0) {
+        return bad(
+          c,
+          409,
+          'sync_mismatch',
+          'escrow job does not exist onchain (was funded; possible deep reorg)',
+        );
+      }
+      return c.json({
+        jobId: id,
+        state: listing.state,
+        onchainState,
+        synced: false,
+        ...(listing.state !== 'open' ? { note: 'db_ahead_of_chain' } : {}),
+      });
+    }
+
+    const target = SYNC_TARGETS[onchain.state];
+    if (!target) {
+      return bad(c, 503, 'sync_unavailable', `unknown onchain state ${onchain.state}`);
+    }
+
+    // Bind worker/agentId from the chain when leaving 'open' — the contract
+    // verified identity at claimBounty time, so this is trustless. Zero
+    // address / zero agentId (unclaimed states) bind nothing.
+    const zeroAddr = '0x0000000000000000000000000000000000000000';
+    const worker =
+      onchain.provider.toLowerCase() === zeroAddr ? null : getAddress(onchain.provider);
+    const agentId = onchain.agentId === 0n ? null : onchain.agentId.toString();
+
+    const now = Math.floor(Date.now() / 1000);
+    const res = db.syncJobState(id, target.db, { worker, agentId, now });
+    if (res === 'not_found') return bad(c, 404, 'job_not_found');
+    if (res === 'no_path') {
+      // The DB is ahead of the chain (e.g. a reorged-away tx): never roll
+      // back, just report both states.
+      return c.json({
+        jobId: id,
+        state: listing.state,
+        onchainState,
+        synced: false,
+        note: 'db_ahead_of_chain',
+      });
+    }
+    if (res === 'ok') {
+      deps.onActivity?.({
+        kind: target.activity,
+        jobId: id,
+        actor: worker ?? listing.requester,
+        title: listing.title,
+        bountyUsdc: listing.bountyUsdc,
+      });
+    }
+    const updated = db.getJob(id);
+    return c.json({
+      jobId: id,
+      state: updated?.state ?? listing.state,
+      onchainState,
+      synced: res === 'ok',
+    });
   });
 
   return app;

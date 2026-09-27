@@ -41,6 +41,10 @@ export interface JobListing {
   workerAgentId: string | null;
   title: string;
   spec: string;
+  /** When true, the spec is withheld from public board/detail reads
+   * (returned as null, specHash kept) and only served to the requester or
+   * the claimed worker via POST /jobs/:id/spec. */
+  specPrivate: boolean;
   /** keccak256(spec); must equal the onchain termsHash (no bait-and-switch). */
   specHash: string;
   category: string;
@@ -77,6 +81,7 @@ CREATE TABLE IF NOT EXISTS job_listings (
   worker_agent_id TEXT,
   title TEXT NOT NULL,
   spec TEXT NOT NULL,
+  spec_private INTEGER NOT NULL DEFAULT 0,
   spec_hash TEXT NOT NULL,
   category TEXT NOT NULL,
   bounty_usdc TEXT NOT NULL,
@@ -104,6 +109,7 @@ CREATE TABLE IF NOT EXISTS used_tx_hashes (
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON job_listings(state, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_category ON job_listings(category, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_worker_agent ON job_listings(worker_agent_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_requester_created ON job_listings(requester, created_at);
 `;
 
 function rowToListing(row: Record<string, unknown>): JobListing {
@@ -116,6 +122,7 @@ function rowToListing(row: Record<string, unknown>): JobListing {
     workerAgentId: (row.worker_agent_id as string | null) ?? null,
     title: row.title as string,
     spec: row.spec as string,
+    specPrivate: Number(row.spec_private ?? 0) === 1,
     specHash: row.spec_hash as string,
     category: row.category as string,
     bountyUsdc: row.bounty_usdc as string,
@@ -136,6 +143,25 @@ export class JobsDb {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /**
+   * Column migrations for DBs created before the current schema.
+   * CREATE TABLE IF NOT EXISTS never alters an existing table, so each
+   * later column lands here as a guarded ALTER TABLE. Existing rows get the
+   * column default (public specs for pre-privacy listings).
+   */
+  private migrate(): void {
+    const cols = this.db
+      .prepare('PRAGMA table_info(job_listings)')
+      .all() as { name: string }[];
+    const names = new Set(cols.map((c) => c.name));
+    if (!names.has('spec_private')) {
+      this.db.exec(
+        'ALTER TABLE job_listings ADD COLUMN spec_private INTEGER NOT NULL DEFAULT 0',
+      );
+    }
   }
 
   close(): void {
@@ -204,6 +230,7 @@ export class JobsDb {
     requester: Address;
     title: string;
     spec: string;
+    specPrivate?: boolean;
     specHash: string;
     category: string;
     bountyUsdc: string;
@@ -219,9 +246,9 @@ export class JobsDb {
         .prepare(
           `INSERT INTO job_listings
              (escrow_job_id, escrow, requester, worker, worker_agent_id, title, spec,
-              spec_hash, category, bounty_usdc, deadline, state,
+              spec_private, spec_hash, category, bounty_usdc, deadline, state,
               submission_hash, submission_uri, disputed_at, created_at, updated_at)
-           VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL, ?, ?)`,
+           VALUES (?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL, ?, ?)`,
         )
         .run(
           o.escrowJobId,
@@ -229,6 +256,7 @@ export class JobsDb {
           getAddress(o.requester),
           o.title,
           o.spec,
+          o.specPrivate ? 1 : 0,
           o.specHash,
           o.category,
           o.bountyUsdc,
@@ -285,6 +313,19 @@ export class JobsDb {
       )
       .all(agentId) as Record<string, unknown>[];
     return rows.map(rowToListing);
+  }
+
+  /**
+   * Board-spam cap: how many listings `requester` created at/after
+   * `sinceSec` (rolling 24h window). Backed by idx_jobs_requester_created.
+   */
+  countListingsSince(requester: string, sinceSec: number): number {
+    const row = this.db
+      .prepare(
+        'SELECT COUNT(*) AS n FROM job_listings WHERE requester = ? AND created_at >= ?',
+      )
+      .get(getAddress(requester), sinceSec) as { n: number } | undefined;
+    return row?.n ?? 0;
   }
 
   /**
@@ -454,9 +495,74 @@ export class JobsDb {
   }
 
   /**
+   * Forward-only onchain reconciliation (POST /jobs/:id/sync). Advances the
+   * row toward a verified onchain state read from the escrow contract —
+   * used when the action happened onchain WITHOUT touching the API (direct
+   * contract call), which would otherwise strand the listing in a stale
+   * state forever.
+   *
+   * Rules:
+   * - Only moves FORWARD along the contract's state machine; never rolls
+   *   a row back (a reorged-away tx is the documented accepted risk — the
+   *   DB never un-invents a mirrored outcome).
+   * - Never touches terminal rows (complete/resolved/refunded).
+   * - When leaving 'open', the worker/agentId MUST be bound from the
+   *   onchain job (the contract verified identity at claimBounty time, so
+   *   the chain is the trustless source — a stale offchain row can't lie).
+   * - No txHash is burned: the onchain read IS the proof, and every
+   *   endpoint re-verifies its own tx anyway, so an unburned sync tx can
+   *   never be weaponized elsewhere.
+   */
+  syncJobState(
+    id: number,
+    to: 'claimed' | 'disputed' | 'complete' | 'resolved' | 'refunded',
+    o: { worker?: Address | null; agentId?: string | null; now: number },
+  ): 'ok' | 'noop' | 'not_found' | 'no_path' {
+    const forward: Record<string, JobState[]> = {
+      claimed: ['open'],
+      disputed: ['open', 'claimed', 'submitted'],
+      complete: ['open', 'claimed', 'submitted'],
+      resolved: ['open', 'claimed', 'submitted', 'disputed'],
+      refunded: ['open', 'claimed'],
+    };
+    return this.txn(() => {
+      const listing = this.getJob(id);
+      if (!listing) return 'not_found';
+      if (listing.state === to) return 'noop';
+      if (!forward[to].includes(listing.state)) return 'no_path';
+      const worker = o.worker ? getAddress(o.worker) : listing.worker;
+      const agentId = o.agentId ?? listing.workerAgentId;
+      // A claimant must exist onchain for claimed/disputed/complete/resolved
+      // (claimBounty always sets provider+agentId). Refunded is the exception:
+      // refund() from Open has no claimant, so an unclaimed open -> refunded
+      // sync must not demand one. Leaving 'open' for a claimant-target
+      // without chain-bound worker/agentId would invent a claimant — refuse.
+      const needsClaimant =
+        to === 'claimed' || to === 'disputed' || to === 'complete' || to === 'resolved';
+      if (needsClaimant && listing.state === 'open' && (!worker || !agentId)) {
+        return 'no_path';
+      }
+      this.db
+        .prepare(
+          `UPDATE job_listings
+           SET state = ?, worker = ?, worker_agent_id = ?,
+               disputed_at = CASE WHEN ? = 'disputed' THEN ? ELSE disputed_at END,
+               updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(to, worker, agentId, to, o.now, o.now, id);
+      return 'ok';
+    });
+  }
+
+  /**
    * Enroll (or re-verify) a worker. Upsert: first enrollment keeps its
    * enrolled_at; every call refreshes last_verified_at. No auth here —
    * the caller verifies the signature + onchain identity first.
+   *
+   * seatTokenId: when undefined the existing seat is PRESERVED (a claim-time
+   * re-verification must not wipe the seat the seat gate checks); pass null
+   * to clear it explicitly.
    */
   enrollWorker(o: {
     wallet: Address;
@@ -466,12 +572,14 @@ export class JobsDb {
   }): { isNew: boolean } {
     const existing = this.getWorker(o.wallet);
     if (existing) {
+      const seat =
+        o.seatTokenId === undefined ? existing.seatTokenId : o.seatTokenId;
       this.db
         .prepare(
           `UPDATE job_workers SET agent_id = ?, seat_token_id = ?, last_verified_at = ?
            WHERE wallet = ?`,
         )
-        .run(o.agentId, o.seatTokenId ?? null, o.now, getAddress(o.wallet));
+        .run(o.agentId, seat, o.now, getAddress(o.wallet));
       return { isNew: false };
     }
     this.db
