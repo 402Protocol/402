@@ -53,8 +53,16 @@
  *      body's organizationId (the signer override). Turnkey docs describe the
  *      parent as having "read-only visibility" into sub-orgs; the standard
  *      pattern creates root users AT sub-org creation and manages with those
- *      credentials. Whether the parent-credential + organizationId override can
- *      create users/policies inside the sub-org is EXACTLY what this proof tests.
+ *      credentials. The migration guide is explicit: "A parent-organization
+ *      credential has no write access over its sub-organizations — it cannot
+ *      stamp sub-org activities on its own, and adding a user afterwards
+ *      requires going through that sub-org's existing root quorum." Whether
+ *      the parent-credential + organizationId override can create
+ *      users/policies inside the sub-org is EXACTLY what this proof tests —
+ *      steps 2/3 will either work or 403, and both answers are informative.
+ *      (Root-user shape verified against tkhq/docs
+ *      reference/migration-guide.mdx: userName + apiKeys + authenticators +
+ *      oauthProviders, all required.)
  *
  * Env (same as the other proofs):
  *   TURNKEY_ORG_ID
@@ -248,6 +256,8 @@ async function runFlow(call: TkCall, rootCreds: Creds, parentOrgId: string, opts
     rootUsers: [{
       userName: "taap-suborg-proof-root",
       apiKeys: [{ apiKeyName: "proof-root-key", publicKey: rootPubHex, curveType: "API_KEY_CURVE_P256" }],
+      authenticators: [],
+      oauthProviders: [],
     }],
     rootQuorumThreshold: 1,
     wallet: {
@@ -448,6 +458,8 @@ async function selfTest() {
   assert("sub-org params: ≥1 root user (400s without), quorum 1, embedded wallet",
     Array.isArray(subOrgCall.params.rootUsers) && subOrgCall.params.rootUsers.length >= 1 &&
     /^[0-9a-f]{66}$/.test(subOrgCall.params.rootUsers[0].apiKeys[0].publicKey) &&
+    Array.isArray(subOrgCall.params.rootUsers[0].authenticators) &&
+    Array.isArray(subOrgCall.params.rootUsers[0].oauthProviders) &&
     subOrgCall.params.rootQuorumThreshold === 1 &&
     subOrgCall.params.wallet?.walletName === "trading" &&
     subOrgCall.params.wallet?.accounts?.[0]?.path === "m/44'/60'/0'/0/0");
