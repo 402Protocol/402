@@ -271,7 +271,8 @@ async function main() {
     try {
       const r = await fn();
       const s = r.signTransactionResult?.signedTransaction as string | undefined;
-      verdict(name, !!s && s.startsWith("0x"), s ? `signed ${s.slice(0, 18)}…` : "no signedTransaction in result");
+      const ok = !!s && /^(0x)?[0-9a-fA-F]{20,}$/.test(s);
+      verdict(name, ok, s ? `signed ${s.slice(0, 18)}…` : "no signedTransaction in result");
     } catch (e: any) {
       verdict(name, false, `denied unexpectedly: ${e.message.slice(0, 200)}`);
     }
