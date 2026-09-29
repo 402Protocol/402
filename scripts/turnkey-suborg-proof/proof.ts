@@ -20,13 +20,21 @@
  *  - CREATE_SUB_ORGANIZATION_V4 params (subOrganizationName, rootUsers,
  *    rootQuorumThreshold, optional wallet): tkhq/docs features/sub-organizations.mdx
  *    and docs.turnkey.com/features/sub-organizations
+ *  - **LIVE FINDING 2026-09-29: `rootUsers: []` is REJECTED with HTTP 400
+ *    ("This field requires a value to be set").** A sub-org must be created
+ *    with at least one root user. The script now generates an ephemeral P-256
+ *    keypair and registers it as the sub-org's root user (thrown away after;
+ *    it mirrors the real design where the HUMAN'S PASSKEY becomes the
+ *    trader sub-org's root user at claim time). `src/claim/turnkey.ts` still
+ *    passes `rootUsers: []` and is therefore BROKEN live — it must be fixed
+ *    to register the claim-time passkey as root before the agent key exists.
  *  - Result field is `createSubOrganizationResultV4` (subOrganizationId,
  *    wallet.walletId, wallet.addresses[0]): tkhq/sdk issue #159 example
  *  - ACTIVITY_TYPE_DELETE_SUB_ORGANIZATION exists, BUT the docs state: "This
  *    activity must be initiated by a root user in the sub-organization that is
  *    to be deleted. A parent org cannot delete a sub-organization without its
- *    participation." Our proof sub-org is created with rootUsers: [] (mirroring
- *    turnkey.ts), so the delete attempt is EXPECTED to fail — reported, not fatal.
+ *    participation." The proof's root key is ephemeral and discarded, so the
+ *    delete attempt is EXPECTED to fail — reported, not fatal.
  *  - Endpoint path convention /public/v1/submit/<snake_case>: live-verified by
  *    the withdrawal proof (create_wallet, create_users, create_policy,
  *    sign_transaction, delete_* all worked).
@@ -227,10 +235,20 @@ async function runFlow(call: TkCall, rootCreds: Creds, parentOrgId: string, opts
 
   console.log("== Turnkey sub-org targeting proof ==\n");
 
-  console.log("[1/6] Parent credential -> CREATE_SUB_ORGANIZATION_V4 (mirror src/claim/turnkey.ts)…");
+  console.log("[1/6] Parent credential -> CREATE_SUB_ORGANIZATION_V4…");
+  // LIVE FINDING 2026-09-29: rootUsers: [] is rejected with HTTP 400 — a
+  // sub-org must have at least one root user. Register an ephemeral throwaway
+  // root key (mirrors the real design, where the human's passkey becomes the
+  // trader sub-org's root at claim time). turnkey.ts must be fixed the same way.
+  const rootKp = generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const rootJwk = rootKp.publicKey.export({ format: "jwk" }) as any;
+  const rootPubHex = compressedPubHex(rootJwk.x, rootJwk.y);
   const so = await call("/public/v1/submit/create_sub_organization", "ACTIVITY_TYPE_CREATE_SUB_ORGANIZATION_V4", {
     subOrganizationName: "taap-suborg-proof-" + Date.now().toString(36),
-    rootUsers: [],
+    rootUsers: [{
+      userName: "taap-suborg-proof-root",
+      apiKeys: [{ apiKeyName: "proof-root-key", publicKey: rootPubHex, curveType: "API_KEY_CURVE_P256" }],
+    }],
     rootQuorumThreshold: 1,
     wallet: {
       walletName: "trading",
@@ -427,8 +445,9 @@ async function selfTest() {
 
   const subOrgCall = calls.find((c) => c.activityType === "ACTIVITY_TYPE_CREATE_SUB_ORGANIZATION_V4")!;
   assert("sub-org created in the PARENT org", subOrgCall.orgId === "parent-org-test");
-  assert("sub-org params mirror turnkey.ts (empty rootUsers, quorum 1, embedded wallet)",
-    Array.isArray(subOrgCall.params.rootUsers) && subOrgCall.params.rootUsers.length === 0 &&
+  assert("sub-org params: ≥1 root user (400s without), quorum 1, embedded wallet",
+    Array.isArray(subOrgCall.params.rootUsers) && subOrgCall.params.rootUsers.length >= 1 &&
+    /^[0-9a-f]{66}$/.test(subOrgCall.params.rootUsers[0].apiKeys[0].publicKey) &&
     subOrgCall.params.rootQuorumThreshold === 1 &&
     subOrgCall.params.wallet?.walletName === "trading" &&
     subOrgCall.params.wallet?.accounts?.[0]?.path === "m/44'/60'/0'/0/0");
