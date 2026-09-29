@@ -51,6 +51,7 @@ async function loadEnv() {
   let org = process.env.TURNKEY_ORG_ID?.trim() || "";
   let pub = process.env.TURNKEY_API_PUBLIC_KEY?.replace(/^0x/, "").trim();
   let privHex = process.env.TURNKEY_API_PRIVATE_KEY?.replace(/^0x/, "").trim();
+  if (!org) org = (await prompt("Turnkey org ID: ")).trim();
   if (!pub) pub = (await prompt("API public key (paste exactly as the dashboard shows it): ")).replace(/^0x/, "");
   if (!privHex) privHex = (await prompt("API private key (the one shown once at creation): ")).replace(/^0x/, "");
   if (!org || !pub || !/^[0-9a-fA-F]{64}$/.test(privHex)) {
