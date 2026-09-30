@@ -44,22 +44,11 @@ import type {
   PaymentRequirements,
   SupportedResponse,
 } from './types.js';
-import { acceptedMatchesRequirements, verifyExactPayment } from './verify.js';
+import { verifyExactPayment } from './verify.js';
 import { createLoungeApp } from '../lounge/server.js';
-import { startRektFeed } from '../lounge/rekt.js';
 import { LoungeDb } from '../lounge/db.js';
-import { createOracleApp, oracleRequirements, PRICE_SYMBOLS } from './oracle.js';
-import {
-  fetchRelayData,
-  isRelayResource,
-  relayQuoteTypedData,
-  relayRequirements,
-  verifyRelayAuth,
-} from './relay.js';
-import { settlementRow } from './tape.js';
+import { createOracleApp } from './oracle.js';
 import { createJobsApp } from '../jobs/server.js';
-import { createAgentsApp } from '../jobs/agents.js';
-import { defaultResolveAgentSeat } from '../jobs/escrow.js';
 import { JobsDb } from '../jobs/db.js';
 import type { JobsConfig } from '../jobs/config.js';
 import type { BlackjackConfig, LoungeConfig } from '../lounge/config.js';
@@ -125,11 +114,6 @@ export interface ServerOptions {
    * undeployed, so in practice this is unset until the founder deploys it.
    */
   jobs?: JobsConfig | null;
-  /**
-   * Override the fetch implementation used by /relay/execute to fetch the
-   * paid resource data. Production uses global fetch; tests inject a stub.
-   */
-  relayFetchFn?: typeof fetch;
 }
 
 const DEFAULT_GLOBAL_LIMIT: RateLimitBucket = { windowMs: 60_000, max: 600 };
@@ -228,8 +212,6 @@ export function createApp(
   // L3: rate limits — strictest on /settle, which can spend operator gas.
   app.use(rateLimit(opts.rateLimits?.global ?? DEFAULT_GLOBAL_LIMIT));
   app.use('/settle', rateLimit(opts.rateLimits?.settle ?? DEFAULT_SETTLE_LIMIT));
-  // /relay/execute can spend operator gas — same strict bucket as /settle.
-  app.use('/relay/execute', rateLimit(opts.rateLimits?.settle ?? DEFAULT_SETTLE_LIMIT));
 
   app.get('/health', (c) =>
     c.json({ ok: true, dryRun: config.dryRun, time: Date.now() }),
@@ -248,13 +230,6 @@ export function createApp(
         db: loungeDb,
       }),
     );
-    // The Rekt ticker: read-only Nado liquidation spectator feed. Fail-soft —
-    // it must never take the server down.
-    try {
-      startRektFeed(loungeDb);
-    } catch (err) {
-      console.error('[rekt] failed to start feed:', (err as Error).message);
-    }
   }
 
   // 402 Oracles: pay-per-call data feeds. Mounted whenever the recipient
@@ -271,11 +246,6 @@ export function createApp(
           priceUsd: q.priceUsd,
           createdAt: Math.floor(Date.now() / 1000),
         }),
-      // The Tape: every real oracle settlement lands in the public log.
-      onSettled: (req, res, resource) => {
-        const row = settlementRow(req, res, resource);
-        if (row) loungeDb?.logSettlement(row);
-      },
       productionGate: (getHeader) => {
         if (config.settleApiKeys.length === 0) return 'not_configured';
         // Note: query-param keys aren't available here (GET routes read
@@ -307,19 +277,6 @@ export function createApp(
             bountyUsdc: a.bountyUsdc,
             createdAt: Math.floor(Date.now() / 1000),
           }),
-      }),
-    );
-    // The Agents tab: public directory of enrolled workers with live
-    // status. Rides on the jobs DB; mounted only when the board is on.
-    // Seat token ids resolve live from the onchain registry when
-    // FOUR02_TRACES_SEAT is configured (same gating as the seat gate);
-    // otherwise every agent reports seatTokenId: null.
-    app.route(
-      '/agents',
-      createAgentsApp(jobsDb, {
-        resolveSeat: opts.jobs.seatsContract
-          ? defaultResolveAgentSeat(opts.jobs.rpcUrl, opts.jobs.seatsContract)
-          : null,
       }),
     );
   }
@@ -427,16 +384,6 @@ export function createApp(
       settlerKey: config.settlerKey,
       dryRun: config.dryRun,
     });
-    // The Tape: log real broadcasts (dry-runs report success:false, so the
-    // helper's null check keeps them out automatically).
-    if (result.success) {
-      const row = settlementRow(
-        body,
-        result,
-        body.paymentPayload?.resource?.url ?? 'settle',
-      );
-      if (row) loungeDb?.logSettlement(row);
-    }
     // H2 (2026-09-23 audit): a duplicate arriving while an identical
     // settlement is in flight is a client conflict, not a server error.
     const status =
@@ -446,185 +393,6 @@ export function createApp(
           ? 409
           : 200;
     return c.json(result, status as 200);
-  });
-
-  // ---- The Tape: public visual log of every real settlement ----
-  app.get('/settlements', (c) => {
-    const raw = c.req.query('limit');
-    const parsed = parseInt(raw ?? '50', 10);
-    const limit = Math.min(200, Math.max(1, Number.isSafeInteger(parsed) ? parsed : 50));
-    return c.json({ settlements: loungeDb?.recentSettlements(limit) ?? [] });
-  });
-
-  // ---- Settlement relay: agents pay without the operator API key ----
-  //
-  // The agent proves its wallet with EIP-712 RelayAuth (see relay.ts); the
-  // server attaches its own key-equivalent internally. No API key crosses
-  // the wire, and the human is never in the loop. The agent may only relay
-  // payments where it is the payer.
-  async function readRelayBody(c: Context): Promise<{ ok: true; json: any } | { ok: false; reason: string }> {
-    let text: string;
-    try {
-      text = await c.req.text();
-    } catch {
-      return { ok: false, reason: 'invalid_request' };
-    }
-    if (text.length > maxBodyBytes) return { ok: false, reason: 'body_too_large' };
-    try {
-      return { ok: true, json: JSON.parse(text) };
-    } catch {
-      return { ok: false, reason: 'invalid_request' };
-    }
-  }
-
-  /** Canonical relay params. Agents must sign this exact JSON string. */
-  function canonicalRelayParams(
-    resource: 'oracle-price' | 'oracle-gas' | 'demo-data',
-    params: unknown,
-  ): { ok: true; params: Record<string, unknown>; json: string } | { ok: false; reason: string } {
-    if (resource === 'oracle-price') {
-      const symbol = String((params as any)?.symbol ?? '').toUpperCase();
-      if (!(PRICE_SYMBOLS as readonly string[]).includes(symbol)) {
-        return { ok: false, reason: 'invalid_symbol' };
-      }
-      const canonical = { symbol };
-      return { ok: true, params: canonical, json: JSON.stringify(canonical) };
-    }
-    return { ok: true, params: {}, json: '{}' };
-  }
-
-  function relayResourceAvailable(
-    resource: 'oracle-price' | 'oracle-gas' | 'demo-data',
-  ): { ok: true } | { ok: false; error: string; detail: string } {
-    if (resource === 'demo-data') {
-      if (!config.demoPayTo) {
-        return { ok: false, error: 'demo_not_configured', detail: 'Set FOUR02_DEMO_PAYTO to enable the demo.' };
-      }
-      return { ok: true };
-    }
-    if (!config.oraclePayTo) {
-      return { ok: false, error: 'oracle_not_configured', detail: 'Set FOUR02_ORACLE_PAYTO to enable oracles.' };
-    }
-    return { ok: true };
-  }
-
-  function relayLabel(resource: 'oracle-price' | 'oracle-gas' | 'demo-data', params: Record<string, unknown>): string {
-    return resource === 'oracle-price' ? `oracle-price:${String(params.symbol ?? '')}` : resource;
-  }
-
-  app.post('/relay/quote', async (c) => {
-    const parsed = await readRelayBody(c);
-    if (!parsed.ok) return c.json({ error: parsed.reason }, 400);
-    const body = parsed.json;
-    if (!isRelayResource(body?.resource)) {
-      return c.json({ error: 'invalid_resource', detail: 'resource must be oracle-price, oracle-gas, or demo-data.' }, 400);
-    }
-    const resource = body.resource;
-    const canon = canonicalRelayParams(resource, body?.params);
-    if (!canon.ok) return c.json({ error: canon.reason }, 400);
-    const auth = await verifyRelayAuth({
-      agent: body?.agent,
-      action: 'relay-quote',
-      resource,
-      params: canon.json,
-      timestamp: body?.timestamp,
-      signature: body?.signature,
-    });
-    if (!auth.ok) {
-      return c.json({ error: 'relay_unauthorized', reason: auth.reason }, 401);
-    }
-    const available = relayResourceAvailable(resource);
-    if (!available.ok) return c.json({ error: available.error, detail: available.detail }, 503);
-    const requirements = relayRequirements(config, resource, canon.params, oracleRequirements, demoRequirements);
-    const typedData = relayQuoteTypedData(requirements, auth.agent);
-    if (!typedData) return c.json({ error: 'quote_failed' }, 500);
-    return c.json({ requirements, typedData });
-  });
-
-  app.post('/relay/execute', async (c) => {
-    const parsed = await readRelayBody(c);
-    if (!parsed.ok) return c.json({ error: parsed.reason }, 400);
-    const body = parsed.json;
-    const paymentPayload = body?.paymentPayload as PaymentPayload | undefined;
-    if (!paymentPayload || !isRelayResource(body?.resource)) {
-      return c.json({ error: 'invalid_request' }, 400);
-    }
-    const resource = body.resource;
-    const canon = canonicalRelayParams(resource, body?.params);
-    if (!canon.ok) return c.json({ error: canon.reason }, 400);
-    const auth = await verifyRelayAuth({
-      agent: body?.agent,
-      action: 'relay-execute',
-      resource,
-      params: canon.json,
-      timestamp: body?.timestamp,
-      signature: body?.signature,
-    });
-    if (!auth.ok) {
-      return c.json({ error: 'relay_unauthorized', reason: auth.reason }, 401);
-    }
-    const available = relayResourceAvailable(resource);
-    if (!available.ok) return c.json({ error: available.error, detail: available.detail }, 503);
-    // Canonical requirements, rebuilt server-side — the client never supplies them.
-    const requirements = relayRequirements(config, resource, canon.params, oracleRequirements, demoRequirements);
-    if (!acceptedMatchesRequirements(paymentPayload.accepted, requirements)) {
-      return c.json({ error: 'requirements_mismatch' }, 402);
-    }
-    // The agent may only relay its own payments.
-    let payer: string;
-    try {
-      payer = paymentPayload.payload.authorization.from;
-      if (payer.toLowerCase() !== auth.agent.toLowerCase()) {
-        return c.json({ error: 'payer_mismatch', detail: 'The relay agent must be the payment payer.' }, 403);
-      }
-    } catch {
-      return c.json({ error: 'invalid_request' }, 400);
-    }
-    // Fetch the paid data BEFORE settlement: if the upstream feed is down we
-    // 503 here and no money moves. The agent pays for data — the response
-    // must return it, not just the settlement receipt.
-    let served;
-    try {
-      served = await fetchRelayData(resource, canon.params, opts.relayFetchFn);
-    } catch {
-      return c.json(
-        {
-          error: 'relay_upstream_unavailable',
-          detail: 'The data feed is down; no payment was taken.',
-        },
-        503,
-      );
-    }
-    const result = await settleExactPayment(
-      { paymentPayload, paymentRequirements: requirements },
-      { store, settlerKey: config.settlerKey, dryRun: config.dryRun },
-    );
-    if (result.success) {
-      const row = settlementRow(
-        { paymentPayload, paymentRequirements: requirements },
-        result,
-        relayLabel(resource, canon.params),
-      );
-      if (row) loungeDb?.logSettlement(row);
-      // Keep the command map's oracle-activity feed consistent with the
-      // x402-gated oracle routes.
-      if (served.queryLog) {
-        loungeDb?.logOracleQuery({
-          payer,
-          endpoint: served.queryLog.endpoint,
-          symbol: served.queryLog.symbol,
-          priceUsd: served.queryLog.priceUsd,
-          createdAt: Math.floor(Date.now() / 1000),
-        });
-      }
-    }
-    const status =
-      result.errorReason === 'missing_settler_key'
-        ? 503
-        : result.errorReason === 'duplicate_settlement'
-          ? 409
-          : 200;
-    return c.json({ ...result, data: served.data }, status as 200);
   });
 
   // ---- Demo paid endpoint: the full x402 loop in one route ----
@@ -770,13 +538,6 @@ export function createApp(
         status as 402,
       );
     }
-    // The Tape: log the real broadcast.
-    const demoRow = settlementRow(
-      { paymentPayload, paymentRequirements: requirements },
-      settled,
-      'demo-data',
-    );
-    if (demoRow) loungeDb?.logSettlement(demoRow);
     return new Response(JSON.stringify({ ...data, dryRun: false }), {
       status: 200,
       headers: {

@@ -5,9 +5,7 @@
  *   GET  /jobs?status=&category=&limit= -> public board, newest first
  *   GET  /jobs/:id                  -> public detail
  *   POST /jobs/:id/spec             -> gated private-spec read (signed JobSpecAccess)
- *   POST /jobs/:id/claim            -> enrolled worker claims (signed JobClaim + claim txHash; gated on live assignment)
- *   POST /jobs/:id/decline          -> assigned worker declines (signed JobDecline; burns a dispatch round)
- *   GET  /jobs/assigned?wallet=...  -> live directed assignments for one worker
+ *   POST /jobs/:id/claim            -> enrolled worker claims (signed JobClaim + claim txHash)
  *   POST /jobs/:id/submit           -> worker submits deliverable (signed JobSubmit)
  *   POST /jobs/:id/accept           -> requester accepts (signed JobDecision + release txHash)
  *   POST /jobs/:id/dispute          -> either party disputes (signed JobDecision + raiseDispute txHash)
@@ -17,12 +15,8 @@
  *                                     job (direct contract calls bypassing
  *                                     the API), forward-only, permissionless
  *   POST /jobs/enroll               -> worker enrollment (signed JobEnroll + onchain ownerOf check)
- *   GET  /jobs/workers/:wallet      -> enrollment record (wallet/agent binding)
+ *   GET  /jobs/workers/:wallet      -> enrollment record
  *   GET  /jobs/worker/:agentId/history -> DB history + onchain reputation summary
- *   GET  /jobs/stream                -> SSE dispatch feed (v2): job_posted /
- *                                         job_assigned (directed, wallet-scoped) /
- *                                         job_claimed / job_opened
- *                                     (server-push; workers subscribe instead of polling)
  *
  * Conventions mirror the lounge: EIP-712 agent actions on the shared
  * "402 Lounge" domain (see lounge/signing.ts), txHash receipt verification
@@ -56,19 +50,7 @@ import {
 import { defaultGetReceipt } from '../lounge/payments.js';
 import type { GetReceipt } from '../lounge/types.js';
 import type { JobsConfig } from './config.js';
-import { JobsDb, LEDGER_STATUSES, type JobAssignment, type JobListing, type JobsTxPurpose, type JobState, type LedgerStatus } from './db.js';
-import {
-  JOB_FEED_MAX_SUBSCRIBERS,
-  createJobFeed,
-  type JobFeed,
-  type JobFeedEvent,
-} from './feed.js';
-import {
-  advanceDispatch,
-  dispatchNewJob,
-  settleExpiredDispatch,
-  type DispatchDeps,
-} from './dispatch.js';
+import { JobsDb, type JobListing, type JobsTxPurpose, type JobState } from './db.js';
 import {
   defaultGetOnchainJob,
   defaultIdentityOwner,
@@ -86,10 +68,6 @@ import {
   type ReputationSummary,
   type VerifySeatPairing,
 } from './escrow.js';
-import {
-  defaultSnapshotSeatAvatar,
-  type SnapshotSeatAvatar,
-} from './avatars.js';
 
 /** v0 categories. `security-audit` is explicitly rejected (founder rule). */
 export const JOB_CATEGORIES = [
@@ -173,21 +151,8 @@ export interface JobsDeps {
    * contract at startup). Injectable for tests.
    */
   verifySeatPairing?: VerifySeatPairing | null;
-  /**
-   * Seat-artwork snapshotter for agent avatars. Defaults to a live
-   * tokenURI + IPFS-gateway fetch against config.seatsContract; null when
-   * no seat contract is configured (snapshots only run after a successful
-   * seat-gated enroll, so this is dormant until the seat gate is live).
-   * Injectable for tests.
-   */
-  snapshotAvatar?: SnapshotSeatAvatar | null;
   /** Fired after every board event (the Lounge's job-activity feed). */
   onActivity?: (a: JobActivityEvent) => void;
-  /**
-   * Live dispatch feed (server-push). Defaults to an in-memory fan-out
-   * — correct on a single instance; inject a shared pub/sub for multi-replica.
-   */
-  jobFeed?: JobFeed;
   /**
    * Override the shared rate-limit bucket. Production uses
    * JOBS_ACTION_BUCKET; tests pass a generous bucket so the suite isn't
@@ -304,35 +269,12 @@ export function createJobsApp(
     (config.seatsContract
       ? defaultVerifySeatPairing(config.rpcUrl, config.seatsContract)
       : null);
-  // Avatar snapshotter: only runs after a successful seat-gated enroll, so
-  // it stays dormant until the seat gate is live (seatsContract unset =>
-  // null => no snapshots, no avatar URLs).
-  const snapshotAvatar =
-    deps.snapshotAvatar ??
-    (config.seatsContract
-      ? defaultSnapshotSeatAvatar({
-          rpcUrl: config.rpcUrl,
-          seatContract: config.seatsContract,
-          gatewayBase: config.ipfsGateway,
-        })
-      : null);
   const reputationSummary =
     deps.reputationSummary ??
     defaultReputationSummary(config.rpcUrl, config.reputationRegistry);
   const limiter = new AuthorRateLimiter();
   const bucket = deps.rateLimitBucket ?? JOBS_ACTION_BUCKET;
   const ipBucket = deps.ipRateLimitBucket ?? deps.rateLimitBucket ?? JOBS_IP_BUCKET;
-  const feed = deps.jobFeed ?? createJobFeed();
-
-  /** Directed-dispatch engine wiring: db + feed + config + public shape. */
-  const dispatchDeps: DispatchDeps = {
-    db,
-    feed,
-    acceptWindowSeconds: config.dispatchAcceptWindowSeconds,
-    maxRounds: config.dispatchMaxRounds,
-    maxConcurrentJobs: config.dispatchMaxConcurrentJobs,
-    publicJob,
-  };
 
   async function readBody(
     c: Context,
@@ -500,9 +442,8 @@ export function createJobsApp(
     // and agent). The seatTokenId body field is only a hint — the chain
     // is the binding. Re-pairing later (repairSeat) just re-enrolls.
     let seatIdStr: string | null = null;
-    let seatIdBig: bigint | null = null;
     if (config.seatsRequired) {
-      seatIdBig = parseUint(seatTokenId);
+      const seatIdBig = parseUint(seatTokenId);
       if (seatIdBig === null || seatIdBig === 0n) {
         return bad(
           c,
@@ -528,23 +469,6 @@ export function createJobsApp(
       seatTokenId: seatIdStr ?? undefined,
       now,
     });
-    // Agent avatar snapshot: the seat's artwork becomes the agent's
-    // canonical face. Fail-soft (bounded timeouts, size cap, image sniff
-    // inside the snapshotter) — a failed snapshot never blocks enrollment.
-    // Re-enrolling with a different seat overwrites: latest face wins.
-    if (seatIdStr !== null && seatIdBig !== null && snapshotAvatar) {
-      const snap = await snapshotAvatar(seatIdBig);
-      if (snap) {
-        db.saveAvatar({
-          wallet: getAddress(wallet),
-          agentId: agentIdBig.toString(),
-          seatTokenId: seatIdStr,
-          imageBytes: snap.bytes,
-          contentType: snap.contentType,
-          now,
-        });
-      }
-    }
     return c.json(
       { wallet: getAddress(wallet), agentId: agentIdBig.toString(), enrolled: true },
       isNew ? 201 : 200,
@@ -649,11 +573,11 @@ export function createJobsApp(
     if (typeof spec !== 'string' || spec.length === 0 || spec.length > JOB_SPEC_MAX) {
       return bad(c, 400, 'invalid_spec', `spec must be 1-${JOB_SPEC_MAX} chars`);
     }
-    // The read-visibility flag IS part of the signed JobPost message: it
-    // decides whether the API withholds the spec from public reads, so an
-    // unsigned flag would let anyone relaying the request flip a private
-    // listing public. Signers must include specPrivate (bool) or their
-    // signature fails verification.
+    // Unsigned read-visibility flag: the spec ITSELF is signed (and its
+    // hash is the onchain termsHash), so the flag can't smuggle content —
+    // it only decides whether the API withholds the spec from public
+    // reads. Kept out of the JobPost typed message so existing signers
+    // keep verifying (adding a field would break their signatures).
     if (specPrivate !== undefined && typeof specPrivate !== 'boolean') {
       return bad(c, 400, 'invalid_spec_private', 'specPrivate must be a boolean');
     }
@@ -721,7 +645,6 @@ export function createJobsApp(
         requester,
         title,
         spec,
-        specPrivate: specPrivate === true,
         category,
         bountyUsdc,
         deadline: deadlineBig,
@@ -814,19 +737,6 @@ export function createJobsApp(
       title,
       bountyUsdc: bountyUsdc as string,
     });
-    // Wake subscribed workers: directed dispatch. The job
-    // is assigned to exactly one eligible worker and that worker gets a
-    // private wake-up; everyone else sees job_posted with the dispatch
-    // mode and stands down. No candidates -> open board immediately.
-    const posted = db.getJob(res.id);
-    if (posted) {
-      settleExpiredDispatch(dispatchDeps, nowSec);
-      const dispatch = dispatchNewJob(dispatchDeps, posted, nowSec);
-      return c.json(
-        { jobId: res.id, dispatch: dispatch.mode, assignee: dispatch.assignee?.wallet ?? null },
-        201,
-      );
-    }
     return c.json({ jobId: res.id }, 201);
   });
 
@@ -865,175 +775,12 @@ export function createJobsApp(
     });
   });
 
-  // ---- live dispatch feed (server-push; wallet-scoped in v2) ----
-  //
-  // Workers subscribe once and get woken when work is assigned to THEM:
-  //   GET /jobs/stream?wallet=0xWorker   (directed events: job_assigned)
-  //   GET /jobs/stream                   (public events only)
-  //
-  // The ?wallet= binding is a routing key, not an identity proof: events
-  // carry nothing private (the assignee's wallet is public board info),
-  // and the endpoints that ACT on a wallet all verify signatures. Binding
-  // a stranger's wallet only lets you WATCH their wake-ups — the same
-  // information the public job_posted broadcast already carries.
-  app.get('/stream', (c) => {
-    if (feed.subscriberCount >= JOB_FEED_MAX_SUBSCRIBERS) {
-      return bad(c, 503, 'feed_busy', 'too many stream subscribers');
-    }
-    const walletRaw = c.req.query('wallet');
-    let wallet: Address | null = null;
-    if (walletRaw !== undefined) {
-      if (typeof walletRaw !== 'string' || !isAddress(walletRaw)) {
-        return bad(c, 400, 'invalid_wallet', 'wallet must be an address');
-      }
-      wallet = getAddress(walletRaw);
-    }
-    const boundWallet = wallet;
-    const encoder = new TextEncoder();
-    let unsubscribe: (() => void) | null = null;
-    let heartbeat: ReturnType<typeof setInterval> | null = null;
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        const send = (event: JobFeedEvent | 'ready', data: string) => {
-          controller.enqueue(
-            encoder.encode(`event: ${event}\ndata: ${data}\n\n`),
-          );
-        };
-        send('ready', '{}');
-        unsubscribe = feed.subscribe(send, boundWallet);
-        // Comment heartbeat keeps proxies/load balancers from idling out
-        // the connection; SSE clients ignore comment lines.
-        heartbeat = setInterval(() => {
-          try {
-            controller.enqueue(encoder.encode(': ping\n\n'));
-          } catch {
-            // fall through to cancel()
-          }
-        }, 25_000);
-      },
-      cancel() {
-        if (heartbeat) clearInterval(heartbeat);
-        unsubscribe?.();
-      },
-    });
-    return new Response(stream, {
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-        // Disable proxy buffering so events flush immediately.
-        'X-Accel-Buffering': 'no',
-      },
-    });
-  });
-
-  // ---- "My Jobs": every listing where `wallet` is the requester or the
-  // claimed worker, newest first. Public read — listings are public; the
-  // wallet is only a filter. Placed before /:id so 'mine' isn't swallowed
-  // by the param route.
-  app.get('/mine', (c) => {
-    const walletRaw = c.req.query('wallet');
-    if (typeof walletRaw !== 'string' || !isAddress(walletRaw)) {
-      return bad(c, 400, 'invalid_wallet', 'wallet must be an address');
-    }
-    const w = getAddress(walletRaw).toLowerCase();
-    const jobs = db.listJobsForParty(walletRaw).map((l) => {
-      const isRequester = l.requester.toLowerCase() === w;
-      const isWorker = l.worker !== null && l.worker.toLowerCase() === w;
-      return {
-        ...publicJob(l),
-        role: isRequester && isWorker ? 'both' : isRequester ? 'requester' : 'worker',
-      };
-    });
-    return c.json({ jobs });
-  });
-
-  // ---- "Assigned to me": live directed assignments for one worker ----
-  //
-  // The wake-up view: assignments where this wallet is the current
-  // assignee and the accept window is still open. A worker's daemon gets
-  // the same information pushed as `job_assigned`; this endpoint is the
-  // human/CLI-readable mirror. Public read — the assignee's wallet is
-  // public board information.
-  app.get('/assigned', (c) => {
-    const walletRaw = c.req.query('wallet');
-    if (typeof walletRaw !== 'string' || !isAddress(walletRaw)) {
-      return bad(c, 400, 'invalid_wallet', 'wallet must be an address');
-    }
-    settleExpiredDispatch(dispatchDeps, Math.floor(Date.now() / 1000));
-    const rows = db.openAssignmentsForWorker(walletRaw);
-    return c.json({
-      assignments: rows.map(({ assignment, job }) => ({
-        job: publicJob(job),
-        assignment: {
-          round: assignment.round,
-          assignedAt: assignment.assignedAt,
-          expiresAt: assignment.expiresAt,
-        },
-      })),
-    });
-  });
-
-  // ---- The Ledger: public explorer over the full job lifecycle ----
-  //
-  // What the workers shipped (and what's in flight): every job grouped by
-  // lifecycle bucket, newest activity first. Public read, no auth — the
-  // same convention as the other public GETs (rate limits apply to writes).
-  app.get('/ledger', (c) => {
-    const statusRaw = c.req.query('status') ?? 'all';
-    const categoryRaw = c.req.query('category');
-    const limitRaw = parseInt(c.req.query('limit') ?? '50', 10);
-    const limit =
-      Number.isSafeInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
-    if (!(LEDGER_STATUSES as readonly string[]).includes(statusRaw)) {
-      return bad(
-        c,
-        400,
-        'invalid_status',
-        `status must be one of: ${LEDGER_STATUSES.join(', ')}`,
-      );
-    }
-    if (categoryRaw && !(JOB_CATEGORIES as readonly string[]).includes(categoryRaw)) {
-      return bad(
-        c,
-        400,
-        'invalid_category',
-        `category must be one of: ${JOB_CATEGORIES.join(', ')}`,
-      );
-    }
-    const status = statusRaw as LedgerStatus;
-    const category = categoryRaw || undefined;
-    // Escaped like publicJob: title/deliveryUri are worker-supplied content
-    // the site renders (stored-XSS hygiene).
-    const jobs = db.listLedgerJobs({ status, category, limit }).map((j) => ({
-      ...j,
-      title: escapeHtml(j.title),
-      deliveryUri: j.deliveryUri ? escapeHtml(j.deliveryUri) : null,
-    }));
-    return c.json({ jobs, total: db.countLedgerJobs({ status, category }) });
-  });
-
-  // Filter-row counts for the Ledger explorer: per bucket + per category.
-  app.get('/ledger/counts', (c) => {
-    const { byStatus, byCategory, total } = db.ledgerCounts();
-    const counts: Record<string, number> = {};
-    for (const cat of JOB_CATEGORIES) counts[cat] = byCategory[cat] ?? 0;
-    // Forward-compat: surface any non-v0 category that snuck into the DB.
-    for (const [cat, n] of Object.entries(byCategory)) {
-      if (!(cat in counts)) counts[cat] = n;
-    }
-    return c.json({ total, byStatus, byCategory: counts });
-  });
-
   app.get('/:id', (c) => {
     const id = jobIdParam(c);
     if (id === null) return bad(c, 400, 'invalid_job_id');
-    settleExpiredDispatch(dispatchDeps, Math.floor(Date.now() / 1000));
     const listing = db.getJob(id);
     if (!listing) return bad(c, 404, 'job_not_found');
-    return c.json({
-      job: { ...publicJob(listing), dispatch: db.getDispatchMode(id) },
-    });
+    return c.json({ job: publicJob(listing) });
   });
 
   // ---- gated private-spec read ----
@@ -1084,18 +831,12 @@ export function createJobsApp(
     const isRequester = acc === listing.requester.toLowerCase();
     const isWorker =
       listing.worker !== null && acc === listing.worker.toLowerCase();
-    // The CURRENT assignee may read the spec before claiming: directed
-    // dispatch assigns first, and the worker needs the terms to decide
-    // whether to accept. A live assignment is the authorization.
-    const active = db.getActiveAssignment(id);
-    const isAssignee =
-      active !== null && active.workerWallet.toLowerCase() === acc;
-    if (!isRequester && !isWorker && !isAssignee) {
+    if (!isRequester && !isWorker) {
       return bad(
         c,
         403,
         'not_authorized',
-        'only the requester, the claimed worker, or the current assignee may read this spec',
+        'only the requester or the claimed worker may read this spec',
       );
     }
     return c.json({
@@ -1106,83 +847,11 @@ export function createJobsApp(
     });
   });
 
-  // ---- gated submission read ----
-  //
-  // The public detail endpoint hides the submission URI until the job is
-  // complete (work-in-review stays private). The requester still needs to
-  // SEE the deliverable to decide on accept, so this endpoint serves it to
-  // the two parties of the job — and only them — while a submission is
-  // under review. Mirrors the /:id/spec gate: the accessor signs a
-  // JobSubmissionAccess typed message; the signature proves WHO is asking,
-  // the server checks they are the requester or the claimed worker.
-
-  app.post('/:id/submission', async (c) => {
-    const id = jobIdParam(c);
-    if (id === null) return bad(c, 400, 'invalid_job_id');
-    const listing = db.getJob(id);
-    if (!listing) return bad(c, 404, 'job_not_found');
-    const parsed = await readBody(c);
-    if (!parsed.ok) return bad(c, parsed.status, parsed.error);
-    const b = parsed.body as Record<string, unknown>;
-    const { jobId, accessor, timestamp, signature } = b;
-
-    if (typeof accessor !== 'string' || !isAddress(accessor)) {
-      return bad(c, 400, 'invalid_accessor');
-    }
-    const ts = parseTimestamp(timestamp);
-    if (ts === null || !timestampFresh(ts)) {
-      return bad(c, 401, 'stale_timestamp', 'timestamp must be within ±5 minutes');
-    }
-    if (typeof signature !== 'string') {
-      return bad(c, 400, 'missing_signature');
-    }
-    if (jobId !== undefined && parseUint(jobId)?.toString() !== String(id)) {
-      return bad(c, 400, 'job_id_mismatch', 'signed jobId does not match the URL');
-    }
-    const sig = await verifyLoungeSignature({
-      primaryType: 'JobSubmissionAccess',
-      message: { jobId: BigInt(id), accessor, timestamp: ts },
-      signature,
-      author: accessor,
-    });
-    if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
-
-    if (!limiter.take(`jobs-submission:${accessor.toLowerCase()}`, bucket)) {
-      return bad(c, 429, 'rate_limited', 'slow down');
-    }
-
-    const acc = accessor.toLowerCase();
-    const isRequester = acc === listing.requester.toLowerCase();
-    const isWorker =
-      listing.worker !== null && acc === listing.worker.toLowerCase();
-    if (!isRequester && !isWorker) {
-      return bad(
-        c,
-        403,
-        'not_authorized',
-        'only the requester or the claimed worker may read this submission',
-      );
-    }
-    if (listing.submissionUri === null) {
-      return bad(c, 409, 'no_submission', 'job has no submission yet');
-    }
-    return c.json({
-      jobId: id,
-      submissionUri: escapeHtml(listing.submissionUri),
-      submissionHash: listing.submissionHash,
-      submittedAt: listing.submittedAt,
-    });
-  });
-
   // ---- lifecycle ----
 
   app.post('/:id/claim', async (c) => {
     const id = jobIdParam(c);
     if (id === null) return bad(c, 400, 'invalid_job_id');
-    // Expire stale assignments before anything else: a lapsed window must
-    // never block the next claimant, and a job the assignee ignored may
-    // already have moved to the next round or the open board.
-    settleExpiredDispatch(dispatchDeps, Math.floor(Date.now() / 1000));
     const listing = db.getJob(id);
     if (!listing) return bad(c, 404, 'job_not_found');
     // 'claimed' is allowed through for the idempotent path: when a worker
@@ -1308,30 +977,6 @@ export function createJobsApp(
       });
     }
 
-    // Directed-dispatch gate: while a job carries a live assignment, only
-    // the assignee may claim it. Everyone else gets a 409 (not a silent
-    // 403) so their client knows to wait for the window or the open board
-    // instead of burning gas on a doomed claim. No live assignment means
-    // the job is on the open board — any enrolled worker may claim. The
-    // gate runs on the fresh-claim path only; the idempotent path above
-    // already proved the worker via the verified onchain event.
-    let liveAssignment: JobAssignment | null = null;
-    if (!alreadyClaimed) {
-      liveAssignment = db.getActiveAssignment(id);
-      if (
-        liveAssignment &&
-        liveAssignment.workerWallet.toLowerCase() !==
-          getAddress(worker).toLowerCase()
-      ) {
-        return bad(
-          c,
-          409,
-          'not_assigned',
-          'this job is assigned to another worker',
-        );
-      }
-    }
-
     // Verify the onchain claim: claimBounty(jobId, agentId) really ran,
     // binding this worker + agent id to the escrow's bounty.
     const claimed = await verifyBountyClaimed({
@@ -1371,12 +1016,6 @@ export function createJobsApp(
     if (res === 'tx_reused') return bad(c, 409, 'tx_hash_reused');
     if (res !== 'ok') return bad(c, 409, 'wrong_state', `job is no longer open`);
 
-    // The claim IS the acceptance: close the live assignment so it never
-    // expires into a redundant re-dispatch of an already-taken job.
-    if (liveAssignment) {
-      db.decideAssignment(liveAssignment.id, 'accepted', now);
-    }
-
     deps.onActivity?.({
       kind: 'claimed',
       jobId: id,
@@ -1384,76 +1023,7 @@ export function createJobsApp(
       title: listing.title,
       bountyUsdc: listing.bountyUsdc,
     });
-    // Tell subscribed workers the job is taken so they stop racing it.
-    feed.broadcast('job_claimed', {
-      jobId: id,
-      worker: getAddress(worker),
-      agentId: agentIdBig.toString(),
-    });
     return c.json({ jobId: id, state: 'claimed', worker: getAddress(worker) });
-  });
-
-  // ---- decline a directed assignment ----
-  //
-  // The assigned worker passes on the job: the server burns one round and
-  // advances dispatch (next candidate, or the open board). The worker signs
-  // a JobDecline typed message; the server then checks the signer is the
-  // CURRENT assignee — the signature alone proves nothing about the
-  // assignment. Declining a job you were never assigned is a 409, not a
-  // no-op, so clients can distinguish "not mine" from "declined".
-  app.post('/:id/decline', async (c) => {
-    const id = jobIdParam(c);
-    if (id === null) return bad(c, 400, 'invalid_job_id');
-    const nowSec = Math.floor(Date.now() / 1000);
-    settleExpiredDispatch(dispatchDeps, nowSec);
-    const listing = db.getJob(id);
-    if (!listing) return bad(c, 404, 'job_not_found');
-    if (listing.state !== 'open') {
-      return bad(c, 409, 'wrong_state', `job is ${listing.state}, not open`);
-    }
-    const parsed = await readBody(c);
-    if (!parsed.ok) return bad(c, parsed.status, parsed.error);
-    const b = parsed.body as Record<string, unknown>;
-    const { jobId, worker, timestamp, signature } = b;
-
-    if (typeof worker !== 'string' || !isAddress(worker)) {
-      return bad(c, 400, 'invalid_worker');
-    }
-    const ts = parseTimestamp(timestamp);
-    if (ts === null || !timestampFresh(ts)) {
-      return bad(c, 401, 'stale_timestamp', 'timestamp must be within ±5 minutes');
-    }
-    if (typeof signature !== 'string') {
-      return bad(c, 400, 'missing_signature');
-    }
-    const sig = await verifyLoungeSignature({
-      primaryType: 'JobDecline',
-      message: { jobId: BigInt(id), worker, timestamp: ts },
-      signature,
-      author: worker,
-    });
-    if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
-
-    // Rate limit AFTER the request is otherwise valid.
-    if (!limiter.take(`jobs-decline:${worker.toLowerCase()}`, bucket)) {
-      return bad(c, 429, 'rate_limited', 'slow down');
-    }
-
-    const active = db.getActiveAssignment(id);
-    if (!active) {
-      return bad(c, 409, 'no_assignment', 'no live assignment for this job');
-    }
-    if (active.workerWallet.toLowerCase() !== getAddress(worker).toLowerCase()) {
-      return bad(
-        c,
-        403,
-        'not_assigned',
-        'only the assigned worker may decline this assignment',
-      );
-    }
-    db.decideAssignment(active.id, 'declined', nowSec);
-    advanceDispatch(dispatchDeps, id, nowSec);
-    return c.json({ jobId: id, declined: true, round: active.round });
   });
 
   app.post('/:id/submit', async (c) => {

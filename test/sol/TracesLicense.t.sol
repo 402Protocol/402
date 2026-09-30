@@ -2,7 +2,6 @@
 pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/src/Test.sol";
-import {Vm} from "forge-std/src/Vm.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {TracesLicense} from "../../contracts/TracesLicense.sol";
@@ -84,13 +83,11 @@ contract TracesLicenseTest is Test {
     address internal payer = address(0xCAFE);
     address internal agent = address(0xD00D);
 
-    uint256 internal constant WL_PRICE = 10_000_000; // $10.00 USDC whitelist
-    uint256 internal constant PUBLIC_PRICE = 12_000_000; // $12.00 USDC public
+    uint256 internal constant PRICE = 10_000_000; // $10.00 USDC
     string internal constant BASE_URI = "ipfs://bafybeidhdxryx66t3sbrgnuagwtjjjteiddavvm55474sshyyh5tfnclxe/";
 
     event SeatPaired(uint256 indexed tokenId, uint256 indexed agentId, address indexed to);
     event SeatRepaired(uint256 indexed tokenId, uint256 indexed oldAgentId, uint256 indexed newAgentId);
-    event SeatUnpaired(uint256 indexed tokenId, uint256 indexed agentId);
 
     function setUp() public {
         registry = new MockIdentityRegistry();
@@ -98,9 +95,7 @@ contract TracesLicenseTest is Test {
         // Pair against the mock registry (constructor param); on Ink mainnet
         // this is 0x7274e874CA62410a93Bd8bf61c69d8045E399c02, the live
         // IdentityRegistryUpgradeable.
-        traces = new TracesLicense(
-            owner, address(usdc), treasury, WL_PRICE, PUBLIC_PRICE, BASE_URI, address(registry)
-        );
+        traces = new TracesLicense(owner, address(usdc), treasury, PRICE, BASE_URI, address(registry));
     }
 
     /// @dev Register `n` identities owned by `to`, using the mock that now
@@ -130,7 +125,7 @@ contract TracesLicenseTest is Test {
 
     function test_MintHappyPathNoIdentityNeeded() public {
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         traces.mint(agent); // no 8004 identity exists at all — still succeeds
@@ -138,14 +133,14 @@ contract TracesLicenseTest is Test {
         assertEq(traces.ownerOf(1), agent);
         assertEq(traces.seatToAgent(1), 0); // unpaired until activation
         assertEq(traces.nextTokenId(), 2);
-        assertEq(usdc.balanceOf(treasury), PUBLIC_PRICE);
+        assertEq(usdc.balanceOf(treasury), PRICE);
         assertEq(usdc.balanceOf(payer), 0);
         assertEq(traces.balanceOf(agent), 1);
     }
 
     function test_MintBatchSequential() public {
         _openMint();
-        _fundPayer(PUBLIC_PRICE * 3);
+        _fundPayer(PRICE * 3);
 
         vm.prank(payer);
         traces.mintBatch(agent, 3);
@@ -155,12 +150,12 @@ contract TracesLicenseTest is Test {
         assertEq(traces.ownerOf(3), agent);
         assertEq(traces.seatToAgent(2), 0);
         assertEq(traces.nextTokenId(), 4);
-        assertEq(usdc.balanceOf(treasury), PUBLIC_PRICE * 3);
+        assertEq(usdc.balanceOf(treasury), PRICE * 3);
     }
 
     function test_MintBatchZeroReverts() public {
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         vm.expectRevert(TracesLicense.EmptyBatch.selector);
@@ -174,7 +169,7 @@ contract TracesLicenseTest is Test {
     function test_PairSeatHappyPath() public {
         uint256[] memory ids = _register(agent, 1);
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         traces.mint(agent);
@@ -193,7 +188,7 @@ contract TracesLicenseTest is Test {
         address stranger = address(0xBAD);
         uint256[] memory ids = _register(stranger, 1);
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         traces.mint(agent);
@@ -206,7 +201,7 @@ contract TracesLicenseTest is Test {
     function test_PairSeatUnownedAgentReverts() public {
         uint256[] memory ids = _register(agent, 1); // owned by agent, not payer
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         traces.mint(payer);
@@ -218,7 +213,7 @@ contract TracesLicenseTest is Test {
 
     function test_PairSeatNonexistentAgentReverts() public {
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         traces.mint(agent);
@@ -231,7 +226,7 @@ contract TracesLicenseTest is Test {
     function test_PairSeatAlreadyPairedAgentReverts() public {
         uint256[] memory ids = _register(agent, 1);
         _openMint();
-        _fundPayer(PUBLIC_PRICE * 2);
+        _fundPayer(PRICE * 2);
 
         vm.prank(payer);
         traces.mintBatch(agent, 2);
@@ -247,7 +242,7 @@ contract TracesLicenseTest is Test {
     function test_PairSeatAlreadyPairedSeatReverts() public {
         uint256[] memory ids = _register(agent, 2);
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         traces.mint(agent);
@@ -277,7 +272,7 @@ contract TracesLicenseTest is Test {
 
     function test_MintClosedByDefault() public {
         assertFalse(traces.mintOpen());
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         vm.expectRevert(TracesLicense.MintClosed.selector);
@@ -292,7 +287,7 @@ contract TracesLicenseTest is Test {
 
     function test_WalletCapEnforced() public {
         _openMint();
-        _fundPayer(PUBLIC_PRICE * 11);
+        _fundPayer(PRICE * 11);
 
         vm.prank(payer);
         traces.mintBatch(agent, 10);
@@ -354,7 +349,7 @@ contract TracesLicenseTest is Test {
             traces.teamMint(agent);
         }
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         vm.expectRevert(TracesLicense.WalletCapExceeded.selector);
@@ -368,11 +363,11 @@ contract TracesLicenseTest is Test {
     function test_PricePullMath() public {
         _openMint();
         // payer approves exactly price*2; over-pull would revert
-        _fundPayer(PUBLIC_PRICE * 2);
+        _fundPayer(PRICE * 2);
 
         vm.prank(payer);
         traces.mintBatch(agent, 2);
-        assertEq(usdc.balanceOf(treasury), PUBLIC_PRICE * 2);
+        assertEq(usdc.balanceOf(treasury), PRICE * 2);
         assertEq(usdc.balanceOf(payer), 0);
     }
 
@@ -417,7 +412,7 @@ contract TracesLicenseTest is Test {
 
     function test_TokenURIFormat() public {
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         traces.mint(agent);
@@ -470,7 +465,7 @@ contract TracesLicenseTest is Test {
 
     function test_TransfersWorkWithDefaultValidator() public {
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         traces.mint(agent);
@@ -485,12 +480,12 @@ contract TracesLicenseTest is Test {
     // repairSeat (re-pairing after pairing / secondary sale)
     // ------------------------------------------------------------------------
 
-    function test_TransferAutoClearsPairing() public {
+    function test_RepairSeatAfterSecondarySale() public {
         address buyer = address(0xBEE5);
         uint256[] memory sellerIds = _register(agent, 1);
         uint256[] memory buyerIds = _register(buyer, 1);
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         // mint, then activate on the 402 site
         vm.prank(payer);
@@ -498,49 +493,28 @@ contract TracesLicenseTest is Test {
         vm.prank(agent);
         traces.pairSeat(1, sellerIds[0]);
 
-        // secondary sale: the pairing auto-clears WITH the transfer —
-        // the license follows the token, no stale seller pairing survives.
-        vm.expectEmit(true, true, false, true);
-        emit SeatUnpaired(1, sellerIds[0]);
+        // secondary sale: seat moves, pairing stays stale
         vm.prank(agent);
         traces.transferFrom(agent, buyer, 1);
+        assertEq(traces.seatToAgent(1), sellerIds[0]);
 
-        assertEq(traces.ownerOf(1), buyer);
-        assertEq(traces.seatToAgent(1), 0);
-        assertEq(traces.agentToSeat(sellerIds[0]), 0);
-
-        // buyer activates directly with pairSeat — no repair step needed.
+        // buyer re-pairs the seat to their own agent
         vm.expectEmit(true, true, true, true);
-        emit SeatPaired(1, buyerIds[0], buyer);
+        emit SeatRepaired(1, sellerIds[0], buyerIds[0]);
         vm.prank(buyer);
-        traces.pairSeat(1, buyerIds[0]);
+        traces.repairSeat(1, buyerIds[0]);
 
         assertEq(traces.seatToAgent(1), buyerIds[0]);
         assertEq(traces.agentToSeat(buyerIds[0]), 1);
-    }
-
-    function test_TransferOfUnpairedSeatEmitsNothing() public {
-        address buyer = address(0xBEE5);
-        _openMint();
-        _fundPayer(PUBLIC_PRICE);
-
-        vm.prank(payer);
-        traces.mint(agent);
-
-        vm.recordLogs();
-        vm.prank(agent);
-        traces.transferFrom(agent, buyer, 1);
-        Vm.Log[] memory logs = vm.getRecordedLogs();
-        // only the ERC-721 Transfer event, no SeatUnpaired
-        assertEq(logs.length, 1);
-        assertEq(traces.seatToAgent(1), 0);
+        assertEq(traces.agentToSeat(sellerIds[0]), 0); // old pairing cleared
+        assertEq(traces.ownerOf(1), buyer);
     }
 
     function test_RepairSeatOnNeverPairedSeat() public {
         address buyer = address(0xBEE5);
         uint256[] memory buyerIds = _register(buyer, 1);
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         traces.mint(agent);
@@ -562,7 +536,7 @@ contract TracesLicenseTest is Test {
         uint256[] memory ids = _register(agent, 1);
         uint256[] memory strangerIds = _register(stranger, 1);
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         traces.mint(agent);
@@ -578,7 +552,7 @@ contract TracesLicenseTest is Test {
         address stranger = address(0xBAD);
         uint256[] memory strangerIds = _register(stranger, 1);
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         traces.mint(agent);
@@ -591,7 +565,7 @@ contract TracesLicenseTest is Test {
     function test_RepairSeatToAlreadyPairedAgentReverts() public {
         uint256[] memory ids = _register(agent, 2);
         _openMint();
-        _fundPayer(PUBLIC_PRICE * 2);
+        _fundPayer(PRICE * 2);
 
         vm.prank(payer);
         traces.mintBatch(agent, 2);
@@ -609,7 +583,7 @@ contract TracesLicenseTest is Test {
     function test_RepairSeatSameAgentReverts() public {
         uint256[] memory ids = _register(agent, 1);
         _openMint();
-        _fundPayer(PUBLIC_PRICE);
+        _fundPayer(PRICE);
 
         vm.prank(payer);
         traces.mint(agent);
@@ -621,65 +595,10 @@ contract TracesLicenseTest is Test {
         traces.repairSeat(1, ids[0]);
     }
 
-    function test_RepairSeatCooldownEnforced() public {
-        uint256[] memory ids = _register(agent, 3);
-        _openMint();
-        _fundPayer(PUBLIC_PRICE);
-
-        vm.prank(payer);
-        traces.mint(agent);
-        vm.prank(agent);
-        traces.pairSeat(1, ids[0]);
-
-        // first repair (activating rotation) is free
-        vm.prank(agent);
-        traces.repairSeat(1, ids[1]);
-        assertEq(traces.seatToAgent(1), ids[1]);
-        assertEq(traces.lastRepairAt(1), block.timestamp);
-
-        // immediate second repair reverts — no serial multiplexing
-        vm.prank(agent);
-        vm.expectRevert(TracesLicense.RepairCooldown.selector);
-        traces.repairSeat(1, ids[2]);
-
-        // one second before the cooldown ends: still reverts
-        vm.warp(block.timestamp + 72 hours - 1);
-        vm.prank(agent);
-        vm.expectRevert(TracesLicense.RepairCooldown.selector);
-        traces.repairSeat(1, ids[2]);
-
-        // cooldown elapsed: repair succeeds
-        vm.warp(block.timestamp + 1);
-        vm.prank(agent);
-        traces.repairSeat(1, ids[2]);
-        assertEq(traces.seatToAgent(1), ids[2]);
-        assertEq(traces.agentToSeat(ids[1]), 0);
-    }
-
-    function test_RepairSeatCooldownIsPerSeat() public {
-        uint256[] memory ids = _register(agent, 3);
-        _openMint();
-        _fundPayer(PUBLIC_PRICE * 2);
-
-        vm.prank(payer);
-        traces.mintBatch(agent, 2);
-        vm.prank(agent);
-        traces.pairSeat(1, ids[0]);
-        vm.prank(agent);
-        traces.pairSeat(2, ids[1]);
-
-        // repairing seat 1 does not lock seat 2
-        vm.prank(agent);
-        traces.repairSeat(1, ids[2]);
-        vm.prank(agent);
-        vm.expectRevert(TracesLicense.RepairCooldown.selector);
-        traces.repairSeat(1, ids[0]);
-    }
-
     function test_EnumerableListsOwnerSeats() public {
         address buyer = address(0xBEE5);
         _openMint();
-        _fundPayer(PUBLIC_PRICE * 3);
+        _fundPayer(PRICE * 3);
 
         vm.prank(payer);
         traces.mintBatch(agent, 2);

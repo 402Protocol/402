@@ -31,90 +31,6 @@ export type JobState =
 /** txHash purposes burned in used_tx_hashes. */
 export type JobsTxPurpose = 'post' | 'claim' | 'accept' | 'dispute' | 'refund' | 'resolve';
 
-// ---- The Ledger: public explorer over the full job lifecycle ----
-//
-// Buckets mirror the jobs explorer the site renders:
-// - open: posted but unclaimed, sitting on the open board
-// - active: assigned/claimed/submitted/in_review/disputed — work in progress
-//   (`disputed` is still in flight: the arbiter hasn't ruled yet)
-// - completed: terminal success — panel-verified, requester-accepted, or
-//   arbiter-resolved
-// - failed: terminal failure. Today only `refunded` (money returned to the
-//   requester, nothing shipped); expired/cancelled/disputed-lost have no
-//   states yet, so the bucket is empty by construction but the param works.
-//
-// Note: `verified` still holds the seat until accept (see
-// countActiveJobsForSeat), so it is not terminal in the state machine —
-// but for the explorer it is terminal *success*: the panel finalized and
-// the deliverable shipped.
-
-/** Ledger status filter values accepted by GET /jobs/ledger. */
-export const LEDGER_STATUSES = ['all', 'open', 'active', 'completed', 'failed'] as const;
-export type LedgerStatus = (typeof LEDGER_STATUSES)[number];
-
-/** Raw job states in each ledger bucket. */
-export const LEDGER_BUCKETS: Record<Exclude<LedgerStatus, 'all'>, JobState[]> = {
-  open: ['open'],
-  active: ['claimed', 'submitted', 'in_review', 'disputed'],
-  completed: ['verified', 'complete', 'resolved'],
-  failed: ['refunded'],
-};
-
-/** Terminal-success states, shared by the Ledger completed bucket and the Agents directory. */
-export const LEDGER_COMPLETED_STATES: JobState[] = [...LEDGER_BUCKETS.completed];
-
-/**
- * One row of the public Agents directory. Times are unix milliseconds.
- * `score` is null: delivery reputation lives onchain
- * (Four02ReputationRegistryV2) and there is no cached DB score column yet —
- * null is the honest value, not a gap to paper over.
- */
-export interface AgentDirectoryEntry {
-  wallet: string;
-  agentId: string | null;
-  enrolledAt: number | null;
-  status: 'working' | 'waiting';
-  activeJobs: number;
-  completedJobs: number;
-  score: number | null;
-  /**
-   * TRACES seat token id linked to this agent's ERC-8004 id. The DB never
-   * fills this in — the /agents route resolves it LIVE from the onchain
-   * seat registry's agentToSeat mapping when the registry is configured
-   * (same env-gating as the seat gate), else null.
-   */
-  seatTokenId: string | null;
-}
-
-/** Panel-derived score status for a ledger row. */
-export type LedgerScoreStatus = 'none' | 'queued' | 'scored';
-
-/**
- * One row of the Ledger explorer feed. Timestamps are unix milliseconds.
- * `workerWallet` is null for unclaimed (open) jobs; `deliveryUri` is only
- * exposed once the work has shipped (terminal success) so submissions under
- * blind panel review stay hidden; `settlementTx` is the money-moving tx
- * (accept/resolve) when one exists — the Tape's settlements table has no
- * per-job link, so the tx is read from used_tx_hashes instead.
- */
-export interface LedgerJob {
-  jobId: string;
-  /** Raw job state string, so the UI can render pipeline stages. */
-  state: JobState;
-  title: string;
-  category: string;
-  bountyUsdc: string;
-  workerWallet: string | null;
-  workerAgentId: string | null;
-  deliveryUri: string | null;
-  postedAt: number;
-  claimedAt: number | null;
-  submittedAt: number | null;
-  scoreStatus: LedgerScoreStatus;
-  score: number | null;
-  settlementTx: string | null;
-}
-
 export interface JobListing {
   id: number;
   /** Onchain job id in the BountyEscrow contract (decimal string). */
@@ -144,8 +60,6 @@ export interface JobListing {
   state: JobState;
   submissionHash: string | null;
   submissionUri: string | null;
-  /** Unix seconds, set when the worker submits a deliverable. */
-  submittedAt: number | null;
   /** Unix seconds, set when the job enters `disputed` (dispute SLA clock). */
   disputedAt: number | null;
   createdAt: number;
@@ -160,19 +74,6 @@ export interface JobWorker {
   seatTokenId: string | null;
   enrolledAt: number;
   lastVerifiedAt: number;
-}
-
-/**
- * An agent's avatar snapshot: the TRACES seat artwork captured at pairing
- * time. The agent's canonical face until the holder re-pairs (latest wins).
- */
-export interface AgentAvatar {
-  wallet: Address;
-  agentId: string;
-  seatTokenId: string;
-  imageBytes: Buffer;
-  contentType: string;
-  snapshotAt: number;
 }
 
 /**
@@ -218,26 +119,6 @@ export interface ReviewerStats {
   cooldownUntil: number;
 }
 
-/**
- * Directed-dispatch assignment lifecycle. One row per assignment round:
- * the server assigns an open job to exactly one worker; the worker claims
- * (accepted), declines, or lets the window lapse (expired). After the
- * configured max rounds the job falls back to the open board.
- */
-export type AssignmentStatus = 'assigned' | 'accepted' | 'declined' | 'expired';
-
-export interface JobAssignment {
-  id: number;
-  jobId: number;
-  workerWallet: Address;
-  workerAgentId: string;
-  round: number;
-  status: AssignmentStatus;
-  assignedAt: number;
-  expiresAt: number;
-  decidedAt: number | null;
-}
-
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS job_listings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -258,7 +139,6 @@ CREATE TABLE IF NOT EXISTS job_listings (
   state TEXT NOT NULL,
   submission_hash TEXT,
   submission_uri TEXT,
-  submitted_at INTEGER,
   disputed_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -269,20 +149,6 @@ CREATE TABLE IF NOT EXISTS job_workers (
   seat_token_id TEXT,
   enrolled_at INTEGER NOT NULL,
   last_verified_at INTEGER NOT NULL
-);
-/**
- * Agent avatar snapshots: the TRACES seat artwork snapshotted at pairing
- * time, used as the agent's canonical face. One row per worker wallet;
- * INSERT OR REPLACE = latest face wins on re-pairing. Dormant until the
- * seat gate is live (no pairing => no snapshot).
- */
-CREATE TABLE IF NOT EXISTS agent_avatars (
-  wallet TEXT PRIMARY KEY,
-  agent_id TEXT NOT NULL,
-  seat_token_id TEXT NOT NULL,
-  image_bytes BLOB NOT NULL,
-  content_type TEXT NOT NULL,
-  snapshot_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS used_tx_hashes (
   tx_hash TEXT PRIMARY KEY,
@@ -336,30 +202,6 @@ CREATE TABLE IF NOT EXISTS panel_epoch_submissions (
   submitted_at INTEGER NOT NULL,
   tx_hash TEXT NOT NULL
 );
--- Directed dispatch: one row per assignment round. A job is assigned to
--- exactly one worker at a time; decline/expiry burns a round, and after the
--- configured max rounds the job falls back to the open board (job_dispatch).
-CREATE TABLE IF NOT EXISTS job_assignments (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  job_id INTEGER NOT NULL,
-  worker_wallet TEXT NOT NULL,
-  worker_agent_id TEXT NOT NULL,
-  round INTEGER NOT NULL,
-  status TEXT NOT NULL,
-  assigned_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL,
-  decided_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_assignments_job ON job_assignments(job_id, status);
-CREATE INDEX IF NOT EXISTS idx_assignments_worker ON job_assignments(worker_wallet, status);
-CREATE INDEX IF NOT EXISTS idx_assignments_expiry ON job_assignments(status, expires_at);
--- Directed dispatch mode per job: a row appears only when a job leaves the
--- directed path for the open board. Absence of a row means 'directed'.
-CREATE TABLE IF NOT EXISTS job_dispatch (
-  job_id INTEGER PRIMARY KEY,
-  mode TEXT NOT NULL,
-  opened_at INTEGER NOT NULL
-);
 `;
 
 function rowToListing(row: Record<string, unknown>): JobListing {
@@ -381,7 +223,6 @@ function rowToListing(row: Record<string, unknown>): JobListing {
     state: row.state as JobState,
     submissionHash: (row.submission_hash as string | null) ?? null,
     submissionUri: (row.submission_uri as string | null) ?? null,
-    submittedAt: (row.submitted_at as number | null) ?? null,
     disputedAt: (row.disputed_at as number | null) ?? null,
     createdAt: row.created_at as number,
     updatedAt: row.updated_at as number,
@@ -416,9 +257,6 @@ export class JobsDb {
     }
     if (!names.has('worker_seat_id')) {
       this.db.exec('ALTER TABLE job_listings ADD COLUMN worker_seat_id TEXT');
-    }
-    if (!names.has('submitted_at')) {
-      this.db.exec('ALTER TABLE job_listings ADD COLUMN submitted_at INTEGER');
     }
   }
 
@@ -563,199 +401,6 @@ export class JobsDb {
     return rows.map(rowToListing);
   }
 
-  /**
-   * The Ledger feed: every job across the full lifecycle, newest activity
-   * first. One query; panel score status, the money-moving tx, and the claim
-   * timestamp come from correlated subqueries.
-   */
-  listLedgerJobs(o: {
-    status: LedgerStatus;
-    category?: string;
-    limit: number;
-  }): LedgerJob[] {
-    const { where, params } = this.ledgerFilter(o.status, o.category);
-    const rows = this.db
-      .prepare(
-        `SELECT l.*,
-          (SELECT p.state FROM job_panels p WHERE p.job_id = l.id) AS panel_state,
-          (SELECT AVG(r.score) FROM job_reviews r
-             JOIN job_panel_reviewers pr
-               ON pr.job_id = r.job_id AND pr.reviewer_agent_id = r.reviewer_agent_id
-           WHERE r.job_id = l.id AND pr.replaced_at IS NULL AND r.verdict = 1) AS panel_score,
-          (SELECT u.tx_hash FROM used_tx_hashes u
-           WHERE u.job_id = l.id AND u.purpose IN ('accept', 'resolve') LIMIT 1) AS settlement_tx,
-          (SELECT u2.used_at FROM used_tx_hashes u2
-           WHERE u2.job_id = l.id AND u2.purpose = 'claim' LIMIT 1) AS claimed_at
-         FROM job_listings l
-         ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
-         ORDER BY l.updated_at DESC, l.id DESC LIMIT ?`,
-      )
-      .all(...params, o.limit) as Record<string, unknown>[];
-    return rows.map((r) => this.rowToLedgerJob(r));
-  }
-
-  /** Total ledger rows for a filter (the `total` next to a jobs page). */
-  countLedgerJobs(o: { status: LedgerStatus; category?: string }): number {
-    const { where, params } = this.ledgerFilter(o.status, o.category);
-    const row = this.db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM job_listings l ${where.length ? 'WHERE ' + where.join(' AND ') : ''}`,
-      )
-      .get(...params) as { n: number };
-    return row.n;
-  }
-
-  /**
-   * Filter-row counts for the Ledger explorer, scoped to all jobs:
-   * per-bucket, per-category, and the grand total.
-   */
-  ledgerCounts(): {
-    byStatus: Record<Exclude<LedgerStatus, 'all'>, number>;
-    byCategory: Record<string, number>;
-    total: number;
-  } {
-    const byStatus: Record<Exclude<LedgerStatus, 'all'>, number> = {
-      open: 0,
-      active: 0,
-      completed: 0,
-      failed: 0,
-    };
-    const stateRows = this.db
-      .prepare('SELECT state, COUNT(*) AS n FROM job_listings GROUP BY state')
-      .all() as { state: string; n: number }[];
-    for (const r of stateRows) {
-      for (const bucket of Object.keys(LEDGER_BUCKETS) as (keyof typeof LEDGER_BUCKETS)[]) {
-        if (LEDGER_BUCKETS[bucket].includes(r.state as JobState)) byStatus[bucket] += r.n;
-      }
-    }
-    const byCategory: Record<string, number> = {};
-    const catRows = this.db
-      .prepare('SELECT category, COUNT(*) AS n FROM job_listings GROUP BY category')
-      .all() as { category: string; n: number }[];
-    for (const r of catRows) byCategory[r.category] = r.n;
-    return { byStatus, byCategory, total: stateRows.reduce((a, r) => a + r.n, 0) };
-  }
-
-  private ledgerFilter(status: LedgerStatus, category?: string): {
-    where: string[];
-    params: (string | number)[];
-  } {
-    const where: string[] = [];
-    const params: (string | number)[] = [];
-    if (status !== 'all') {
-      const states = LEDGER_BUCKETS[status];
-      where.push(`l.state IN (${states.map(() => '?').join(',')})`);
-      params.push(...states);
-    }
-    if (category) {
-      where.push('l.category = ?');
-      params.push(category);
-    }
-    return { where, params };
-  }
-
-  private rowToLedgerJob(row: Record<string, unknown>): LedgerJob {
-    const panelState = row.panel_state as string | null;
-    const panelScore = row.panel_score as number | null;
-    const state = row.state as JobState;
-    // acceptJob closes the panel on the success path, so a 'closed' panel
-    // with a real accept average on a verified/complete job still means
-    // "scored". A rejected or dispute-closed panel voids the score: 'none'.
-    let scoreStatus: LedgerScoreStatus = 'none';
-    if (panelState === 'open') scoreStatus = 'queued';
-    else if (panelState === 'verified') scoreStatus = 'scored';
-    else if (
-      panelState === 'closed' &&
-      (state === 'verified' || state === 'complete') &&
-      panelScore != null
-    ) {
-      scoreStatus = 'scored';
-    }
-    // The deliverable goes public once the work has shipped (terminal
-    // success). While a panel is still blind-deliberating, the submission
-    // stays hidden — same rule as the board's publicJob.
-    const shipped = state === 'verified' || state === 'complete' || state === 'resolved';
-    const submissionUri = row.submission_uri as string | null;
-    const claimedAt = row.claimed_at as number | null;
-    const submittedAt = row.submitted_at as number | null;
-    return {
-      jobId: String(row.id),
-      state,
-      title: row.title as string,
-      category: row.category as string,
-      bountyUsdc: row.bounty_usdc as string,
-      workerWallet: (row.worker as string | null) ?? null,
-      workerAgentId: (row.worker_agent_id as string | null) ?? null,
-      deliveryUri: shipped && submissionUri ? submissionUri : null,
-      postedAt: (row.created_at as number) * 1000,
-      claimedAt: claimedAt != null ? claimedAt * 1000 : null,
-      submittedAt: submittedAt != null ? submittedAt * 1000 : null,
-      scoreStatus,
-      score:
-        scoreStatus === 'scored' && panelScore != null
-          ? Math.round(panelScore * 10) / 10
-          : null,
-      settlementTx: (row.settlement_tx as string | null) ?? null,
-    };
-  }
-
-  /**
-   * The Agents directory: every enrolled worker with live status.
-   * `activeJobs` reuses countActiveJobsForWorker — the exact definition
-   * dispatch ranking uses for "fewest active jobs" — so a worker with a
-   * verified-but-unaccepted job still reads "working" (their seat is
-   * occupied, payout pending). `completedJobs` counts terminal-success
-   * states, so a verified job lands in BOTH counters; that overlap is
-   * intentional and documented in the spec addendum.
-   *
-   * Order: working first, then waiting; within each group by completedJobs
-   * desc (the leaderboard the Agents tab renders).
-   */
-  listAgents(): AgentDirectoryEntry[] {
-    const workers = this.db
-      .prepare('SELECT wallet, agent_id, enrolled_at FROM job_workers ORDER BY enrolled_at ASC')
-      .all() as { wallet: string; agent_id: string | null; enrolled_at: number | null }[];
-    const completedStates = LEDGER_COMPLETED_STATES.map(() => '?').join(',');
-    const entries: AgentDirectoryEntry[] = workers.map((w) => {
-      const activeJobs = this.countActiveJobsForWorker(w.wallet);
-      const completedRow = this.db
-        .prepare(
-          `SELECT COUNT(*) AS n FROM job_listings
-           WHERE worker = ? AND state IN (${completedStates})`,
-        )
-        .get(w.wallet, ...LEDGER_COMPLETED_STATES) as { n: number };
-      return {
-        wallet: w.wallet,
-        agentId: w.agent_id ?? null,
-        enrolledAt: w.enrolled_at != null ? w.enrolled_at * 1000 : null,
-        status: activeJobs > 0 ? 'working' : 'waiting',
-        activeJobs,
-        completedJobs: completedRow.n,
-        score: null,
-        // The seat pairing is resolved live onchain by the /agents route
-        // (createAgentsApp) — the DB layer never caches it.
-        seatTokenId: null,
-      };
-    });
-    entries.sort((a, b) => {
-      if (a.status !== b.status) return a.status === 'working' ? -1 : 1;
-      return b.completedJobs - a.completedJobs;
-    });
-    return entries;
-  }
-
-  /** "My Jobs": every listing where `wallet` is the requester or the claimed worker, newest first. */
-  listJobsForParty(wallet: string): JobListing[] {
-    const w = getAddress(wallet);
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM job_listings WHERE requester = ? OR worker = ?
-         ORDER BY created_at DESC, id DESC`,
-      )
-      .all(w, w) as Record<string, unknown>[];
-    return rows.map(rowToListing);
-  }
-
   /** All jobs a given agent id worked on (the DB half of the resume). */
   jobsForAgent(agentId: string): JobListing[] {
     const rows = this.db
@@ -846,252 +491,6 @@ export class JobsDb {
     return row.n;
   }
 
-  // ---- directed dispatch ----
-
-  private rowToAssignment(row: Record<string, unknown>): JobAssignment {
-    return {
-      id: row.id as number,
-      jobId: row.job_id as number,
-      workerWallet: row.worker_wallet as Address,
-      workerAgentId: row.worker_agent_id as string,
-      round: row.round as number,
-      status: row.status as AssignmentStatus,
-      assignedAt: row.assigned_at as number,
-      expiresAt: row.expires_at as number,
-      decidedAt: (row.decided_at as number | null) ?? null,
-    };
-  }
-
-  /**
-   * Active (in-flight, claimed/submitted/in_review/verified/disputed) jobs
-   * claimed by one worker wallet. The assignment engine skips workers at
-   * the concurrency cap so work spreads instead of piling on one agent.
-   */
-  countActiveJobsForWorker(wallet: string): number {
-    let addr: string;
-    try {
-      addr = getAddress(wallet);
-    } catch {
-      return 0;
-    }
-    const row = this.db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM job_listings
-         WHERE worker = ?
-           AND state IN ('claimed', 'submitted', 'in_review', 'verified', 'disputed')`,
-      )
-      .get(addr) as { n: number };
-    return row.n;
-  }
-
-  /**
-   * Ranked dispatch candidates for a job. Eligibility is enrollment only:
-   * any enrolled worker may be assigned any job — workers carry no
-   * platform capabilities (categories live on jobs as metadata only).
-   * - not in excludeWallets (the requester + already-tried workers)
-   * - under the concurrency cap (active jobs < maxConcurrent)
-   *
-   * Ranking: fewest active jobs first, then least-recently-assigned (fair
-   * rotation across the fleet), then random for ties. Reputation weighting
-   * is the future: delivery reputation lives onchain
-   * (Four02ReputationRegistryV2) and needs a read per candidate, which
-   * does not scale to thousands of workers per job post — a cached DB
-   * reputation column (keeper-fed) is the follow-up.
-   */
-  listDispatchCandidates(o: {
-    excludeWallets?: string[];
-    maxConcurrent: number;
-    limit: number;
-  }): { wallet: Address; agentId: string }[] {
-    const ex = (o.excludeWallets ?? []).map((w) => {
-      try {
-        return getAddress(w).toLowerCase();
-      } catch {
-        return '';
-      }
-    });
-    const exPlace = ex.map(() => '?').join(', ');
-    const rows = this.db
-      .prepare(
-        `SELECT w.wallet AS wallet, w.agent_id AS agent_id
-         FROM job_workers w
-         WHERE 1 = 1
-           ${ex.length ? `AND LOWER(w.wallet) NOT IN (${exPlace})` : ''}
-           AND (
-                 SELECT COUNT(*) FROM job_listings l
-                 WHERE l.worker = w.wallet
-                   AND l.state IN ('claimed', 'submitted', 'in_review', 'verified', 'disputed')
-               ) < ?
-         ORDER BY
-           (SELECT COUNT(*) FROM job_listings l
-            WHERE l.worker = w.wallet
-              AND l.state IN ('claimed', 'submitted', 'in_review', 'verified', 'disputed')) ASC,
-           (SELECT MAX(a.assigned_at) FROM job_assignments a
-            WHERE a.worker_wallet = w.wallet) ASC NULLS FIRST,
-           RANDOM()
-         LIMIT ?`,
-      )
-      .all(...ex, o.maxConcurrent, o.limit) as {
-        wallet: string;
-        agent_id: string;
-      }[];
-    return rows.map((r) => ({
-      wallet: r.wallet as Address,
-      agentId: r.agent_id,
-    }));
-  }
-
-  /** Insert an assignment round for a job. Returns the assignment id. */
-  createAssignment(o: {
-    jobId: number;
-    workerWallet: Address;
-    workerAgentId: string;
-    round: number;
-    now: number;
-    expiresAt: number;
-  }): number {
-    const res = this.db
-      .prepare(
-        `INSERT INTO job_assignments
-           (job_id, worker_wallet, worker_agent_id, round, status, assigned_at, expires_at, decided_at)
-         VALUES (?, ?, ?, ?, 'assigned', ?, ?, NULL)`,
-      )
-      .run(
-        o.jobId,
-        getAddress(o.workerWallet),
-        o.workerAgentId,
-        o.round,
-        o.now,
-        o.expiresAt,
-      );
-    return Number(res.lastInsertRowid);
-  }
-
-  /** The currently live assignment for a job, if any. */
-  getActiveAssignment(jobId: number): JobAssignment | null {
-    const row = this.db
-      .prepare(
-        `SELECT * FROM job_assignments
-         WHERE job_id = ? AND status = 'assigned'
-         ORDER BY round DESC, id DESC LIMIT 1`,
-      )
-      .get(jobId) as Record<string, unknown> | undefined;
-    return row ? this.rowToAssignment(row) : null;
-  }
-
-  /** Wallets already tried for a job (excluded from later rounds). */
-  triedWallets(jobId: number): string[] {
-    const rows = this.db
-      .prepare(
-        'SELECT DISTINCT worker_wallet AS w FROM job_assignments WHERE job_id = ?',
-      )
-      .all(jobId) as { w: string }[];
-    return rows.map((r) => r.w);
-  }
-
-  /** How many assignment rounds a job has burned. */
-  assignmentRounds(jobId: number): number {
-    const row = this.db
-      .prepare('SELECT COUNT(*) AS n FROM job_assignments WHERE job_id = ?')
-      .get(jobId) as { n: number };
-    return row.n;
-  }
-
-  /**
-   * Decide a live assignment. Only transitions out of 'assigned' — a
-   * double-decline or a claim racing a decline resolves to a single
-   * winner, never a contradictory state.
-   */
-  decideAssignment(
-    assignmentId: number,
-    status: 'accepted' | 'declined' | 'expired',
-    now: number,
-  ): boolean {
-    const res = this.db
-      .prepare(
-        `UPDATE job_assignments SET status = ?, decided_at = ?
-         WHERE id = ? AND status = 'assigned'`,
-      )
-      .run(status, now, assignmentId);
-    return res.changes > 0;
-  }
-
-  /**
-   * Expire every live assignment past its window. Returns the expired
-   * rows so the caller can advance each job (next round or open board).
-   * Runs lazily on the dispatch read/write paths — no cron needed.
-   */
-  sweepExpiredAssignments(now: number): JobAssignment[] {
-    return this.txn(() => {
-      const rows = this.db
-        .prepare(
-          `SELECT * FROM job_assignments
-           WHERE status = 'assigned' AND expires_at <= ?`,
-        )
-        .all(now) as Record<string, unknown>[];
-      if (rows.length === 0) return [];
-      this.db
-        .prepare(
-          `UPDATE job_assignments SET status = 'expired', decided_at = ?
-           WHERE status = 'assigned' AND expires_at <= ?`,
-        )
-        .run(now, now);
-      // The SELECT ran before the UPDATE: stamp the returned rows with
-      // the status the caller will act on.
-      return rows.map((r) =>
-        this.rowToAssignment({ ...r, status: 'expired', decided_at: now }),
-      );
-    });
-  }
-
-  /** Mark a job as open-board (directed dispatch exhausted or skipped). */
-  setDispatchOpen(jobId: number, now: number): void {
-    this.db
-      .prepare(
-        'INSERT OR REPLACE INTO job_dispatch (job_id, mode, opened_at) VALUES (?, ?, ?)',
-      )
-      .run(jobId, 'open', now);
-  }
-
-  /** 'open' once the job fell back to the board; 'directed' otherwise. */
-  getDispatchMode(jobId: number): 'directed' | 'open' {
-    const row = this.db
-      .prepare('SELECT mode FROM job_dispatch WHERE job_id = ?')
-      .get(jobId) as { mode: string } | undefined;
-    return row?.mode === 'open' ? 'open' : 'directed';
-  }
-
-  /**
-   * Open assignments for one worker wallet (the "wake up, you have work"
-   * view): live assignments joined to their listings, soonest-expiring
-   * first.
-   */
-  openAssignmentsForWorker(wallet: string): {
-    assignment: JobAssignment;
-    job: JobListing;
-  }[] {
-    let addr: string;
-    try {
-      addr = getAddress(wallet);
-    } catch {
-      return [];
-    }
-    const rows = this.db
-      .prepare(
-        `SELECT a.* FROM job_assignments a
-         JOIN job_listings l ON l.id = a.job_id
-         WHERE a.worker_wallet = ? AND a.status = 'assigned' AND l.state = 'open'
-         ORDER BY a.expires_at ASC`,
-      )
-      .all(addr) as Record<string, unknown>[];
-    const out: { assignment: JobAssignment; job: JobListing }[] = [];
-    for (const r of rows) {
-      const job = this.getJob(r.job_id as number);
-      if (job) out.push({ assignment: this.rowToAssignment(r), job });
-    }
-    return out;
-  }
-
   /** claimed -> submitted (worker deliverable hash + uri; offchain, no tx). */
   submitJob(
     id: number,
@@ -1102,9 +501,9 @@ export class JobsDb {
     return this.transition(id, ['claimed'], 'submitted', now, () => {
       this.db
         .prepare(
-          'UPDATE job_listings SET submission_hash = ?, submission_uri = ?, submitted_at = ? WHERE id = ?',
+          'UPDATE job_listings SET submission_hash = ?, submission_uri = ? WHERE id = ?',
         )
-        .run(submissionHash, submissionUri, now, id);
+        .run(submissionHash, submissionUri, id);
     });
   }
 
@@ -1351,73 +750,6 @@ export class JobsDb {
       enrolledAt: row.enrolled_at as number,
       lastVerifiedAt: row.last_verified_at as number,
     };
-  }
-
-  // ---- agent avatar snapshots (the agent's canonical face) ----
-
-  /**
-   * Store (or overwrite) an agent's avatar snapshot. INSERT OR REPLACE =
-   * latest face wins when a holder re-pairs a different seat.
-   */
-  saveAvatar(o: {
-    wallet: Address;
-    agentId: string;
-    seatTokenId: string;
-    imageBytes: Buffer;
-    contentType: string;
-    now: number;
-  }): void {
-    this.db
-      .prepare(
-        `INSERT OR REPLACE INTO agent_avatars
-           (wallet, agent_id, seat_token_id, image_bytes, content_type, snapshot_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        getAddress(o.wallet),
-        o.agentId,
-        o.seatTokenId,
-        o.imageBytes,
-        o.contentType,
-        o.now,
-      );
-  }
-
-  getAvatar(wallet: string): AgentAvatar | null {
-    let addr: string;
-    try {
-      addr = getAddress(wallet);
-    } catch {
-      return null;
-    }
-    const row = this.db
-      .prepare('SELECT * FROM agent_avatars WHERE wallet = ?')
-      .get(addr) as Record<string, unknown> | undefined;
-    if (!row) return null;
-    return {
-      wallet: row.wallet as Address,
-      agentId: row.agent_id as string,
-      seatTokenId: row.seat_token_id as string,
-      // node:sqlite returns BLOB columns as Uint8Array — normalize to
-      // Buffer so the AgentAvatar contract holds at runtime.
-      imageBytes: Buffer.from(row.image_bytes as Uint8Array),
-      contentType: row.content_type as string,
-      snapshotAt: row.snapshot_at as number,
-    };
-  }
-
-  /** Existence check without loading the (possibly large) image bytes. */
-  hasAvatar(wallet: string): boolean {
-    let addr: string;
-    try {
-      addr = getAddress(wallet);
-    } catch {
-      return false;
-    }
-    const row = this.db
-      .prepare('SELECT wallet FROM agent_avatars WHERE wallet = ?')
-      .get(addr) as { wallet: string } | undefined;
-    return !!row;
   }
 
   // ---- verification panels (advisory only) ----

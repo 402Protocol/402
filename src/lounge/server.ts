@@ -347,41 +347,6 @@ export function createLoungeApp(
     return c.json({ events: db.recentJobActivity(limit) });
   });
 
-  // ---- rekt ticker (Nado liquidation spectacle feed) ----
-
-  app.get('/rekt', (c) => {
-    const limitRaw = parseInt(c.req.query('limit') ?? '30', 10);
-    const limit =
-      Number.isSafeInteger(limitRaw) && limitRaw > 0
-        ? Math.min(limitRaw, 100)
-        : 30;
-    const stats = db.rektStats24h();
-    return c.json({
-      events: db.recentRektEvents(limit).map((e) => ({
-        id: e.id,
-        ticker: e.ticker,
-        side: e.side,
-        price: e.price,
-        notional_usd: e.notionalUsd,
-        ts: e.ts,
-      })),
-      stats: {
-        total_usd_24h: stats.totalUsd24h,
-        count_24h: stats.count24h,
-        longs_24h: stats.longs24h,
-        shorts_24h: stats.shorts24h,
-        biggest: stats.biggest
-          ? {
-              ticker: stats.biggest.ticker,
-              side: stats.biggest.side,
-              notional_usd: stats.biggest.notionalUsd,
-            }
-          : null,
-      },
-      as_of: Math.floor(Date.now() / 1000),
-    });
-  });
-
   app.post('/name-claim', async (c) => {
     const parsed = await readBody(c);
     if (!parsed.ok) return bad(c, parsed.status, parsed.error);

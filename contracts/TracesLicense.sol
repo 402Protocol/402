@@ -8,7 +8,6 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {ICreatorToken} from "@creator-token-standards/interfaces/ICreatorToken.sol";
 import {ICreatorTokenLegacy} from "@creator-token-standards/interfaces/ICreatorTokenLegacy.sol";
@@ -24,20 +23,6 @@ interface IIdentityRegistry {
 ///         as a normal NFT drop (e.g. OpenSea); each seat becomes a license
 ///         when paired 1:1 with a canonical ERC-8004 agent identity via
 ///         pairSeat — minting workers, not JPEGs.
-///
-///         Whitelist: Quotrons terminal-NFT holders (1:1 per terminal) mint
-///         at the whitelist price during the whitelist window by proving
-///         inclusion in a Merkle root built from a SURPRISE snapshot of
-///         Robinhood Chain at a past block. Unclaimed whitelist allocation
-///         rolls into the public sale automatically (shared 10k supply).
-///
-///         License integrity: pairings auto-clear when a seat transfers, so
-///         the license always follows the token holder. repairSeat carries
-///         a 72h cooldown so one seat cannot serially license unlimited
-///         agents. Job-board integrations MUST additionally check that the
-///         same wallet owns both the seat and the agent identity
-///         (agentToSeat != 0 alone is not sufficient — agent identities are
-///         transferable ERC-721s).
 /// @dev Non-upgradeable by design (same posture as AgentEscrow).
 ///      ERC-721C-compatible transfer gating via ERC721CCompat (see its docs
 ///      for why the Limit Break contracts are not inherited directly).
@@ -57,11 +42,6 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
     uint256 public constant TEAM_SUPPLY = 100;
     /// @notice ERC-2981 royalty: 5% to treasury.
     uint96 public constant ROYALTY_BPS = 500;
-    /// @notice Cooldown between repairSeat calls on the same seat. Kills
-    ///         license multiplexing (one seat serially licensing N agents)
-    ///         while staying invisible to legitimate secondhand buyers, who
-    ///         pair once via pairSeat after auto-clear.
-    uint256 public constant REPAIR_COOLDOWN = 72 hours;
 
     /// @notice ERC-8004 Identity Registry seats pair against.
     /// @dev Immutable, set at deploy. On Ink mainnet this is
@@ -85,14 +65,6 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
     error ZeroAddress();
     error NotSeatOwner();
     error NoPairingChange();
-    error InvalidProof();
-    error TerminalAlreadyClaimed();
-    error WhitelistNotActive();
-    error WhitelistPhaseActive();
-    error WhitelistLocked();
-    error InvalidWindow();
-    error RepairCooldown();
-    error RegistryNotContract();
 
     // ------------------------------------------------------------------------
     // Events
@@ -100,18 +72,9 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
 
     event SeatPaired(uint256 indexed tokenId, uint256 indexed agentId, address indexed to);
     event SeatRepaired(uint256 indexed tokenId, uint256 indexed oldAgentId, uint256 indexed newAgentId);
-    /// @notice Emitted when a seat transfer auto-clears its pairing. The
-    ///         license follows the token: the seller's agent is unpaired and
-    ///         the buyer's seat arrives clean.
-    event SeatUnpaired(uint256 indexed tokenId, uint256 indexed agentId);
     event PriceUpdated(uint256 oldPrice, uint256 newPrice);
-    event WhitelistPriceUpdated(uint256 oldPrice, uint256 newPrice);
-    event WhitelistMerkleRootUpdated(bytes32 root);
-    event WhitelistWindowUpdated(uint64 start, uint64 end);
-    event WhitelistMint(address indexed to, uint256 indexed terminalId, uint256 indexed tokenId);
     event MintOpenUpdated(bool open);
     event TreasuryUpdated(address oldTreasury, address newTreasury);
-    event BaseURIUpdated(string newBaseURI);
 
     // ------------------------------------------------------------------------
     // State
@@ -121,10 +84,8 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
     IERC20 public immutable paymentToken;
     /// @notice Receives mint payments and ERC-2981 royalties.
     address public treasury;
-    /// @notice Public seat price in payment-token base units (6 decimals on Ink USDC).
+    /// @notice Seat price in payment-token base units (6 decimals on Ink USDC). TBD at deploy.
     uint256 public price;
-    /// @notice Whitelist seat price in payment-token base units.
-    uint256 public whitelistPrice;
     /// @notice Public minting starts closed; founder opens when ready.
     bool public mintOpen;
     /// @notice Next token ID to mint. Starts at 1 (matches metadata numbering).
@@ -132,28 +93,10 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
     /// @notice Team claims used so far (cap: TEAM_SUPPLY).
     uint256 public teamMinted;
 
-    /// @notice Merkle root of the whitelist: leaves are
-    ///         keccak256(bytes.concat(keccak256(abi.encode(wallet, terminalId))))
-    ///         for each (snapshot wallet, Quotrons terminal tokenId) pair.
-    ///         Built from a SURPRISE snapshot of Robinhood Chain at a past
-    ///         block — never announced in advance, so terminals cannot be
-    ///         farmed into fresh wallets ahead of it.
-    bytes32 public whitelistMerkleRoot;
-    /// @notice Whitelist window [start, end]. Zero start = no whitelist
-    ///         configured (plain sale). Set before the window opens; locked
-    ///         once the window starts.
-    uint64 public whitelistStart;
-    uint64 public whitelistEnd;
-    /// @notice Quotrons terminal tokenId => claimed. Each terminal entitles
-    ///         its snapshot holder to exactly one whitelist mint.
-    mapping(uint256 => bool) public terminalClaimed;
-
     /// @notice seat tokenId => paired ERC-8004 agentId (0 = unpaired).
     mapping(uint256 => uint256) public seatToAgent;
     /// @notice ERC-8004 agentId => seat tokenId (0 = unpaired; one seat per identity).
     mapping(uint256 => uint256) public agentToSeat;
-    /// @notice seat tokenId => timestamp of the last repairSeat call.
-    mapping(uint256 => uint256) public lastRepairAt;
 
     string private _baseTokenURI;
 
@@ -165,18 +108,15 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
         address initialOwner,
         address paymentToken_,
         address treasury_,
-        uint256 whitelistPrice_,
-        uint256 publicPrice_,
+        uint256 initialPrice,
         string memory baseURI_,
         address identityRegistry_
     ) ERC721("TRACES", "TRACES") Ownable(initialOwner) {
         if (paymentToken_ == address(0) || treasury_ == address(0)) revert ZeroAddress();
         if (identityRegistry_ == address(0)) revert ZeroAddress();
-        if (identityRegistry_.code.length == 0) revert RegistryNotContract();
         paymentToken = IERC20(paymentToken_);
         treasury = treasury_;
-        whitelistPrice = whitelistPrice_;
-        price = publicPrice_;
+        price = initialPrice;
         _baseTokenURI = baseURI_;
         IDENTITY_REGISTRY = IIdentityRegistry(identityRegistry_);
         _setDefaultRoyalty(treasury_, ROYALTY_BPS);
@@ -188,64 +128,30 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
     // ------------------------------------------------------------------------
 
     /**
-     * @notice Mint one seat to `to` at the public price. No identity needed:
-     *         this is a normal NFT sale (e.g. an OpenSea drop). Pairing
-     *         happens later via pairSeat on the 402 site.
-     * @dev Reverts during the whitelist window — whitelist claimants use
-     *      whitelistMint; everyone else waits for the public phase. After
-     *      the window ends, unclaimed whitelist allocation is simply part
-     *      of the remaining public supply (shared 10k cap).
-     *      The payer (msg.sender) may differ from the recipient: a human
+     * @notice Mint one seat to `to`. No identity needed: this is a normal
+     *         NFT sale (e.g. an OpenSea drop). Pairing happens later via
+     *         pairSeat on the 402 site.
+     * @dev The payer (msg.sender) may differ from the recipient: a human
      *      pays, the agent's wallet receives.
      */
     function mint(address to) external nonReentrant {
         if (!mintOpen) revert MintClosed();
-        _requirePublicPhase();
         uint256 tokenId = _prepareMint(to, 1);
         paymentToken.safeTransferFrom(msg.sender, treasury, price);
         _mintSeat(to, tokenId);
     }
 
     /**
-     * @notice Mint `n` seats to `to` in one transaction (public phase only).
+     * @notice Mint `n` seats to `to` in one transaction.
      */
     function mintBatch(address to, uint256 n) external nonReentrant {
         if (!mintOpen) revert MintClosed();
-        _requirePublicPhase();
         if (n == 0) revert EmptyBatch();
         uint256 firstId = _prepareMint(to, n);
         paymentToken.safeTransferFrom(msg.sender, treasury, price * n);
         for (uint256 i = 0; i < n; ++i) {
             _mintSeat(to, firstId + i);
         }
-    }
-
-    /**
-     * @notice Whitelist mint: one seat at the whitelist price for a Quotrons
-     *         terminal holder. The caller proves they held `terminalId` at
-     *         the snapshot block via a Merkle proof against
-     *         whitelistMerkleRoot. Each terminal claims exactly once; the
-     *         seat goes to the claiming (snapshot) wallet.
-     * @dev Leaf construction (offchain snapshot script must match):
-     *      keccak256(bytes.concat(keccak256(abi.encode(wallet, terminalId)))),
-     *      with OpenZeppelin sorted-pair hashing up the tree.
-     */
-    function whitelistMint(uint256 terminalId, bytes32[] calldata proof) external nonReentrant {
-        if (!mintOpen) revert MintClosed();
-        if (
-            whitelistStart == 0 ||
-            block.timestamp < whitelistStart ||
-            block.timestamp > whitelistEnd
-        ) revert WhitelistNotActive();
-        if (terminalClaimed[terminalId]) revert TerminalAlreadyClaimed();
-        bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(msg.sender, terminalId))));
-        if (!MerkleProof.verify(proof, whitelistMerkleRoot, leaf)) revert InvalidProof();
-        terminalClaimed[terminalId] = true;
-
-        uint256 tokenId = _prepareMint(msg.sender, 1);
-        paymentToken.safeTransferFrom(msg.sender, treasury, whitelistPrice);
-        _mintSeat(msg.sender, tokenId);
-        emit WhitelistMint(msg.sender, terminalId, tokenId);
     }
 
     /**
@@ -271,9 +177,7 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
      *         and the agent must not already be paired to another seat.
      * @dev This is the license activation step. Buy the NFT anywhere
      *      (OpenSea drop, secondary); bring it here to make it a license.
-     *      Seats arrive unpaired after any transfer (pairings auto-clear),
-     *      so secondhand buyers activate with pairSeat directly. To change
-     *      an existing pairing on a seat you still hold, use repairSeat.
+     *      To change an existing pairing, use repairSeat instead.
      */
     function pairSeat(uint256 tokenId, uint256 agentId) external {
         address seatOwner = ownerOf(tokenId);
@@ -286,24 +190,20 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
     }
 
     /**
-     * @notice Re-pair a seat you hold to a different agent. The new agent
-     *         must be owned by the caller and unpaired. Carries a 72h
-     *         cooldown per seat: one seat cannot be serially rotated across
-     *         unlimited agents to multiplex licenses.
-     * @dev Also works on a never-paired seat (equivalent to pairSeat).
-     *      The license always follows the token holder.
+     * @notice Re-pair a seat to a different agent. Only the seat holder can
+     *         call this; the new agent must be owned by the caller and unpaired.
+     * @dev The secondary-market path: after buying a seat secondhand, the
+     *      buyer re-pairs it to their own agent. The old agent's pairing is
+     *      cleared so it can pair with another seat later. Also works on a
+     *      never-paired seat (equivalent to pairSeat). The license always
+     *      follows the token holder.
      */
     function repairSeat(uint256 tokenId, uint256 newAgentId) external {
         address seatOwner = ownerOf(tokenId);
         if (seatOwner != msg.sender) revert NotSeatOwner();
         uint256 oldAgentId = seatToAgent[tokenId];
         if (oldAgentId == newAgentId) revert NoPairingChange();
-        uint256 lastRepair = lastRepairAt[tokenId];
-        if (lastRepair != 0 && block.timestamp < lastRepair + REPAIR_COOLDOWN) {
-            revert RepairCooldown();
-        }
         _checkPairing(msg.sender, newAgentId);
-        lastRepairAt[tokenId] = block.timestamp;
         if (oldAgentId != 0) {
             agentToSeat[oldAgentId] = 0;
         }
@@ -322,15 +222,6 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
         firstTokenId = nextTokenId;
         if (firstTokenId + n - 1 > MAX_SUPPLY) revert MaxSupplyReached();
         if (balanceOf(to) + n > MAX_PER_WALLET) revert WalletCapExceeded();
-    }
-
-    /// @dev Public mints are closed before the whitelist window opens and
-    ///      restricted to whitelistMint during it. No window configured
-    ///      (start == 0) means a plain sale with no whitelist phase.
-    function _requirePublicPhase() internal view {
-        if (whitelistStart == 0) return;
-        if (block.timestamp < whitelistStart) revert MintClosed();
-        if (block.timestamp <= whitelistEnd) revert WhitelistPhaseActive();
     }
 
     /// @dev The caller must own `agentId` in the Identity Registry and the
@@ -354,32 +245,6 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
         price = newPrice;
     }
 
-    /// @dev Whitelist params lock once the window starts: no moving the
-    ///      goalposts mid-sale.
-    function _requireWhitelistNotStarted() internal view {
-        if (whitelistStart != 0 && block.timestamp >= whitelistStart) revert WhitelistLocked();
-    }
-
-    function setWhitelistPrice(uint256 newPrice) external onlyOwner {
-        _requireWhitelistNotStarted();
-        emit WhitelistPriceUpdated(whitelistPrice, newPrice);
-        whitelistPrice = newPrice;
-    }
-
-    function setWhitelistMerkleRoot(bytes32 root) external onlyOwner {
-        _requireWhitelistNotStarted();
-        whitelistMerkleRoot = root;
-        emit WhitelistMerkleRootUpdated(root);
-    }
-
-    function setWhitelistWindow(uint64 start, uint64 end) external onlyOwner {
-        _requireWhitelistNotStarted();
-        if (start == 0 || end <= start) revert InvalidWindow();
-        whitelistStart = start;
-        whitelistEnd = end;
-        emit WhitelistWindowUpdated(start, end);
-    }
-
     function setMintOpen(bool open) external onlyOwner {
         emit MintOpenUpdated(open);
         mintOpen = open;
@@ -390,13 +255,6 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
         emit TreasuryUpdated(treasury, newTreasury);
         treasury = newTreasury;
         _setDefaultRoyalty(newTreasury, ROYALTY_BPS);
-    }
-
-    /// @notice Update the metadata base URI (e.g. if the deploy-time CID was
-    ///         wrong). Owner-only; emits for indexer visibility.
-    function setBaseURI(string memory newBaseURI) external onlyOwner {
-        _baseTokenURI = newBaseURI;
-        emit BaseURIUpdated(newBaseURI);
     }
 
     function _requireCanSetValidator() internal view override {
@@ -429,11 +287,8 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
             super.supportsInterface(interfaceId);
     }
 
-    /// @dev OZ v5 transfer hook: on real transfers the seat's pairing is
-    ///      auto-cleared FIRST, so the license always follows the token
-    ///      holder — no stale seller pairings, no buyer repair step. Then
-    ///      the transfer is gated through the ERC-721C validator.
-    ///      Mints/burns are never gated (reference semantics).
+    /// @dev OZ v5 transfer hook: gate real transfers through the ERC-721C
+    ///      validator. Mints/burns are never gated (reference semantics).
     function _update(address to, uint256 tokenId, address auth)
         internal
         override(ERC721, ERC721Enumerable)
@@ -441,12 +296,6 @@ contract TracesLicense is ERC721, ERC721Enumerable, ERC2981, Ownable, Reentrancy
     {
         from = super._update(to, tokenId, auth);
         if (from != address(0) && to != address(0)) {
-            uint256 agentId = seatToAgent[tokenId];
-            if (agentId != 0) {
-                seatToAgent[tokenId] = 0;
-                agentToSeat[agentId] = 0;
-                emit SeatUnpaired(tokenId, agentId);
-            }
             _validateTransferWithValidator(_msgSender(), from, to, tokenId);
         }
         return from;

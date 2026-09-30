@@ -77,8 +77,6 @@ import {
   type Invoice,
 } from '../invoice.js';
 import { LOUNGE_DOMAIN, LOUNGE_TYPES, verifyLoungeSignature } from '../lounge/signing.js';
-import { INK_CONFIG } from '../facilitator/chains.js';
-import { signAuthorization } from '../facilitator/eip3009.js';
 import { findUsdcTransfers, latestBlock } from '../settle.js';
 import {
   BOUNTY_ESCROW_ADDRESS,
@@ -102,13 +100,6 @@ export interface McpConfig {
   invoiceSignerKey?: Hex;
   /** Optional author key for the lounge_post tool. Env only. */
   loungeSignerKey?: Hex;
-  /**
-   * Optional agent key for the relay pay-per-call tools (oracle_price,
-   * oracle_gas). The key signs the RelayAuth challenge AND the EIP-3009
-   * payment authorization — real USDC moves when these tools run against a
-   * live facilitator. Env only, never a tool argument.
-   */
-  agentKey?: Hex;
 }
 
 function cleanUrl(v: string | undefined, fallback: string): string {
@@ -130,7 +121,6 @@ export function loadMcpConfig(
     inkRpcUrl: (env.FOUR02_INK_RPC_URL ?? INK_RPC_URL).trim() || INK_RPC_URL,
     invoiceSignerKey: key(env.FOUR02_MCP_INVOICE_KEY),
     loungeSignerKey: key(env.FOUR02_MCP_LOUNGE_KEY),
-    agentKey: key(env.FOUR02_MCP_AGENT_KEY),
   };
 }
 
@@ -285,116 +275,6 @@ export function createMcpServer(config: McpConfig): McpServer {
         return errorResult('facilitator unreachable', (e as Error).message);
       }
     },
-  );
-
-  // ---- relay pay-per-call (agent pays, agent gets data) ----
-
-  /**
-   * Full agent-authenticated relay flow for one resource: RelayAuth sign →
-   * /relay/quote → EIP-3009 sign → /relay/execute → paid data. The agent
-   * key signs both messages; the server settles and pays gas. No API key.
-   */
-  async function relayPaidCall(
-    resource: 'oracle-price' | 'oracle-gas',
-    params: Record<string, unknown>,
-  ): Promise<ReturnType<typeof textResult>> {
-    if (!config.agentKey) {
-      return errorResult(
-        'agent key not configured',
-        'Set FOUR02_MCP_AGENT_KEY to the agent wallet private key to use relay pay-per-call tools. Real USDC moves on each call.',
-      );
-    }
-    const agent = privateKeyToAccount(config.agentKey);
-    const signRelayAuth = (action: 'relay-quote' | 'relay-execute', timestamp: bigint) =>
-      agent.signTypedData({
-        domain: { ...LOUNGE_DOMAIN },
-        types: LOUNGE_TYPES,
-        primaryType: 'RelayAuth',
-        message: {
-          agent: agent.address,
-          action,
-          resource,
-          params: JSON.stringify(params),
-          timestamp,
-        },
-      });
-    try {
-      const quoteTs = BigInt(Math.floor(Date.now() / 1000));
-      const quote = await postJson(`${config.facilitatorUrl}/relay/quote`, {
-        resource,
-        params,
-        agent: agent.address,
-        timestamp: quoteTs.toString(),
-        signature: await signRelayAuth('relay-quote', quoteTs),
-      });
-      if (quote.status !== 200) {
-        return errorResult('relay quote failed', JSON.stringify(quote.json).slice(0, 500));
-      }
-      const q = quote.json as {
-        requirements: { payTo?: string; amount?: string; maxTimeoutSeconds?: number };
-        typedData: {
-          domain: never;
-          types: never;
-          primaryType: 'TransferWithAuthorization';
-          message: {
-            from: Address;
-            to: Address;
-            value: string;
-            validAfter: string;
-            validBefore: string;
-            nonce: Hex;
-          };
-        };
-      };
-      const exact = await signAuthorization(INK_CONFIG, config.agentKey, {
-        from: getAddress(q.typedData.message.from),
-        to: getAddress(q.typedData.message.to),
-        value: BigInt(q.typedData.message.value),
-        validAfter: BigInt(q.typedData.message.validAfter),
-        validBefore: BigInt(q.typedData.message.validBefore),
-        nonce: q.typedData.message.nonce,
-      });
-      const execTs = BigInt(Math.floor(Date.now() / 1000));
-      const exec = await postJson(`${config.facilitatorUrl}/relay/execute`, {
-        paymentPayload: { x402Version: 2, accepted: q.requirements, payload: exact },
-        resource,
-        params,
-        agent: agent.address,
-        timestamp: execTs.toString(),
-        signature: await signRelayAuth('relay-execute', execTs),
-      });
-      return textResult({
-        ok: exec.status === 200,
-        httpStatus: exec.status,
-        ...(exec.json as Record<string, unknown>),
-      });
-    } catch (e) {
-      return errorResult(`${resource} relay failed`, (e as Error).message);
-    }
-  }
-
-  server.registerTool(
-    'oracle_price',
-    {
-      description:
-        'Buy the current ETH/BTC/USDC price from the 402 oracle: your agent wallet (FOUR02_MCP_AGENT_KEY) signs the RelayAuth challenge and the EIP-3009 USDC authorization, the facilitator settles 0.001 USDC on Ink and pays gas, and the paid price comes back in the response. No API key, no account. Fails without FOUR02_MCP_AGENT_KEY.',
-      inputSchema: {
-        symbol: z
-          .enum(['ETH', 'BTC', 'USDC'])
-          .default('ETH')
-          .describe('Token symbol to price'),
-      },
-    },
-    async (args) => relayPaidCall('oracle-price', { symbol: args.symbol }),
-  );
-
-  server.registerTool(
-    'oracle_gas',
-    {
-      description:
-        'Buy the current Ink gas price from the 402 oracle via the same agent-authenticated relay flow as oracle_price: your agent wallet signs, the facilitator settles 0.001 USDC and pays gas, and the paid gas price comes back in the response. Fails without FOUR02_MCP_AGENT_KEY.',
-    },
-    async () => relayPaidCall('oracle-gas', {}),
   );
 
   // ---- invoices ----
@@ -1194,7 +1074,6 @@ export function createMcpServer(config: McpConfig): McpServer {
                 requester,
                 title: args.title,
                 spec: args.spec,
-                specPrivate: args.specPrivate === true,
                 category,
                 bountyUsdc: args.bountyUsdc,
                 deadline: deadline.toString(),
@@ -1202,7 +1081,7 @@ export function createMcpServer(config: McpConfig): McpServer {
                 timestamp: '<set at signing time: unix seconds, must be within ±5 min of now>',
               },
             },
-            note: 'Sign the typed data above with YOUR key (EIP-712, deadline as uint256). The signature must cover the EXACT title/spec/specPrivate/category/bountyUsdc/deadline/termsHash echoed here.',
+            note: 'Sign the typed data above with YOUR key (EIP-712, deadline as uint256). The signature must cover the EXACT title/spec/category/bountyUsdc/deadline/termsHash echoed here.',
             next: 'Send both calls IN ORDER with your own key (approve first, then createBounty), wait for confirmation, then call jobs_post again with { requester, title, spec, category, bountyUsdc, deadline, termsHash, timestamp, signature, txHash } (txHash = the createBounty tx).',
           });
         }
@@ -1239,7 +1118,6 @@ export function createMcpServer(config: McpConfig): McpServer {
             requester,
             title: args.title,
             spec: args.spec,
-            specPrivate: args.specPrivate === true,
             category,
             bountyUsdc: args.bountyUsdc,
             deadline: BigInt(deadline),

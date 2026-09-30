@@ -66,7 +66,6 @@ export const LOUNGE_TYPES: Record<string, { name: string; type: string }[]> = {
     { name: 'requester', type: 'address' },
     { name: 'title', type: 'string' },
     { name: 'spec', type: 'string' },
-    { name: 'specPrivate', type: 'bool' },
     { name: 'category', type: 'string' },
     { name: 'bountyUsdc', type: 'string' },
     { name: 'deadline', type: 'uint256' },
@@ -101,15 +100,6 @@ export const LOUNGE_TYPES: Record<string, { name: string; type: string }[]> = {
     { name: 'accessor', type: 'address' },
     { name: 'timestamp', type: 'uint256' },
   ],
-  // Gated read of a worker's submission: the accessor signs the exact job
-  // id they claim the right to read. The server then checks the accessor is
-  // the requester or the claimed worker — the signature alone proves
-  // nothing about authorization, only about who is asking.
-  JobSubmissionAccess: [
-    { name: 'jobId', type: 'uint256' },
-    { name: 'accessor', type: 'address' },
-    { name: 'timestamp', type: 'uint256' },
-  ],
   // Verification-panel review attestation: an assigned reviewer signs
   // their verdict (bool accept) and score (0-100) for a job in_review.
   // The server checks the signer is an actively assigned reviewer —
@@ -120,28 +110,6 @@ export const LOUNGE_TYPES: Record<string, { name: string; type: string }[]> = {
     { name: 'agentId', type: 'uint256' },
     { name: 'verdict', type: 'bool' },
     { name: 'score', type: 'uint8' },
-    { name: 'timestamp', type: 'uint256' },
-  ],
-  // Directed dispatch: the assigned worker declines an assignment. The
-  // server checks the signer is the currently assigned worker for the job —
-  // the signature alone proves nothing about assignment.
-  JobDecline: [
-    { name: 'jobId', type: 'uint256' },
-    { name: 'worker', type: 'address' },
-    { name: 'timestamp', type: 'uint256' },
-  ],
-  // Relay auth: an agent proves its wallet to use the settlement relay
-  // (POST /relay/quote, POST /relay/execute) without the operator API key.
-  // action is 'relay-quote' or 'relay-execute'; resource is the pay-per-call
-  // resource ('oracle-price', 'oracle-gas', 'demo-data'); params is the
-  // JSON of the resource params (e.g. '{"symbol":"ETH"}'). The signature
-  // proves who is asking — the payment signature itself is what moves money,
-  // and the agent may only relay payments where it is the payer.
-  RelayAuth: [
-    { name: 'agent', type: 'address' },
-    { name: 'action', type: 'string' },
-    { name: 'resource', type: 'string' },
-    { name: 'params', type: 'string' },
     { name: 'timestamp', type: 'uint256' },
   ],
 };
@@ -178,9 +146,7 @@ export async function verifyLoungeSignature(opts: {
     | 'JobSubmit'
     | 'JobDecision'
     | 'JobSpecAccess'
-    | 'JobSubmissionAccess'
-    | 'ReviewAttestation'
-    | 'JobDecline';
+    | 'ReviewAttestation';
   message: Record<string, unknown>;
   signature: string;
   author: string;

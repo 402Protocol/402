@@ -63,10 +63,8 @@ function sameAddress(a: string, b: string): boolean {
 /**
  * The resource server tells the facilitator what it required; the payload
  * carries what the payer accepted. They must agree on the money fields.
- * Exported for the settlement relay, which rebuilds canonical requirements
- * server-side and refuses payloads that don't match them.
  */
-export function acceptedMatchesRequirements(
+function acceptedMatchesRequirements(
   accepted: PaymentRequirements,
   required: PaymentRequirements,
 ): boolean {

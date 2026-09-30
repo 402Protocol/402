@@ -52,8 +52,7 @@ contract TracesForkRehearsalTest is Test {
 
         address buyer = vm.addr(0xBEEF1234);
         address treasury = address(0xCAFE);
-        uint256 wlPrice = 10_000_000; // $10 whitelist
-        uint256 price = 12_000_000; // $12 public for the rehearsal (scaled here)
+        uint256 price = 1_000_000; // 1 USDC for the rehearsal
 
         vm.deal(buyer, 10 ether);
         deal(INK_USDC, buyer, 100_000_000); // 100 real Ink USDC on the fork
@@ -63,7 +62,6 @@ contract TracesForkRehearsalTest is Test {
             buyer,
             INK_USDC,
             treasury,
-            wlPrice,
             price,
             "ipfs://bafybeidhdxryx66t3sbrgnuagwtjjjteiddavvm55474sshyyh5tfnclxe/",
             IDENTITY_REGISTRY

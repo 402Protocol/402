@@ -230,37 +230,6 @@ export function defaultVerifySeatPairing(
   };
 }
 
-/**
- * Resolve an agent's TRACES seat token id from the onchain registry's
- * agentToSeat mapping. Used by the public Agents directory to show each
- * worker's seat NFT (the seat lives in the owner's wallet, not the worker
- * wallet — the link is the registry pairing, same read the seat gate
- * uses). Fail-soft by design: any failure (RPC down, bad agent id, no
- * pairing) returns null instead of throwing — a public directory must
- * never 503 because a thumbnail lookup failed. Read live, never from DB.
- */
-export type ResolveAgentSeat = (agentId: string) => Promise<string | null>;
-
-export function defaultResolveAgentSeat(
-  rpcUrl: string,
-  seatContract: Address,
-): ResolveAgentSeat {
-  const client = createPublicClient({ chain: ink, transport: http(rpcUrl) });
-  return async (agentId: string) => {
-    try {
-      const seat: bigint = await client.readContract({
-        address: seatContract,
-        abi: SEAT_PAIRING_ABI,
-        functionName: 'agentToSeat',
-        args: [BigInt(agentId)],
-      });
-      return seat === 0n ? null : seat.toString();
-    } catch {
-      return null;
-    }
-  };
-}
-
 export function defaultIdentityOwner(rpcUrl: string): IdentityOwner {
   const client = createPublicClient({ chain: ink, transport: http(rpcUrl) });
   return async (agentId: bigint) => {

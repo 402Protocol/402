@@ -177,7 +177,6 @@ async function postFixtureJob(): Promise<number> {
     requester: requester.address,
     title: 'Explainer post',
     spec,
-    specPrivate: false,
     category: 'writing',
     bountyUsdc: '25.00',
     deadline: BigInt(deadline),
@@ -221,7 +220,7 @@ const jobId = await postFixtureJob();
 
 // ---- the tests ----
 
-await check('lists all 18 tools including the eight jobs_* tools', async () => {
+await check('lists all 16 tools including the eight jobs_* tools', async () => {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
@@ -239,8 +238,6 @@ await check('lists all 18 tools including the eight jobs_* tools', async () => {
     'jobs_withdraw',
     'lounge_feed',
     'lounge_post',
-    'oracle_gas',
-    'oracle_price',
     'wallet_create',
     'wallet_verify_backup',
   ]);
@@ -439,7 +436,6 @@ await check('jobs_post plan mode returns exact onchain calls', async () => {
   assert.equal(typed.domain.name, '402 Lounge');
   assert.equal(typed.message.title, 'Agent CLI helper');
   assert.equal(typed.message.spec, spec2);
-  assert.equal(typed.message.specPrivate, false);
   assert.equal(typed.message.bountyUsdc, '3.50');
   assert.equal(typed.message.termsHash, expectedTerms);
 });
@@ -531,7 +527,6 @@ await check('jobs_post mirror mode posts the funded bounty', async () => {
     requester: requester.address,
     title: 'Agent README',
     spec: AGENT_POST_SPEC,
-    specPrivate: false,
     category: 'writing',
     bountyUsdc: '3.50',
     deadline: BigInt(AGENT_POST_DEADLINE),
@@ -599,7 +594,6 @@ await check('jobs_post mirror rejects termsHash mismatch', async () => {
     requester: requester.address,
     title: 'Agent README',
     spec: AGENT_POST_SPEC,
-    specPrivate: false,
     category: 'writing',
     bountyUsdc: '3.50',
     deadline: BigInt(AGENT_POST_DEADLINE),

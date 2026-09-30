@@ -15,7 +15,6 @@
 import { type Address, getAddress, isAddress, parseUnits } from 'viem';
 import { INK_RPC_URL, USDC_DECIMALS } from '../constants.js';
 import { REPUTATION_REGISTRY } from './escrow.js';
-import { DEFAULT_IPFS_GATEWAY } from './avatars.js';
 
 export interface JobsConfig {
   /** BountyEscrow contract address on Ink. */
@@ -45,12 +44,6 @@ export interface JobsConfig {
    */
   seatsContract: Address | null;
   /**
-   * IPFS gateway base used to resolve ipfs:// tokenURI/image URIs when
-   * snapshotting seat artwork for agent avatars (FOUR02_IPFS_GATEWAY,
-   * default https://ipfs.io/ipfs/). Optional — unset keeps the default.
-   */
-  ipfsGateway: string;
-  /**
    * Max concurrently active (claimed/submitted/disputed) jobs one seat may
    * back (JOBS_SEAT_MAX_ACTIVE_JOBS, default 1). The seat is the license:
    * one license, one active job. Per-seat accounting is the real
@@ -71,26 +64,6 @@ export interface JobsConfig {
    * drawn again until this elapses.
    */
   reviewCooldownSeconds: number;
-  /**
-   * Directed-dispatch accept window in seconds
-   * (JOBS_DISPATCH_ACCEPT_WINDOW_SECONDS, default 600 = 10m). The assigned
-   * worker must claim the job onchain within this window, or the
-   * assignment expires and the job goes to the next candidate.
-   */
-  dispatchAcceptWindowSeconds: number;
-  /**
-   * Assignment rounds before a job falls back to the open board
-   * (JOBS_DISPATCH_MAX_ROUNDS, default 3). Each decline/expiry burns one
-   * round; after the last round the job is racable by any enrolled worker.
-   */
-  dispatchMaxRounds: number;
-  /**
-   * Max concurrently active (claimed/submitted/in_review/verified/disputed)
-   * jobs one worker may hold for dispatch selection
-   * (JOBS_DISPATCH_MAX_CONCURRENT_JOBS, default 1). A worker at the cap is
-   * skipped by the assignment engine (it can still finish what it holds).
-   */
-  dispatchMaxConcurrentJobs: number;
 }
 
 /** Default listing fee: free at launch. */
@@ -107,15 +80,6 @@ export const DEFAULT_JOBS_REVIEW_TIMEOUT_SECONDS = 48 * 3600;
 
 /** Default no-show reviewer cooldown: 7 days. */
 export const DEFAULT_JOBS_REVIEW_COOLDOWN_SECONDS = 7 * 86400;
-
-/** Default directed-dispatch accept window: 10 minutes. */
-export const DEFAULT_JOBS_DISPATCH_ACCEPT_WINDOW_SECONDS = 600;
-
-/** Default assignment rounds before open-board fallback: 3. */
-export const DEFAULT_JOBS_DISPATCH_MAX_ROUNDS = 3;
-
-/** Default max concurrently active jobs per worker for dispatch: 1. */
-export const DEFAULT_JOBS_DISPATCH_MAX_CONCURRENT_JOBS = 1;
 
 /** The superseded V1 registry: its writer allowlist is empty, so any resume
  * read against it returns all-zeros. */
@@ -168,13 +132,6 @@ export function loadJobsConfig(
   if (seatsContractRaw && !isAddress(seatsContractRaw)) {
     throw new Error('FOUR02_TRACES_SEAT is not a valid Ethereum address');
   }
-  // Optional IPFS gateway override for avatar snapshots; the default
-  // gateway works with no extra configuration.
-  let ipfsGateway = (env.FOUR02_IPFS_GATEWAY ?? DEFAULT_IPFS_GATEWAY).trim();
-  if (!/^https?:\/\//i.test(ipfsGateway)) {
-    throw new Error('FOUR02_IPFS_GATEWAY must be an http(s) URL');
-  }
-  if (!ipfsGateway.endsWith('/')) ipfsGateway += '/';
   const seatMaxActiveJobsRaw =
     env.JOBS_SEAT_MAX_ACTIVE_JOBS ?? String(DEFAULT_JOBS_SEAT_MAX_ACTIVE_JOBS);
   if (!/^\d+$/.test(seatMaxActiveJobsRaw)) {
@@ -192,21 +149,6 @@ export function loadJobsConfig(
   if (!/^\d+$/.test(reviewCooldownRaw) || parseInt(reviewCooldownRaw, 10) <= 0) {
     throw new Error('JOBS_REVIEW_COOLDOWN_SECONDS must be a positive integer');
   }
-  const dispatchAcceptWindowRaw =
-    env.JOBS_DISPATCH_ACCEPT_WINDOW_SECONDS ?? String(DEFAULT_JOBS_DISPATCH_ACCEPT_WINDOW_SECONDS);
-  if (!/^\d+$/.test(dispatchAcceptWindowRaw) || parseInt(dispatchAcceptWindowRaw, 10) <= 0) {
-    throw new Error('JOBS_DISPATCH_ACCEPT_WINDOW_SECONDS must be a positive integer');
-  }
-  const dispatchMaxRoundsRaw =
-    env.JOBS_DISPATCH_MAX_ROUNDS ?? String(DEFAULT_JOBS_DISPATCH_MAX_ROUNDS);
-  if (!/^\d+$/.test(dispatchMaxRoundsRaw) || parseInt(dispatchMaxRoundsRaw, 10) <= 0) {
-    throw new Error('JOBS_DISPATCH_MAX_ROUNDS must be a positive integer');
-  }
-  const dispatchMaxConcurrentRaw =
-    env.JOBS_DISPATCH_MAX_CONCURRENT_JOBS ?? String(DEFAULT_JOBS_DISPATCH_MAX_CONCURRENT_JOBS);
-  if (!/^\d+$/.test(dispatchMaxConcurrentRaw) || parseInt(dispatchMaxConcurrentRaw, 10) <= 0) {
-    throw new Error('JOBS_DISPATCH_MAX_CONCURRENT_JOBS must be a positive integer');
-  }
   const cfg: JobsConfig = {
     escrow: getAddress(escrow),
     listingFeeUsdc,
@@ -217,13 +159,9 @@ export function loadJobsConfig(
     dailyPostCap,
     seatsRequired,
     seatsContract: seatsContractRaw ? getAddress(seatsContractRaw) : null,
-    ipfsGateway,
     seatMaxActiveJobs,
     reviewTimeoutSeconds: parseInt(reviewTimeoutRaw, 10),
     reviewCooldownSeconds: parseInt(reviewCooldownRaw, 10),
-    dispatchAcceptWindowSeconds: parseInt(dispatchAcceptWindowRaw, 10),
-    dispatchMaxRounds: parseInt(dispatchMaxRoundsRaw, 10),
-    dispatchMaxConcurrentJobs: parseInt(dispatchMaxConcurrentRaw, 10),
   };
   // G5: the V1 registry is SUPERSEDED and its writer allowlist is empty —
   // every reputation summary read against it returns all-zeros, so worker

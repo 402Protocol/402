@@ -38,7 +38,6 @@ import {
   type VerifySeatPairing,
 } from '../src/jobs/escrow.js';
 import { createJobsApp, type JobActivityEvent } from '../src/jobs/server.js';
-import { createJobFeed } from '../src/jobs/feed.js';
 import { LoungeDb } from '../src/lounge/db.js';
 import { createLoungeApp } from '../src/lounge/server.js';
 import { LOUNGE_DOMAIN, LOUNGE_TYPES } from '../src/lounge/signing.js';
@@ -254,7 +253,7 @@ function txHash(seed: string): Hex {
 
 async function sign(
   account: ReturnType<typeof privateKeyToAccount>,
-  primaryType: 'JobEnroll' | 'JobPost' | 'JobClaim' | 'JobSubmit' | 'JobDecision' | 'JobSpecAccess' | 'JobSubmissionAccess',
+  primaryType: 'JobEnroll' | 'JobPost' | 'JobClaim' | 'JobSubmit' | 'JobDecision' | 'JobSpecAccess',
   message: Record<string, unknown>,
 ): Promise<Hex> {
   return account.signTypedData({
@@ -295,7 +294,6 @@ function jobPostFields(over: Record<string, unknown> = {}) {
     deadline: deadline.toString(),
     termsHash,
     timestamp: nowSec(),
-    specPrivate: false,
     ...over,
   };
 }
@@ -306,7 +304,6 @@ async function signedPost(over: Record<string, unknown> = {}) {
     requester: f.requester,
     title: f.title,
     spec: f.spec,
-    specPrivate: f.specPrivate === true,
     category: f.category,
     bountyUsdc: f.bountyUsdc,
     deadline: BigInt(f.deadline as string),
@@ -2099,26 +2096,6 @@ await check('G4: specPrivate must be a boolean when present', async () => {
   assert.equal(res.body.error, 'invalid_spec_private');
 });
 
-await check('G4: flipping specPrivate in transit invalidates the signature', async () => {
-  // Sign a PRIVATE listing, then flip the flag to public on the wire.
-  const priv = await signedPost({ specPrivate: true, title: 'Tamper target' });
-  const flipToPublic = await postJson(app, '/jobs', {
-    ...priv,
-    specPrivate: false,
-    txHash: txHash('g4-tamper-public'),
-  });
-  assert.equal(flipToPublic.status, 401);
-
-  // And the reverse: sign public, flip to private.
-  const pub = await signedPost({ specPrivate: false, title: 'Tamper target 2' });
-  const flipToPrivate = await postJson(app, '/jobs', {
-    ...pub,
-    specPrivate: true,
-    txHash: txHash('g4-tamper-private'),
-  });
-  assert.equal(flipToPrivate.status, 401);
-});
-
 async function specAccess(
   target: Hono,
   account: ReturnType<typeof privateKeyToAccount>,
@@ -2665,233 +2642,6 @@ await check('seat: idempotent re-claim preserves the stored seat', async () => {
   const c2 = await claimJob(job, AGENT_ID, 'seat-claim-tx-5b', s);
   assert.equal(c2.status, 200);
   assert.equal(db.getJob(job)?.workerSeatId, '11');
-});
-
-// ---- "My Jobs" (GET /jobs/mine) ----
-
-await check('mine: 400 on a malformed wallet', async () => {
-  const res = await getJson(app, '/jobs/mine?wallet=nope');
-  assert.equal(res.status, 400);
-  assert.equal(res.body.error, 'invalid_wallet');
-});
-
-await check('mine: empty for a wallet with no jobs', async () => {
-  const res = await getJson(app, `/jobs/mine?wallet=${stranger.address}`);
-  assert.equal(res.status, 200);
-  assert.deepEqual(res.body.jobs, []);
-});
-
-await check('mine: requester and worker roles', async () => {
-  const jobId = await postFundedJob('mine-1', 9001n);
-  const asRequester = await getJson(app, `/jobs/mine?wallet=${requester.address}`);
-  assert.equal(asRequester.status, 200);
-  const mine = (asRequester.body.jobs as Record<string, unknown>[]).find(
-    (j) => j.id === jobId,
-  );
-  assert.ok(mine, 'posted job appears in /mine');
-  assert.equal(mine.role, 'requester');
-
-  owners.set(AGENT_ID.toString(), worker.address);
-  const er = await enrollWorkerWallet(worker, AGENT_ID);
-  assert.ok(er.status === 201 || er.status === 200);
-  const cr = await claimJob(jobId, AGENT_ID, 'mine-claim-1');
-  assert.equal(cr.status, 200);
-  const asWorker = await getJson(app, `/jobs/mine?wallet=${worker.address}`);
-  assert.equal(asWorker.status, 200);
-  const worked = (asWorker.body.jobs as Record<string, unknown>[]).find(
-    (j) => j.id === jobId,
-  );
-  assert.ok(worked, 'claimed job appears in worker /mine');
-  assert.equal(worked.role, 'worker');
-});
-
-// ---- gated submission read (POST /jobs/:id/submission) ----
-
-async function submissionAccess(
-  target: Hono,
-  account: ReturnType<typeof privateKeyToAccount>,
-  jobId: number,
-  over: Record<string, unknown> = {},
-): Promise<{ status: number; body: Record<string, unknown> }> {
-  const message = {
-    jobId: BigInt(jobId),
-    accessor: account.address,
-    timestamp: BigInt(nowSec()),
-  };
-  const signature = await sign(account, 'JobSubmissionAccess', message);
-  return postJson(target, `/jobs/${jobId}/submission`, {
-    jobId,
-    accessor: account.address,
-    timestamp: Number(message.timestamp),
-    signature,
-    ...over,
-  });
-}
-
-await check('submission gate: 404 on unknown job', async () => {
-  const res = await submissionAccess(app, requester, 999999);
-  assert.equal(res.status, 404);
-});
-
-await check('submission gate: 409 when nothing submitted yet', async () => {
-  const jobId = await postFundedJob('subgate-1', 9101n);
-  const res = await submissionAccess(app, requester, jobId);
-  assert.equal(res.status, 409);
-  assert.equal(res.body.error, 'no_submission');
-});
-
-await check('submission gate: requester and worker can read, stranger 403s, forgeries 401', async () => {
-  const jobId = await postFundedJob('subgate-2', 9102n);
-  owners.set(AGENT_ID.toString(), worker.address);
-  const er = await enrollWorkerWallet(worker, AGENT_ID);
-  assert.ok(er.status === 201 || er.status === 200);
-  const cr = await claimJob(jobId, AGENT_ID, 'subgate-claim-2');
-  assert.equal(cr.status, 200);
-  const sub = await submitDeliverable(jobId);
-  assert.equal(sub.status, 200);
-
-  // public detail still hides the URI while under review
-  const pub = await getJson(app, `/jobs/${jobId}`);
-  assert.equal((pub.body.job as Record<string, unknown>).submissionUri, null);
-
-  // requester -> 200 with uri + hash + submittedAt
-  const r = await submissionAccess(app, requester, jobId);
-  assert.equal(r.status, 200);
-  assert.equal(r.body.submissionUri, 'ipfs://bafytest');
-  assert.equal(r.body.submissionHash, keccak256(toHex('the work')));
-  assert.ok(typeof r.body.submittedAt === 'number');
-
-  // claimed worker -> 200
-  const w = await submissionAccess(app, worker, jobId);
-  assert.equal(w.status, 200);
-  assert.equal(w.body.submissionUri, 'ipfs://bafytest');
-
-  // stranger -> 403
-  const s = await submissionAccess(app, stranger, jobId);
-  assert.equal(s.status, 403);
-  assert.equal(s.body.error, 'not_authorized');
-
-  // wrong signer for the claimed accessor -> 401
-  const message = {
-    jobId: BigInt(jobId),
-    accessor: requester.address,
-    timestamp: BigInt(nowSec()),
-  };
-  const forged = await sign(stranger, 'JobSubmissionAccess', message);
-  const f = await postJson(app, `/jobs/${jobId}/submission`, {
-    jobId,
-    accessor: requester.address,
-    timestamp: Number(message.timestamp),
-    signature: forged,
-  });
-  assert.equal(f.status, 401);
-  assert.equal(f.body.error, 'bad_signature');
-
-  // stale timestamp -> 401
-  const staleMessage = {
-    jobId: BigInt(jobId),
-    accessor: requester.address,
-    timestamp: BigInt(nowSec() - 3600),
-  };
-  const staleSig = await sign(requester, 'JobSubmissionAccess', staleMessage);
-  const st = await postJson(app, `/jobs/${jobId}/submission`, {
-    jobId,
-    accessor: requester.address,
-    timestamp: Number(staleMessage.timestamp),
-    signature: staleSig,
-  });
-  assert.equal(st.status, 401);
-  assert.equal(st.body.error, 'stale_timestamp');
-
-  // signed jobId mismatch -> 400
-  const mm = await submissionAccess(app, requester, jobId, { jobId: jobId + 1 });
-  assert.equal(mm.status, 400);
-  assert.equal(mm.body.error, 'job_id_mismatch');
-});
-
-// ---- live dispatch feed (GET /jobs/stream, server-push) ----
-
-await check('feed: stream opens as SSE with a ready event', async () => {
-  const res = await app.request('/jobs/stream');
-  assert.equal(res.status, 200);
-  assert.ok(
-    (res.headers.get('content-type') || '').includes('text/event-stream'),
-  );
-  const reader = res.body!.getReader();
-  const { value } = await reader.read();
-  const text = new TextDecoder().decode(value);
-  assert.ok(text.includes('event: ready'));
-  await reader.cancel();
-});
-
-await check('feed: job_posted and job_claimed broadcast to subscribers', async () => {
-  const feed = createJobFeed();
-  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
-  feed.subscribe((event, data) => {
-    events.push({ event, data: JSON.parse(data) as Record<string, unknown> });
-  });
-  const parent = new Hono();
-  parent.route(
-    '/jobs',
-    createJobsApp(jobsConfig(), {
-      db: new JobsDb(':memory:'),
-      getReceipt,
-      getOnchainJob,
-      identityOwner,
-      reputationSummary,
-      onActivity,
-      jobFeed: feed,
-      rateLimitBucket: { windowMs: 60_000, max: 10_000 },
-    }),
-  );
-  const body = await signedPost();
-  const h = txHash('feed-post-seed');
-  receipts.set(
-    h.toLowerCase(),
-    fundingReceipt(
-      77n,
-      parseUnits(body.bountyUsdc as string, 6),
-      BigInt(body.deadline as string),
-      body.termsHash as string,
-    ),
-  );
-  const pr = await postJson(parent, '/jobs', { ...body, txHash: h });
-  assert.equal(pr.status, 201);
-  const jobId = pr.body.jobId as number;
-  assert.equal(events.length, 1);
-  assert.equal(events[0].event, 'job_posted');
-  assert.equal((events[0].data.job as Record<string, unknown>).id, jobId);
-  assert.equal((events[0].data.job as Record<string, unknown>).state, 'open');
-  assert.equal(events[0].data.dispatch, 'open');
-
-  owners.set('4242', worker.address); // mock registry: worker owns agent 4242
-  await enrollWorkerWallet(worker, 4242n, parent);
-  const cr = await claimJob(jobId, 4242n, 'feed-claim-seed', parent);
-  assert.equal(cr.status, 200);
-  assert.equal(events.length, 2);
-  assert.equal(events[1].event, 'job_claimed');
-  assert.equal(events[1].data.jobId, jobId);
-  assert.equal(
-    (events[1].data.worker as string).toLowerCase(),
-    worker.address.toLowerCase(),
-  );
-});
-
-await check('feed: dead subscriber is dropped, broadcast never throws', () => {
-  const feed = createJobFeed();
-  let calls = 0;
-  feed.subscribe(() => {
-    calls++;
-    throw new Error('dead subscriber');
-  });
-  feed.subscribe(() => {
-    calls++;
-  });
-  feed.broadcast('job_posted', { id: 1 });
-  assert.equal(calls, 2);
-  assert.equal(feed.subscriberCount, 1);
-  feed.broadcast('job_posted', { id: 2 });
-  assert.equal(calls, 3);
 });
 
 console.log(`\njobs: ${passed} checks passed`);

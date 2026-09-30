@@ -24,8 +24,6 @@ import type {
   PaymentPayload,
   PaymentRequired,
   PaymentRequirements,
-  SettleRequest,
-  SettleResponse,
 } from './types.js';
 import { verifyExactPayment } from './verify.js';
 
@@ -78,16 +76,6 @@ export interface OracleDeps {
   fetchFn?: typeof fetch;
   /** Fired after every served query (the spectacle feed). */
   onQueryServed?: (q: OracleQuery) => void;
-  /**
-   * Fired after a real onchain settlement (the Tape). Receives the settle
-   * request + response and the resource label; the host builds the log row.
-   * Never fires in dry-run (nothing is broadcast there).
-   */
-  onSettled?: (
-    req: SettleRequest,
-    res: SettleResponse,
-    resource: string,
-  ) => void;
   /**
    * API-key gate for production mode (dry-run off), same posture as
    * /demo/data: fail closed without keys, 401 without a valid key.
@@ -355,14 +343,6 @@ export function createOracleApp(
         status as 402,
       );
     }
-    // The Tape: log the real broadcast. served.log tells us which feed.
-    deps.onSettled?.(
-      { paymentPayload, paymentRequirements: requirements },
-      settled,
-      served.log.endpoint === 'price'
-        ? `oracle-price:${served.log.symbol ?? ''}`
-        : 'oracle-gas',
-    );
     return new Response(
       JSON.stringify({ ...served.data, dryRun: false }),
       {
