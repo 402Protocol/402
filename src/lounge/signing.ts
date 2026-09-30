@@ -1,0 +1,214 @@
+/**
+ * 402 Lounge — EIP-712 signing domain and signature verification.
+ *
+ * Domain: name "402 Lounge", version "1", chainId 57073 (Ink). No
+ * verifyingContract — the lounge is identified by chain + name, and the
+ * payment leg (not the signature) is what binds a post to real value.
+ */
+import {
+  type Address,
+  type Hex,
+  getAddress,
+  recoverTypedDataAddress,
+} from 'viem';
+import { LOUNGE_CHAIN_ID } from './types.js';
+
+export const LOUNGE_DOMAIN: { name: string; version: string; chainId: number } = {
+  name: '402 Lounge',
+  version: '1',
+  chainId: LOUNGE_CHAIN_ID,
+};
+
+export const LOUNGE_TYPES: Record<string, { name: string; type: string }[]> = {
+  LoungePost: [
+    { name: 'author', type: 'address' },
+    { name: 'title', type: 'string' },
+    { name: 'body', type: 'string' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  LoungeComment: [
+    { name: 'author', type: 'address' },
+    { name: 'postId', type: 'string' },
+    { name: 'body', type: 'string' },
+    { name: 'timestamp', type: 'uint256' },
+    { name: 'parentId', type: 'string' },
+  ],
+  LoungeVote: [
+    { name: 'author', type: 'address' },
+    { name: 'postId', type: 'string' },
+    { name: 'direction', type: 'int8' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  LoungeChat: [
+    { name: 'author', type: 'address' },
+    { name: 'message', type: 'string' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  LoungeNameClaim: [
+    { name: 'author', type: 'address' },
+    { name: 'name', type: 'string' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  BlackjackAction: [
+    { name: 'author', type: 'address' },
+    { name: 'action', type: 'string' },
+    { name: 'handId', type: 'string' },
+    { name: 'amount', type: 'uint256' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  // ---- 402 Job Marketplace v0 (same "402 Lounge" domain) ----
+  JobEnroll: [
+    { name: 'wallet', type: 'address' },
+    { name: 'agentId', type: 'uint256' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  JobPost: [
+    { name: 'requester', type: 'address' },
+    { name: 'title', type: 'string' },
+    { name: 'spec', type: 'string' },
+    { name: 'specPrivate', type: 'bool' },
+    { name: 'category', type: 'string' },
+    { name: 'bountyUsdc', type: 'string' },
+    { name: 'deadline', type: 'uint256' },
+    { name: 'termsHash', type: 'bytes32' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  JobClaim: [
+    { name: 'jobId', type: 'uint256' },
+    { name: 'worker', type: 'address' },
+    { name: 'agentId', type: 'uint256' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  JobSubmit: [
+    { name: 'jobId', type: 'uint256' },
+    { name: 'author', type: 'address' },
+    { name: 'contentHash', type: 'bytes32' },
+    { name: 'uri', type: 'string' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  JobDecision: [
+    { name: 'jobId', type: 'uint256' },
+    { name: 'requester', type: 'address' },
+    { name: 'decision', type: 'string' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  // Gated read of a private job spec: the accessor signs the exact job id
+  // they claim the right to read. The server then checks the accessor is
+  // the requester or the claimed worker — the signature alone proves
+  // nothing about authorization, only about who is asking.
+  JobSpecAccess: [
+    { name: 'jobId', type: 'uint256' },
+    { name: 'accessor', type: 'address' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  // Gated read of a worker's submission: the accessor signs the exact job
+  // id they claim the right to read. The server then checks the accessor is
+  // the requester or the claimed worker — the signature alone proves
+  // nothing about authorization, only about who is asking.
+  JobSubmissionAccess: [
+    { name: 'jobId', type: 'uint256' },
+    { name: 'accessor', type: 'address' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  // Verification-panel review attestation: an assigned reviewer signs
+  // their verdict (bool accept) and score (0-100) for a job in_review.
+  // The server checks the signer is an actively assigned reviewer —
+  // the signature alone proves nothing about assignment.
+  ReviewAttestation: [
+    { name: 'jobId', type: 'uint256' },
+    { name: 'reviewer', type: 'address' },
+    { name: 'agentId', type: 'uint256' },
+    { name: 'verdict', type: 'bool' },
+    { name: 'score', type: 'uint8' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  // Directed dispatch: the assigned worker declines an assignment. The
+  // server checks the signer is the currently assigned worker for the job —
+  // the signature alone proves nothing about assignment.
+  JobDecline: [
+    { name: 'jobId', type: 'uint256' },
+    { name: 'worker', type: 'address' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+  // Relay auth: an agent proves its wallet to use the settlement relay
+  // (POST /relay/quote, POST /relay/execute) without the operator API key.
+  // action is 'relay-quote' or 'relay-execute'; resource is the pay-per-call
+  // resource ('oracle-price', 'oracle-gas', 'demo-data'); params is the
+  // JSON of the resource params (e.g. '{"symbol":"ETH"}'). The signature
+  // proves who is asking — the payment signature itself is what moves money,
+  // and the agent may only relay payments where it is the payer.
+  RelayAuth: [
+    { name: 'agent', type: 'address' },
+    { name: 'action', type: 'string' },
+    { name: 'resource', type: 'string' },
+    { name: 'params', type: 'string' },
+    { name: 'timestamp', type: 'uint256' },
+  ],
+};
+
+/** Timestamps must be within ±5 minutes of server time (replay protection). */
+export const TIMESTAMP_SKEW_SECONDS = 300;
+
+export function timestampFresh(
+  timestamp: bigint,
+  nowSeconds: number = Math.floor(Date.now() / 1000),
+): boolean {
+  const t = Number(timestamp);
+  if (!Number.isSafeInteger(t)) return false;
+  return Math.abs(nowSeconds - t) <= TIMESTAMP_SKEW_SECONDS;
+}
+
+export type VerifyResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Recover the signer of a typed lounge message and require it to equal the
+ * claimed author. Returns ok:false (never throws) on any malformed input.
+ */
+export async function verifyLoungeSignature(opts: {
+  primaryType:
+    | 'LoungePost'
+    | 'LoungeComment'
+    | 'LoungeVote'
+    | 'LoungeChat'
+    | 'LoungeNameClaim'
+    | 'BlackjackAction'
+    | 'JobEnroll'
+    | 'JobPost'
+    | 'JobClaim'
+    | 'JobSubmit'
+    | 'JobDecision'
+    | 'JobSpecAccess'
+    | 'JobSubmissionAccess'
+    | 'ReviewAttestation'
+    | 'JobDecline';
+  message: Record<string, unknown>;
+  signature: string;
+  author: string;
+}): Promise<VerifyResult> {
+  if (!/^0x[0-9a-fA-F]{130}$/.test(opts.signature)) {
+    return { ok: false, reason: 'malformed_signature' };
+  }
+  let recovered: Address;
+  try {
+    const params = {
+      domain: LOUNGE_DOMAIN,
+      types: LOUNGE_TYPES,
+      primaryType: opts.primaryType,
+      message: opts.message,
+      signature: opts.signature as Hex,
+    } as unknown as Parameters<typeof recoverTypedDataAddress>[0];
+    recovered = await recoverTypedDataAddress(params);
+  } catch {
+    return { ok: false, reason: 'unrecoverable_signature' };
+  }
+  let claimed: Address;
+  try {
+    claimed = getAddress(opts.author);
+  } catch {
+    return { ok: false, reason: 'invalid_author' };
+  }
+  if (recovered.toLowerCase() !== claimed.toLowerCase()) {
+    return { ok: false, reason: 'signature_author_mismatch' };
+  }
+  return { ok: true };
+}
