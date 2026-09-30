@@ -72,7 +72,8 @@ export interface PinClient {
 
 export interface GitHubFile {
   path: string;
-  content: string;
+  /** Base64-encoded blob bytes — binary-safe; text files are UTF-8 first. */
+  contentBase64: string;
 }
 
 export interface GitHubClient {
@@ -422,10 +423,8 @@ export function createGitHubClient(
     for (const f of opts.files) {
       const blobRes = await api(`/repos/${owner}/${repo}/git/blobs`, {
         method: 'POST',
-        body: JSON.stringify({
-          content: Buffer.from(f.content, 'utf8').toString('base64'),
-          encoding: 'base64',
-        }),
+        // Already base64 (binary-safe): the blobs API decodes with encoding.
+        body: JSON.stringify({ content: f.contentBase64, encoding: 'base64' }),
       });
       if (!blobRes.ok) throw new Error(`github_blob_failed:${blobRes.status}`);
       const blob = (await readJson(blobRes)) as { sha: string };
@@ -492,7 +491,12 @@ export function createGitHubClient(
         throw new Error(`github_contents_failed:${res.status}`);
       await commitFiles({
         repo: opts.repo,
-        files: [{ path: 'README.md', content: buildRootReadme(opts.category) }],
+        files: [
+          {
+            path: 'README.md',
+            contentBase64: Buffer.from(buildRootReadme(opts.category), 'utf8').toString('base64'),
+          },
+        ],
         message: `402publisher: seed ${opts.category} repo readme`,
       });
       rootReadmeSeeded.add(opts.repo);
@@ -683,10 +687,12 @@ export async function publishOneJob(
   };
 
   const folder = `jobs/${job.id}`;
+  const toB64 = (s: string): string => Buffer.from(s, 'utf8').toString('base64');
   const files: GitHubFile[] = [
     {
       path: `${folder}/README.md`,
-      content: buildJobReadme({
+      contentBase64: toB64(
+        buildJobReadme({
         jobId: job.id,
         title: job.title,
         category: job.category,
@@ -699,18 +705,20 @@ export async function publishOneJob(
         settlementTx: manifest.settlementTx,
         artifactCids: [cid],
         sizeSkipped,
-      }),
+        }),
+      ),
     },
     {
       path: `${folder}/manifest.json`,
-      content: JSON.stringify(manifest, null, 2) + '\n',
+      contentBase64: toB64(JSON.stringify(manifest, null, 2) + '\n'),
     },
-    { path: `${folder}/reviews.json`, content: buildReviewsJson(panel) },
+    { path: `${folder}/reviews.json`, contentBase64: toB64(buildReviewsJson(panel)) },
   ];
   if (!sizeSkipped) {
+    // Binary-safe: bytes -> base64, never through a UTF-8 string.
     files.push({
       path: `${folder}/${name}`,
-      content: Buffer.from(bytes).toString('utf8'),
+      contentBase64: Buffer.from(bytes).toString('base64'),
     });
   }
 

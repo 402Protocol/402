@@ -42,6 +42,8 @@ const reviewer = privateKeyToAccount(generatePrivateKey());
 const ESCROW = '0xdf319a060eaa361aa906855c64ccbc941159c01c' as Address;
 
 let passed = 0;
+const b64 = (x: { contentBase64: string }): string =>
+  Buffer.from(x.contentBase64, 'base64').toString('utf8');
 function check(name: string, fn: () => void | Promise<void>): Promise<void> {
   return Promise.resolve()
     .then(fn)
@@ -294,7 +296,7 @@ await check('happy path: keccak submission publishes to the category repo', asyn
     assert.ok(!p.includes('..'), p);
   }
   const manifest = JSON.parse(
-    c.files.find((x) => x.path.endsWith('manifest.json'))!.content,
+    b64(c.files.find((x) => x.path.endsWith('manifest.json'))!),
   ) as PublicationManifest;
   for (const k of [
     'jobId',
@@ -322,11 +324,11 @@ await check('happy path: keccak submission publishes to the category repo', asyn
   assert.equal(manifest.artifacts[0].ipfsCid, manifest.ipfsCid);
   assert.equal(manifest.chainId, 57073);
   assert.ok(manifest.settlementTx);
-  const readme = c.files.find((x) => x.path.endsWith('README.md'))!.content;
+  const readme = b64(c.files.find((x) => x.path.endsWith('README.md'))!);
   assert.ok(readme.includes(`402 bounty ${id}`));
   assert.ok(readme.includes(`ipfs://${manifest.ipfsCid}`));
   const reviews = JSON.parse(
-    c.files.find((x) => x.path.endsWith('reviews.json'))!.content,
+    b64(c.files.find((x) => x.path.endsWith('reviews.json'))!),
   );
   assert.ok(Array.isArray(reviews.votes));
   assert.equal(reviews.votes.length, 1);
@@ -397,7 +399,7 @@ await check('oversized sets go IPFS-only with githubSkipped', async () => {
   const paths = c.files.map((x) => x.path);
   assert.ok(!paths.some((p) => p.endsWith('big.bin')), 'artifact blob omitted');
   const manifest = JSON.parse(
-    c.files.find((x) => x.path.endsWith('manifest.json'))!.content,
+    b64(c.files.find((x) => x.path.endsWith('manifest.json'))!),
   ) as PublicationManifest;
   assert.equal(manifest.githubSkipped, 'size');
   assert.ok(manifest.artifacts[0].ipfsCid);
@@ -517,6 +519,25 @@ await check('complete without a submission cannot publish', async () => {
   const job = db.getJob(id)!;
   assert.equal(job.publishState, 'failed');
   assert.equal(job.publishError, 'missing_submission');
+  db.close();
+});
+
+await check('binary artifacts survive the commit path byte-for-byte', async () => {
+  const db = freshDb();
+  // Non-UTF8 bytes: would be mangled by any utf8 round-trip.
+  const bin = new Uint8Array(1024);
+  for (let i = 0; i < bin.length; i++) bin[i] = i % 251;
+  const binHash: Hex = keccak256(toHex(bin));
+  const f = makeFetch();
+  f.serve.set('https://example.com/out.bin', bin);
+  const pin = makePin();
+  const github = makeGitHub();
+  const nowRef = { now: 1_800_000_010 };
+  settleJob(db, { uri: 'https://example.com/out.bin', hash: binHash });
+  const r = await runPublisherTick(depsFor(db, f, pin, github, nowRef));
+  assert.equal(r.published, 1);
+  const artifact = github.commits[0].files.find((x) => x.path.endsWith('out.bin'))!;
+  assert.deepEqual(new Uint8Array(Buffer.from(artifact.contentBase64, 'base64')), bin);
   db.close();
 });
 
