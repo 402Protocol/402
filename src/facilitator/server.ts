@@ -61,6 +61,7 @@ import { createJobsApp } from '../jobs/server.js';
 import { createAgentsApp } from '../jobs/agents.js';
 import { defaultResolveAgentSeat } from '../jobs/escrow.js';
 import { JobsDb } from '../jobs/db.js';
+import { startPublisherLoop } from '../jobs/publisher.js';
 import type { JobsConfig } from '../jobs/config.js';
 import type { BlackjackConfig, LoungeConfig } from '../lounge/config.js';
 
@@ -294,6 +295,30 @@ export function createApp(
   // lounge is enabled (same posture as the oracle routes).
   if (opts.jobs) {
     const jobsDb = new JobsDb(opts.jobs.dbPath);
+    // Deliverable publisher: settled-only publication of job deliverables
+    // to the per-category public repos (+ IPFS mirror). Runs only when
+    // both credentials are configured; otherwise settled jobs simply wait
+    // (spec §10). Tokens come from env, never code.
+    const publisherToken = (process.env.PUBLISHER_GITHUB_TOKEN ?? '').trim();
+    const pinataJwt = (process.env.PINATA_JWT ?? '').trim();
+    if (publisherToken && pinataJwt) {
+      startPublisherLoop({
+        db: jobsDb,
+        githubToken: publisherToken,
+        pinataJwt,
+        log: (m) => console.log(`[publisher] ${m}`),
+      });
+    } else {
+      const missing = [
+        !publisherToken && 'PUBLISHER_GITHUB_TOKEN',
+        !pinataJwt && 'PINATA_JWT',
+      ]
+        .filter(Boolean)
+        .join(', ');
+      console.warn(
+        `[publisher] disabled — missing env: ${missing} (settled jobs will not be published)`,
+      );
+    }
     app.route(
       '/jobs',
       createJobsApp(opts.jobs, {

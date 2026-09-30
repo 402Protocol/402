@@ -89,6 +89,9 @@ export interface AgentDirectoryEntry {
 /** Panel-derived score status for a ledger row. */
 export type LedgerScoreStatus = 'none' | 'queued' | 'scored';
 
+/** Deliverable-publication state for the Ledger's delivery section. */
+export type PublicationState = 'none' | 'pending' | 'published' | 'failed';
+
 /**
  * One row of the Ledger explorer feed. Timestamps are unix milliseconds.
  * `workerWallet` is null for unclaimed (open) jobs; `deliveryUri` is only
@@ -113,6 +116,12 @@ export interface LedgerJob {
   scoreStatus: LedgerScoreStatus;
   score: number | null;
   settlementTx: string | null;
+  /** Settled-only deliverable publication (§9 of the publisher spec). */
+  publicationState: PublicationState;
+  /** https://github.com/402Protocol/<category>/tree/main/jobs/<jobId> */
+  publicationUrl: string | null;
+  /** ipfs://<cid> of the pinned publication manifest. */
+  publicationIpfs: string | null;
 }
 
 export interface JobListing {
@@ -148,6 +157,19 @@ export interface JobListing {
   submittedAt: number | null;
   /** Unix seconds, set when the job enters `disputed` (dispute SLA clock). */
   disputedAt: number | null;
+  /** Deliverable-publication state: NULL = never attempted. */
+  publishState: 'published' | 'failed' | null;
+  /** Unix seconds, set when the publisher committed + pinned. */
+  publishedAt: number | null;
+  publishError: string | null;
+  /** GitHub commit SHA of the publication, in the category repo. */
+  publishCommit: string | null;
+  /** IPFS CID of the pinned publication manifest. */
+  publishCid: string | null;
+  /** Transient-failure attempts so far (hash mismatch never retries). */
+  publishAttempts: number;
+  /** Unix seconds: earliest next retry, NULL = due now. */
+  publishNextRetryAt: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -383,6 +405,13 @@ function rowToListing(row: Record<string, unknown>): JobListing {
     submissionUri: (row.submission_uri as string | null) ?? null,
     submittedAt: (row.submitted_at as number | null) ?? null,
     disputedAt: (row.disputed_at as number | null) ?? null,
+    publishState: (row.publish_state as 'published' | 'failed' | null) ?? null,
+    publishedAt: (row.published_at as number | null) ?? null,
+    publishError: (row.publish_error as string | null) ?? null,
+    publishCommit: (row.publish_commit as string | null) ?? null,
+    publishCid: (row.publish_cid as string | null) ?? null,
+    publishAttempts: (row.publish_attempts as number | null) ?? 0,
+    publishNextRetryAt: (row.publish_next_retry_at as number | null) ?? null,
     createdAt: row.created_at as number,
     updatedAt: row.updated_at as number,
   };
@@ -419,6 +448,35 @@ export class JobsDb {
     }
     if (!names.has('submitted_at')) {
       this.db.exec('ALTER TABLE job_listings ADD COLUMN submitted_at INTEGER');
+    }
+    // Deliverable publisher (settled-only publication to per-category
+    // repos): publish_state NULL = not yet attempted.
+    if (!names.has('publish_state')) {
+      this.db.exec('ALTER TABLE job_listings ADD COLUMN publish_state TEXT');
+    }
+    if (!names.has('published_at')) {
+      this.db.exec('ALTER TABLE job_listings ADD COLUMN published_at INTEGER');
+    }
+    if (!names.has('publish_error')) {
+      this.db.exec('ALTER TABLE job_listings ADD COLUMN publish_error TEXT');
+    }
+    if (!names.has('publish_commit')) {
+      this.db.exec('ALTER TABLE job_listings ADD COLUMN publish_commit TEXT');
+    }
+    if (!names.has('publish_cid')) {
+      this.db.exec('ALTER TABLE job_listings ADD COLUMN publish_cid TEXT');
+    }
+    // Retry bookkeeping for the publisher's 5-attempts-over-~1h policy.
+    // (Not in the original spec's column list; needed to implement §4.4.)
+    if (!names.has('publish_attempts')) {
+      this.db.exec(
+        'ALTER TABLE job_listings ADD COLUMN publish_attempts INTEGER NOT NULL DEFAULT 0',
+      );
+    }
+    if (!names.has('publish_next_retry_at')) {
+      this.db.exec(
+        'ALTER TABLE job_listings ADD COLUMN publish_next_retry_at INTEGER',
+      );
     }
   }
 
@@ -678,11 +736,29 @@ export class JobsDb {
     const submissionUri = row.submission_uri as string | null;
     const claimedAt = row.claimed_at as number | null;
     const submittedAt = row.submitted_at as number | null;
+    // Settled-only publication: only `complete` jobs (clean accept path)
+    // enter the publisher pipeline; the repo folder is proof money moved.
+    const publishState = row.publish_state as 'published' | 'failed' | null;
+    let publicationState: PublicationState = 'none';
+    if (state === 'complete') {
+      publicationState =
+        publishState === 'published'
+          ? 'published'
+          : publishState === 'failed'
+            ? 'failed'
+            : 'pending';
+    }
+    const category = row.category as string;
+    const publishCid = row.publish_cid as string | null;
+    const publicationUrl =
+      publicationState === 'published'
+        ? `https://github.com/402Protocol/${category}/tree/main/jobs/${row.id}`
+        : null;
     return {
       jobId: String(row.id),
       state,
       title: row.title as string,
-      category: row.category as string,
+      category,
       bountyUsdc: row.bounty_usdc as string,
       workerWallet: (row.worker as string | null) ?? null,
       workerAgentId: (row.worker_agent_id as string | null) ?? null,
@@ -696,6 +772,12 @@ export class JobsDb {
           ? Math.round(panelScore * 10) / 10
           : null,
       settlementTx: (row.settlement_tx as string | null) ?? null,
+      publicationState,
+      publicationUrl,
+      publicationIpfs:
+        publicationState === 'published' && publishCid
+          ? `ipfs://${publishCid}`
+          : null,
     };
   }
 
@@ -1146,6 +1228,90 @@ export class JobsDb {
       this.closePanel(id, now);
       return 'ok';
     });
+  }
+
+  // ---- Deliverable publisher bookkeeping ----
+  //
+  // Only `complete` jobs are publishable: the requester accepted and the
+  // release tx is verified onchain — money moved, so the deliverable may go
+  // public. `resolved` (arbitration) also moves money but the deliverable's
+  // acceptance is murky there; the spec's settled-only rule maps to the
+  // clean accept path.
+
+  /** Settled jobs the publisher hasn't attempted yet (or whose retry is due). */
+  getPublishableJobs(now: number, limit = 10): JobListing[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM job_listings
+         WHERE state = 'complete' AND publish_state IS NULL
+           AND (publish_next_retry_at IS NULL OR publish_next_retry_at <= ?)
+         ORDER BY id ASC LIMIT ?`,
+      )
+      .all(now, limit) as { id: number }[];
+    const out: JobListing[] = [];
+    for (const r of rows) {
+      const j = this.getJob(r.id);
+      if (j) out.push(j);
+    }
+    return out;
+  }
+
+  /** The money-moving tx (accept/resolve) and when it landed, if recorded. */
+  getSettlement(jobId: number): { txHash: string; settledAt: number } | null {
+    const row = this.db
+      .prepare(
+        `SELECT tx_hash, used_at FROM used_tx_hashes
+         WHERE job_id = ? AND purpose IN ('accept', 'resolve') LIMIT 1`,
+      )
+      .get(jobId) as { tx_hash: string; used_at: number } | undefined;
+    return row ? { txHash: row.tx_hash, settledAt: row.used_at } : null;
+  }
+
+  /** used_at for a single-use tx purpose on a job (e.g. 'claim'), if any. */
+  getJobTxAt(jobId: number, purpose: string): number | null {
+    const row = this.db
+      .prepare(
+        `SELECT used_at FROM used_tx_hashes WHERE job_id = ? AND purpose = ? LIMIT 1`,
+      )
+      .get(jobId, purpose) as { used_at: number } | undefined;
+    return row?.used_at ?? null;
+  }
+
+  /** Record a transient failure; schedule the next retry. */
+  recordPublishAttempt(id: number, nextRetryAt: number, now: number): void {
+    this.db
+      .prepare(
+        `UPDATE job_listings
+         SET publish_attempts = publish_attempts + 1,
+             publish_next_retry_at = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(nextRetryAt, now, id);
+  }
+
+  /** Terminal publication failure (hash mismatch or retries exhausted). */
+  markPublishFailed(id: number, error: string, now: number, attempts: number): void {
+    this.db
+      .prepare(
+        `UPDATE job_listings
+         SET publish_state = 'failed', publish_error = ?, publish_attempts = ?,
+             publish_next_retry_at = NULL, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(error, attempts, now, id);
+  }
+
+  /** Successful publication: both the repo commit and the IPFS pin landed. */
+  markPublished(id: number, commit: string, cid: string, now: number): void {
+    this.db
+      .prepare(
+        `UPDATE job_listings
+         SET publish_state = 'published', published_at = ?,
+             publish_commit = ?, publish_cid = ?, publish_error = NULL,
+             updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(now, commit, cid, now, id);
   }
 
   /** claimed|submitted|in_review|verified -> disputed (either party; raiseDispute verified onchain). */
