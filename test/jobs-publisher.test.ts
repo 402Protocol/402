@@ -11,6 +11,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { Hono } from 'hono';
 import {
   type Address,
   type Hex,
@@ -19,6 +20,8 @@ import {
 } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { JobsDb } from '../src/jobs/db.js';
+import { loadJobsConfig } from '../src/jobs/config.js';
+import { createJobsApp } from '../src/jobs/server.js';
 import {
   buildJobReadme,
   buildReviewsJson,
@@ -563,6 +566,37 @@ await check('root readme + job readme builders', () => {
   assert.ok(job.includes('&lt;script&gt;'));
   const reviews = JSON.parse(buildReviewsJson(null));
   assert.deepEqual(reviews.votes, []);
+});
+
+await check('GET /publisher/status reflects loop flag + db counts', async () => {
+  const cfg = loadJobsConfig({
+    FOUR02_BOUNTY_ESCROW: ESCROW,
+    FOUR02_JOBS_DB_PATH: ':memory:',
+    INK_RPC_URL: 'http://localhost:1', // dead localhost: never called, no mocks needed for this route
+  });
+  assert.ok(cfg);
+  const mk = (publisherEnabled?: boolean) => {
+    const parent = new Hono();
+    parent.route(
+      '/jobs',
+      createJobsApp(cfg, { db: new JobsDb(':memory:'), publisherEnabled }),
+    );
+    return parent;
+  };
+  const res1 = await mk(true).request('/jobs/publisher/status');
+  assert.equal(res1.status, 200);
+  const body1 = (await res1.json()) as {
+    enabled: boolean;
+    published: number;
+    failed: number;
+    pending: number;
+  };
+  assert.equal(body1.enabled, true);
+  assert.deepEqual([body1.published, body1.failed, body1.pending], [0, 0, 0]);
+  const res2 = await mk().request('/jobs/publisher/status');
+  assert.equal(res2.status, 200);
+  const body2 = (await res2.json()) as { enabled: boolean };
+  assert.equal(body2.enabled, false);
 });
 
 console.log(`\n${passed} publisher checks passed`);

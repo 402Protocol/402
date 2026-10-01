@@ -301,7 +301,8 @@ export function createApp(
     // (spec §10). Tokens come from env, never code.
     const publisherToken = (process.env.PUBLISHER_GITHUB_TOKEN ?? '').trim();
     const pinataJwt = (process.env.PINATA_JWT ?? '').trim();
-    if (publisherToken && pinataJwt) {
+    const publisherEnabled = !!(publisherToken && pinataJwt);
+    if (publisherEnabled) {
       startPublisherLoop({
         db: jobsDb,
         githubToken: publisherToken,
@@ -323,6 +324,7 @@ export function createApp(
       '/jobs',
       createJobsApp(opts.jobs, {
         db: jobsDb,
+        publisherEnabled,
         onActivity: (a) =>
           loungeDb?.logJobActivity({
             kind: a.kind,

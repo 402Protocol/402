@@ -184,6 +184,12 @@ export interface JobsDeps {
   /** Fired after every board event (the Lounge's job-activity feed). */
   onActivity?: (a: JobActivityEvent) => void;
   /**
+   * Whether the deliverable-publisher keeper loop is running (both
+   * PUBLISHER_GITHUB_TOKEN and PINATA_JWT configured). Surfaced read-only
+   * by GET /publisher/status so operators can verify the loop remotely.
+   */
+  publisherEnabled?: boolean;
+  /**
    * Live dispatch feed (server-push). Defaults to an in-memory fan-out
    * — correct on a single instance; inject a shared pub/sub for multi-replica.
    */
@@ -1023,6 +1029,11 @@ export function createJobsApp(
       if (!(cat in counts)) counts[cat] = n;
     }
     return c.json({ total, byStatus, byCategory: counts });
+  });
+
+  app.get('/publisher/status', (c) => {
+    const stats = db.getPublishStats();
+    return c.json({ enabled: deps.publisherEnabled ?? false, ...stats });
   });
 
   app.get('/:id', (c) => {

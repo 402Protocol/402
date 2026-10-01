@@ -1256,6 +1256,24 @@ export class JobsDb {
     return out;
   }
 
+  /** Publisher status counts for GET /jobs/publisher/status. */
+  getPublishStats(): { published: number; failed: number; pending: number } {
+    const row = this.db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN publish_state = 'published' THEN 1 ELSE 0 END) AS published,
+           SUM(CASE WHEN publish_state = 'failed' THEN 1 ELSE 0 END) AS failed,
+           SUM(CASE WHEN state = 'complete' AND publish_state IS NULL THEN 1 ELSE 0 END) AS pending
+         FROM job_listings`,
+      )
+      .get() as { published: number | null; failed: number | null; pending: number | null };
+    return {
+      published: row.published ?? 0,
+      failed: row.failed ?? 0,
+      pending: row.pending ?? 0,
+    };
+  }
+
   /** The money-moving tx (accept/resolve) and when it landed, if recorded. */
   getSettlement(jobId: number): { txHash: string; settledAt: number } | null {
     const row = this.db
