@@ -30,8 +30,9 @@ import {Four02ReputationRegistryV2} from "./Four02ReputationRegistryV2.sol";
 ///        - counterparty = address(0) (no counterparty to a review).
 ///      Known wart: each recorded event adds weight to `_disputeRate`'s
 ///      "completed commerce" denominator. This is bounded: the registry's
-///      pairCompletionCap (currently 5) stops counting (agentId, 0) pairs after
-///      5 epochs, and reviewers with no disputes are unaffected (0/x = 0).
+///      pairCompletionCap (currently 5) stops counting (agentId, 0) pairs
+///      after 5 EVENTS — exhaustible in a single day via chunking, not 5
+///      epochs — and reviewers with no disputes are unaffected (0/x = 0).
 ///      The clean long-term fix is a registry V3 appending a dedicated
 ///      `PanelReviewed` variant (10) — encoding-stable, no migration of 0-9.
 ///      Until then, this mapping is the least-bad carrier.
@@ -56,6 +57,11 @@ import {Four02ReputationRegistryV2} from "./Four02ReputationRegistryV2.sol";
 ///      multiple transactions without re-submission collisions.
 ///      Freshness: the epoch's day must be within ±2 days of block.timestamp,
 ///      so a compromised keeper cannot pre-emptively squat future epochs.
+///      The chunkIndex < 1000 bound is KEEPER-ENFORCED (the keeper's
+///      epochIdFor throws on chunk >= 1000), not checked onchain: an onchain
+///      check would be vacuous — epochId % 1000 is always < 1000, so
+///      "day D chunk 1005" is indistinguishable onchain from "day D+1
+///      chunk 5".
 ///
 /// @dev agentIds must be STRICTLY INCREASING. This kills duplicates and
 ///      forces a canonical batch order (the keeper sorts ascending), so the
@@ -66,7 +72,10 @@ contract PanelBatchWriter is Ownable {
     // ------------------------------------------------------------------------
 
     /// @notice Emitted when a batch is recorded. batchHash commits to the
-    ///         exact batch contents: keccak256(abi.encode(agentIds, agreementBps)).
+    ///         exact batch contents: keccak256(abi.encode(epochId, agentIds, agreementBps)).
+    ///         Binding the epochId kills cross-epoch replay: the same
+    ///         (agentIds, agreementBps) payload cannot be resubmitted under a
+    ///         different epochId inside the ±2d freshness window.
     event BatchSubmitted(
         uint256 indexed epochId,
         uint256 count,
@@ -132,7 +141,11 @@ contract PanelBatchWriter is Ownable {
 
     /// @param registry_ Four02ReputationRegistryV2 to write to.
     /// @param keeper_ Initial keeper address (the batch-submission bot/EOA).
-    /// @param initialOwner Contract owner (timelock/multisig at deploy).
+    /// @param initialOwner Contract owner. Deploy reality is a fresh EOA held
+    ///        by the founder — NOT a timelock/multisig (that is stated future
+    ///        work). The owner key is the trust root: see the runbook's trust
+    ///        chain (keeper key -> bounded falsification; owner key -> total
+    ///        fabrication; owner-key loss -> rotation permanently bricked).
     constructor(
         address registry_,
         address keeper_,
@@ -189,9 +202,11 @@ contract PanelBatchWriter is Ownable {
     ///        the day component must be within ±2 days of block.timestamp.
     /// @param agentIds ERC-8004 reviewer agent ids, strictly increasing.
     /// @param agreementBps Quorum-agreement rate per agent, 0-10000.
-    /// @param batchHash keccak256(abi.encode(agentIds, agreementBps)) —
+    /// @param batchHash keccak256(abi.encode(epochId, agentIds, agreementBps)) —
     ///        committed onchain so anyone can verify the keeper's batch
-    ///        instead of trusting it.
+    ///        instead of trusting it. Binding epochId prevents replaying an
+    ///        identical (agentIds, agreementBps) payload under a different
+    ///        epochId.
     function submitBatch(
         uint256 epochId,
         uint256[] calldata agentIds,
@@ -205,7 +220,7 @@ contract PanelBatchWriter is Ownable {
         if (agentIds.length != agreementBps.length) revert LengthMismatch();
         if (agentIds.length == 0 || agentIds.length > MAX_BATCH)
             revert BatchSizeInvalid();
-        if (batchHash != keccak256(abi.encode(agentIds, agreementBps)))
+        if (batchHash != keccak256(abi.encode(epochId, agentIds, agreementBps)))
             revert BatchHashMismatch();
 
         epochSubmitted[epochId] = true;

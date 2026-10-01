@@ -691,3 +691,48 @@ export function defaultReputationSummary(
     }
   };
 }
+
+const PANEL_COUNT_ABI = [
+  {
+    name: 'getLastIndex',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'clientAddress', type: 'address' },
+    ],
+    outputs: [{ name: '', type: 'uint64' }],
+  },
+] as const;
+
+/**
+ * Per-writer panel-event count for an agent: registry.getLastIndex on the
+ * PanelBatchWriter address. Read-only; returns null on RPC failure.
+ *
+ * Why this exists: panel scores are recorded as EscrowCompleted, so
+ * summary().totalEvents mixes advisory panel snapshots with real commerce.
+ * The worker-history endpoint reports this count separately so consumers
+ * can tell the two apart instead of reading totalEvents as "jobs done".
+ * Only meaningful once the writer is deployed and FOUR02_PANEL_WRITER is
+ * set; the caller omits the field when this returns null.
+ */
+export function defaultPanelEventCount(
+  rpcUrl: string,
+  registry: Address,
+  panelWriter: Address,
+): (agentId: bigint) => Promise<string | null> {
+  const client = createPublicClient({ chain: ink, transport: http(rpcUrl) });
+  return async (agentId: bigint) => {
+    try {
+      const n = await client.readContract({
+        address: registry,
+        abi: PANEL_COUNT_ABI,
+        functionName: 'getLastIndex',
+        args: [agentId, panelWriter],
+      });
+      return n.toString();
+    } catch {
+      return null;
+    }
+  };
+}

@@ -8,6 +8,7 @@
  * in-memory JobsDb. No network, no keys, no broadcasts.
  */
 import assert from 'node:assert/strict';
+import { encodeErrorResult, parseAbi } from 'viem';
 import { JobsDb, type ReviewerStats } from '../src/jobs/db.js';
 import {
   MAX_BATCH,
@@ -17,10 +18,14 @@ import {
   computeAgreementBps,
   computeBatchHash,
   daysBetweenYmd,
+  daysInMonth,
+  decodeRevertName,
   epochDayFor,
   epochIdFor,
+  parseYmd,
   validateEpochDay,
 } from '../src/jobs/panel-keeper.js';
+import { expectedPanelRefId } from '../src/jobs/panel-verify.js';
 
 function stats(partial: Partial<ReviewerStats> & { reviewerAgentId: string }): ReviewerStats {
   return {
@@ -91,6 +96,17 @@ assert.equal(batch[0].agreementBps, 10000);
 assert.equal(batch[1].agentId, 9n);
 assert.equal(batch[1].agreementBps, 7500);
 assert.deepEqual(buildBatch([]), []);
+// L7: duplicate agent ids collapse to one entry (first wins) — without
+// this the whole batch would revert onchain with AgentIdsNotSorted.
+const duped = buildBatch([
+  stats({ reviewerAgentId: '7', reviewsDone: 2, agreedWithQuorum: 2 }), // 10000
+  stats({ reviewerAgentId: '7', reviewsDone: 4, agreedWithQuorum: 1 }), // 2500 — dropped
+  stats({ reviewerAgentId: '8', reviewsDone: 1, agreedWithQuorum: 1 }), // 10000
+]);
+assert.equal(duped.length, 2);
+assert.equal(duped[0].agentId, 7n);
+assert.equal(duped[0].agreementBps, 10000, 'first duplicate wins');
+assert.equal(duped[1].agentId, 8n);
 console.log('ok - batch building');
 
 // ---- chunking ----
@@ -131,6 +147,48 @@ assert.throws(() => validateEpochDay(20261002, 20260929), /within ±2 days/, '+3
 assert.throws(() => validateEpochDay(20261345, 20260929), /bad YYYYMMDD/);
 console.log('ok - epoch-day validation');
 
+// ---- strict YYYYMMDD parsing (L6) ----
+
+assert.deepEqual(parseYmd(20260929), [2026, 9, 29]);
+assert.deepEqual(parseYmd(20240229), [2024, 2, 29], 'leap day ok');
+assert.throws(() => parseYmd(20260230), /has 28 days/, 'Feb 30 rejected');
+assert.throws(() => parseYmd(20230229), /has 28 days/, 'Feb 29 on non-leap rejected');
+assert.throws(() => parseYmd(20260431), /has 30 days/, 'Apr 31 rejected');
+assert.throws(() => parseYmd(20261301), /bad YYYYMMDD/, 'month 13 rejected');
+assert.throws(() => parseYmd(20260001), /bad YYYYMMDD/, 'month 0 rejected');
+assert.equal(daysInMonth(2024, 2), 29);
+assert.equal(daysInMonth(2023, 2), 28);
+assert.equal(daysInMonth(2000, 2), 29, 'century leap');
+assert.equal(daysInMonth(1900, 2), 28, 'century non-leap');
+assert.equal(daysInMonth(2026, 4), 30);
+assert.equal(daysInMonth(2026, 1), 31);
+console.log('ok - strict date parsing');
+
+// ---- deterministic revert classification (M1) ----
+
+const revertAbi = parseAbi(['error EpochAlreadySubmitted()', 'error BatchHashMismatch()']);
+// viem nests revert data: ContractFunctionExecutionError -> cause -> { data }
+assert.equal(
+  decodeRevertName({
+    cause: { data: encodeErrorResult({ abi: revertAbi, errorName: 'EpochAlreadySubmitted' }) },
+  }),
+  'EpochAlreadySubmitted',
+  'decodes a writer custom error from the viem chain',
+);
+assert.equal(
+  decodeRevertName({ data: { errorName: 'EpochOutOfWindow' } }),
+  'EpochOutOfWindow',
+  'handles viem pre-decoded shape',
+);
+assert.equal(
+  decodeRevertName(new Error('connect ECONNRESET')),
+  null,
+  'transport failure has no revert -> halve path',
+);
+assert.equal(decodeRevertName(null), null);
+assert.equal(decodeRevertName({ cause: { data: '0x12345678' } }), null, 'undecodable data -> halve path');
+console.log('ok - revert classification');
+
 // ---- chunk disposition: the alarm path ----
 
 assert.equal(classifyChunk(false, false), 'submit');
@@ -143,29 +201,50 @@ assert.equal(
 );
 console.log('ok - chunk disposition');
 
-// ---- batchHash commitment ----
+// ---- batchHash commitment (epoch-bound) ----
 
-const h1 = computeBatchHash([
+const h1 = computeBatchHash(20260929000, [
   { agentId: 7n, agreementBps: 8000 },
   { agentId: 9n, agreementBps: 10000 },
 ]);
-const h1again = computeBatchHash([
+const h1again = computeBatchHash(20260929000, [
   { agentId: 7n, agreementBps: 8000 },
   { agentId: 9n, agreementBps: 10000 },
 ]);
 assert.equal(h1, h1again, 'deterministic');
 assert.match(h1, /^0x[0-9a-f]{64}$/, '32-byte hash');
-const h2 = computeBatchHash([{ agentId: 7n, agreementBps: 8001 }]);
+const h2 = computeBatchHash(20260929000, [{ agentId: 7n, agreementBps: 8001 }]);
 assert.notEqual(h1, h2, 'sensitive to contents');
-// Pinned value: keccak256(abi.encode(uint256[](7,9), uint256[](8000,10000))).
+const h3 = computeBatchHash(20260929001, [
+  { agentId: 7n, agreementBps: 8000 },
+  { agentId: 9n, agreementBps: 10000 },
+]);
+assert.notEqual(h1, h3, 'sensitive to epochId — no cross-epoch replay');
+// Pinned value: keccak256(abi.encode(20260929000, uint256[](7,9), uint256[](8000,10000))).
 // The forge BatchHashMismatch test covers the Solidity side of the same
 // encoding; this pins the TS side so a future encoding change breaks loudly.
 assert.equal(
   h1,
-  '0xba02fb79c00e05ab3511be728de7c028e3aa8510ed894d2c98efa60e74b58f45',
-  'must match keccak256(abi.encode(ids, bps)) or the contract rejects the batch',
+  '0x0811edb1ae1335c298f30f75f5125f9f22db92cba568a2a0f6918f3c21ca01da',
+  'must match keccak256(abi.encode(epochId, ids, bps)) or the contract rejects the batch',
 );
 console.log('ok - batchHash commitment');
+
+// ---- panel refId (verify mode) ----
+
+// Pinned against the contract's encoding (forge ScratchPin):
+// keccak256(abi.encodePacked("402:panel-review/v1", 20260929000, 42)).
+assert.equal(
+  expectedPanelRefId(20260929000, 42n),
+  '0x3000bd9ca38e569f67f3485e008fa3922ed7cc0050e28f04ea4111e19d63ab06',
+  'verify refId must match the contract or the per-agent sweep misses',
+);
+assert.notEqual(
+  expectedPanelRefId(20260929000, 42n),
+  expectedPanelRefId(20260929001, 42n),
+  'refId binds the epoch',
+);
+console.log('ok - panel refId');
 
 // ---- epoch submission bookkeeping (in-memory DB) ----
 

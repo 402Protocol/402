@@ -40,6 +40,62 @@ The registry is **append-only** — a bad batch cannot be deleted.
    compromise (below) — the registry will keep accepting its writes until
    `removeWriter` lands.
 
+## Trust chain (honest — read before deploy)
+
+Deploy reality: the writer's `initialOwner` is a **fresh EOA held by Father**,
+not a timelock or multisig (that is stated future work). The registry owner
+is the same class of key. Everything below follows from that.
+
+- **Keeper key → bounded falsification.** The keeper can only call
+  `submitBatch`. It cannot move funds, cannot rotate itself, cannot touch
+  the registry directly. What a compromised keeper CAN do: submit
+  fabricated agreement-bps snapshots. The damage is bounded in one
+  direction: panel events only add `EscrowCompleted` weight to
+  `_disputeRate`'s "completed commerce" denominator, so a dishonest keeper
+  can only DILUTE `disputeRateBps` (make a reviewer look cleaner), never
+  raise it — it cannot conjure disputes, arbitration losses, or ghost
+  penalties. The dilution budget is ≤5 counted events per (agentId,
+  address(0)) pair via `pairCompletionCap` (currently 5); past that the
+  derived views stop moving. The raw event log keeps growing unboundedly —
+  every falsified event is permanently visible, attributed to the writer
+  address, with its bundle hash onchain. Sunlight is the backstop; the
+  keeper honesty monitor (`panel-verify.ts`) is the tripwire.
+- **Owner key → TOTAL fabrication.** `addWriter(malicious)` on the registry
+  lets an arbitrary contract call `recordCommerceEvent` for ANY agent, ANY
+  event type, ANY value — disputes, arbitration outcomes, ghost penalties
+  included. `proposeKeeper` has no timelock (two-step accept only stops
+  fat-fingered addresses, not a malicious owner). `setWeights`,
+  `setPairCompletionCap`, `setGhostPenalty`, `setDecayWindow` retune the
+  scoring itself. There is no onchain constraint on the owner beyond the
+  caps in code (`MAX_PAIR_COMPLETION_CAP`). Guard this key like the
+  treasury key, because it is one.
+- **Owner-key LOSS → permanent brick.** `proposeKeeper` is owner-only and
+  the writer's `renounceOwnership` is disabled by design, so a lost owner
+  key means: keeper rotation can never happen again, a compromised keeper
+  cannot be replaced, and on the registry side `removeWriter`/`addWriter`
+  are unreachable — the writer is orphaned with no recovery path. The
+  registry keeps serving reads; the pipeline just never advances. Back up
+  the owner key accordingly.
+- **Kill switch.** Registry-level `removeWriter(<writer>)` stops a rogue
+  writer immediately (past events stay onchain — sunlight; new writes
+  stop). It requires the live owner key — which is why the line above
+  matters.
+
+## Liveness (accepted design, not a bug to fix later)
+
+- **Keeper silence halts the pipeline.** There is no watchdog that submits
+  for a dead keeper and no permissionless fallback — if the cron stops,
+  no scores land, full stop. Monitor the cron, not just the chain.
+- **Missed epochs are gone forever.** The contract only accepts epoch days
+  within ±2 days of `block.timestamp`. An epoch missed beyond that window
+  can NEVER be backfilled — the gap in the per-reviewer snapshot history
+  is permanent. Snapshots are lifetime bps (not deltas), so a later epoch
+  still shows the right current value, but the historical record has a
+  hole. Size the cron's alerting accordingly.
+- **Rotation assumes a live owner key.** Every recovery path
+  (`proposeKeeper`, `addWriter`, `removeWriter`) is owner-gated. See the
+  trust chain above: lose the key, lose the pipeline.
+
 ## Keeper-compromise procedure
 
 1. **Immediately**, as the registry owner: call `removeWriter(<writer>)` on
@@ -64,7 +120,12 @@ The registry is **append-only** — a bad batch cannot be deleted.
   low ETH, tx reverted). Fix the cause, do not just rerun.
 - Bundle-hash drift: the bundle file's per-chunk `batchHash` must equal the
   `batchHash` in the onchain `BatchSubmitted` event. Mismatch = the keeper
-  binary and the chain disagree — stop the cron and investigate.
+  binary and the chain disagree — stop the cron and investigate. Carve-out:
+  after a keeper-logged halving split, the onchain chunks legitimately
+  differ from the pre-broadcast plan (fresh epochIds, different hashes) —
+  that is what `panel-batch-<day>.submitted.json` (the M4 receipt) records.
+  Diff the receipt against the chain, not the plan, when the keeper log
+  shows a split. A mismatch with NO logged split is still stop-the-cron.
 
 ## Keeper key guidance
 
@@ -92,10 +153,36 @@ The registry is **append-only** — a bad batch cannot be deleted.
 ## Steady-state note (honest)
 
 The registry's `pairCompletionCap` (currently 5) stops counting
-`(agentId, address(0))` pairs after ~5 epochs per reviewer. After that, new
-batches still land onchain (the event log keeps growing — sunlight), but the
-derived `disputeRate`/`summary` views stop moving for that reviewer. In
-steady state the writer is a **commitment log**, not a score engine: the
-live signal is the latest snapshot plus the attestation bundle, not the
-cumulative onchain math. If per-epoch movement matters long-term, that is
-what a registry V3 with a dedicated `PanelReviewed` variant (10) is for.
+`(agentId, address(0))` pairs after **5 events** per reviewer — not 5 epochs;
+a single day's chunked batches can exhaust it. After that, new batches still
+land onchain (the event log keeps growing — sunlight), but the derived
+`disputeRate`/`summary` views stop moving for that reviewer. In steady state
+the writer is a **commitment log**, not a score engine: the live signal is
+the latest snapshot plus the attestation bundle, not the cumulative onchain
+math. If per-epoch movement matters long-term, that is what a registry V3
+with a dedicated `PanelReviewed` variant (10) is for.
+
+Coupling to know: the owner raising `pairCompletionCap` (up to
+`MAX_PAIR_COMPLETION_CAP`) raises the keeper's dilution budget with it —
+each extra counted event is one more unit of disputeRate-denominator a
+compromised keeper can stuff. Cap changes are owner actions; treat them as
+trust-budget changes, not tuning.
+
+## V3 note (labeling)
+
+A future `PanelReviewed(10)` variant fixes **future** labeling only. The
+registry is append-only: every panel event ever written through this writer
+stays permanently labeled `escrow_completed` carrying bps values, and no
+migration rewrites them. Consumers must keep scoping by the `writer` field
+forever — V3 does not clean up history, it just stops adding to the mess.
+
+## Manual cadence
+
+- Father runs the honesty monitor before keeper output becomes
+  load-bearing for dispatch ranking:
+  `npx tsx src/jobs/panel-verify.ts --writer 0x... --registry 0x...`
+  (exit 0 = clean, 1 = divergence). This is a manual gate, not a cron —
+  a dishonest-but-scheduled keeper passes every automated liveness check.
+- The keeper is dormant until panels can actually form: 3 reviewers with
+  completed jobs. True in prod today (zero), so nothing here is urgent —
+  deploy the writer when the reviewer population exists, not before.

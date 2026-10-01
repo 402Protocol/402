@@ -11,9 +11,11 @@
  * Every run writes a bundle file (JSON: epoch, per-chunk entries, batch
  * hashes) and logs its keccak256 prominently. Each chunk's batchHash is
  * ALSO committed onchain in BatchSubmitted — anyone can recompute
- * keccak256(abi.encode(agentIds, agreementBps)) and verify the keeper's
- * batch instead of trusting it. Pin the bundle files (IPFS/cold storage)
- * so fabrication is publicly attributable.
+ * keccak256(abi.encode(epochId, agentIds, agreementBps)) and verify the
+ * keeper's batch instead of trusting it. Binding the epochId means an
+ * identical (agentIds, bps) payload cannot be replayed under a different
+ * epochId. Pin the bundle files (IPFS/cold storage) so fabrication is
+ * publicly attributable.
  *
  * Default is a dry run that prints the full batch and broadcasts nothing.
  * Add --broadcast to actually submit — the keeper key comes from
@@ -21,7 +23,25 @@
  *
  *   FOUR02_PANEL_KEEPER_KEY=0x... npx tsx src/jobs/panel-keeper.ts \
  *     --writer 0x... [--broadcast] [--date 20260929] [--chunk-size 70] \
- *     [--db ./jobs.db] [--rpc URL] [--bundle-dir ./panel-bundles]
+ *     [--db ./jobs.db] [--rpc URL] [--bundle-dir ./panel-bundles] \
+ *     [--registry 0x...]
+ *
+ * --registry (or FOUR02_REPUTATION_REGISTRY) pins the expected reputation
+ * registry: the writer's immutable REGISTRY() is checked against it before
+ * any preflight, and a mismatch refuses loudly. Without it, the allowlist
+ * preflight still gates the broadcast path.
+ *
+ * After a broadcast run confirms, a second bundle file
+ * (panel-batch-<day>.submitted.json) records what ACTUALLY landed onchain
+ * (real epochIds + batchHashes + tx hashes) — simulation-failure halving
+ * splits chunks under fresh chunk indices, so the submitted record can
+ * differ from the pre-broadcast plan. The pre-broadcast bundle is the
+ * commitment; the submitted bundle is the receipt.
+ *
+ * Honesty monitor: npx tsx src/jobs/panel-verify.ts --writer 0x...
+ * independently recomputes the epoch's batches from reviewer_stats and
+ * diffs them against the onchain BatchSubmitted events + registry state.
+ * Run it before keeper output becomes load-bearing for dispatch ranking.
  *
  * epochId encoding (must match PanelBatchWriter.sol): YYYYMMDD * 1000 + chunkIndex.
  * The contract enforces the epoch day within ±2 days of block.timestamp,
@@ -35,6 +55,7 @@ import { join } from 'node:path';
 import {
   createPublicClient,
   createWalletClient,
+  decodeErrorResult,
   encodeAbiParameters,
   getAddress,
   http,
@@ -56,6 +77,19 @@ const writerAbi = parseAbi([
   'function REGISTRY() external view returns (address)',
   'function keeper() external view returns (address)',
   'function epochSubmitted(uint256 epochId) external view returns (bool)',
+  // Custom errors, for deterministic-revert classification in submitWithRetry:
+  // a decoded revert is a keeper/operator bug, never a gas problem — refuse,
+  // don't halve.
+  'error NotKeeper()',
+  'error InvalidEpochId()',
+  'error EpochOutOfWindow()',
+  'error EpochAlreadySubmitted()',
+  'error BatchSizeInvalid()',
+  'error LengthMismatch()',
+  'error ZeroAgentId()',
+  'error AgentIdsNotSorted()',
+  'error ScoreOutOfRange()',
+  'error BatchHashMismatch()',
 ]);
 const registryAbi = parseAbi([
   'function isWriter(address) external view returns (bool)',
@@ -83,14 +117,27 @@ export function epochIdFor(day: number, chunk: number): number {
   return day * 1000 + chunk;
 }
 
-/** Parse YYYYMMDD into [y, m, d]; throws on malformed input. */
+/** Days in a Gregorian month (proleptic) — mirrors the contract's _daysInMonth. */
+export function daysInMonth(y: number, m: number): number {
+  if (m === 2) {
+    const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+    return leap ? 29 : 28;
+  }
+  if (m === 4 || m === 6 || m === 9 || m === 11) return 30;
+  return 31;
+}
+
+/** Parse YYYYMMDD into [y, m, d]; throws on malformed input (strict day-of-month: no Feb 30, no Apr 31, no Feb 29 off-leap). */
 export function parseYmd(day: number): [number, number, number] {
   if (!Number.isInteger(day) || day < 20000101 || day > 21000101)
     throw new Error(`bad YYYYMMDD: ${day}`);
   const y = Math.floor(day / 10000);
   const m = Math.floor(day / 100) % 100;
   const d = day % 100;
-  if (m < 1 || m > 12 || d < 1 || d > 31) throw new Error(`bad YYYYMMDD: ${day}`);
+  if (m < 1 || m > 12 || d < 1) throw new Error(`bad YYYYMMDD: ${day}`);
+  const dim = daysInMonth(y, m);
+  if (d > dim)
+    throw new Error(`bad YYYYMMDD: ${day} (month ${m} of ${y} has ${dim} days)`);
   return [y, m, d];
 }
 
@@ -114,14 +161,65 @@ export function validateEpochDay(day: number, today: number = epochDayFor(new Da
     throw new Error(`--date ${day} is ${diff}d from today (${today}); must be within ±2 days`);
 }
 
-/** keccak256(abi.encode(agentIds, agreementBps)) — must match the contract's commitment. */
-export function computeBatchHash(entries: BatchEntry[]): `0x${string}` {
+/** keccak256(abi.encode(epochId, agentIds, agreementBps)) — must match the contract's commitment. */
+export function computeBatchHash(epochId: number, entries: BatchEntry[]): `0x${string}` {
   return keccak256(
     encodeAbiParameters(
-      [{ type: 'uint256[]' }, { type: 'uint256[]' }],
-      [entries.map((e) => e.agentId), entries.map((e) => BigInt(e.agreementBps))],
+      [{ type: 'uint256' }, { type: 'uint256[]' }, { type: 'uint256[]' }],
+      [
+        BigInt(epochId),
+        entries.map((e) => e.agentId),
+        entries.map((e) => BigInt(e.agreementBps)),
+      ],
     ),
   );
+}
+
+/**
+ * Best-effort decode of a viem simulation error into a custom-error name.
+ * Walks the viem error chain (ContractFunctionExecutionError ->
+ * ContractFunctionRevertedError -> ...) looking for revert data, and tries
+ * the writer ABI on it. Returns the decoded error name, or null when the
+ * failure carries no decodable revert (gas estimation / RPC transport) —
+ * those are the only failures the halving retry may attempt to route
+ * around. Any decoded revert is deterministic: halving cannot fix it.
+ */
+export function decodeRevertName(e: unknown): string | null {
+  const seen = new Set<unknown>();
+  const stack: unknown[] = [e];
+  while (stack.length > 0) {
+    const cur = stack.pop() as {
+      data?: unknown;
+      cause?: unknown;
+      signature?: unknown;
+    } | null;
+    if (!cur || typeof cur !== 'object' || seen.has(cur)) continue;
+    seen.add(cur);
+    const data = cur.data as
+      | { errorName?: unknown }
+      | `0x${string}`
+      | undefined;
+    // viem sometimes pre-decodes when the call ABI is known.
+    if (
+      data &&
+      typeof data === 'object' &&
+      typeof data.errorName === 'string'
+    ) {
+      return data.errorName;
+    }
+    if (typeof data === 'string' && data.startsWith('0x')) {
+      try {
+        return decodeErrorResult({ abi: writerAbi, data }).errorName;
+      } catch {
+        // Not decodable with the writer ABI — keep walking the chain.
+      }
+    }
+    if (cur.cause) {
+      if (Array.isArray(cur.cause)) stack.push(...cur.cause);
+      else stack.push(cur.cause);
+    }
+  }
+  return null;
 }
 
 /**
@@ -139,10 +237,13 @@ export function computeAgreementBps(stats: ReviewerStats): number | null {
  * Build the deterministic batch: reviewers with >= 1 completed review,
  * sorted by numeric agentId (the contract requires strictly increasing ids).
  * Unparseable agent ids are dropped (they can never be recorded onchain —
- * ERC-8004 ids are uint256).
+ * ERC-8004 ids are uint256). Duplicate agent ids collapse to one entry
+ * (first wins); without this, two rows for the same reviewer would revert
+ * the whole batch onchain with AgentIdsNotSorted.
  */
 export function buildBatch(all: ReviewerStats[]): BatchEntry[] {
   const out: BatchEntry[] = [];
+  const seen = new Set<bigint>();
   for (const s of all) {
     const bps = computeAgreementBps(s);
     if (bps === null) continue;
@@ -153,6 +254,8 @@ export function buildBatch(all: ReviewerStats[]): BatchEntry[] {
       continue;
     }
     if (agentId === 0n) continue; // registry reverts on zero agent ids
+    if (seen.has(agentId)) continue; // collapse duplicates, keep first
+    seen.add(agentId);
     out.push({ agentId, agreementBps: bps });
   }
   out.sort((a, b) => (a.agentId < b.agentId ? -1 : a.agentId > b.agentId ? 1 : 0));
@@ -196,6 +299,7 @@ const dateArg = optional(args, 'date', '');
 const dbPath = optional(args, 'db', process.env.FOUR02_JOBS_DB_PATH ?? './jobs.db');
 const writerArg = optional(args, 'writer', process.env.FOUR02_PANEL_WRITER ?? '');
 const rpcUrl = optional(args, 'rpc', INK_RPC_URL);
+const registryArg = optional(args, 'registry', process.env.FOUR02_REPUTATION_REGISTRY ?? '');
 const bundleDir = optional(args, 'bundle-dir', process.env.FOUR02_PANEL_BUNDLE_DIR ?? './panel-bundles');
 const chunkSizeArg = optional(args, 'chunk-size', process.env.FOUR02_PANEL_CHUNK_SIZE ?? String(MAX_BATCH));
 
@@ -224,6 +328,40 @@ const batch = buildBatch(db.listReviewerStats());
 const chunks = chunkBatch(batch, chunkSize);
 const publicClient = createPublicClient({ chain: ink, transport: http(rpcUrl) });
 
+// I1: pin the expected registry BEFORE any preflight. The writer's
+// immutable REGISTRY() must match --registry / FOUR02_REPUTATION_REGISTRY —
+// submitting into a writer pointed at the wrong registry would silently
+// write the scores into the wrong reputation ledger.
+const writerRegistry = (await publicClient.readContract({
+  address: writerAddress,
+  abi: writerAbi,
+  functionName: 'REGISTRY',
+})) as `0x${string}`;
+const expectedRegistryRaw = registryArg.trim();
+if (expectedRegistryRaw) {
+  let expectedRegistry: `0x${string}`;
+  try {
+    expectedRegistry = getAddress(expectedRegistryRaw);
+  } catch {
+    console.error(
+      `REFUSING: --registry / FOUR02_REPUTATION_REGISTRY is not an address: ${registryArg}`,
+    );
+    process.exit(1);
+  }
+  if (getAddress(writerRegistry) !== expectedRegistry) {
+    console.error(
+      `REFUSING: writer ${writerAddress} points at registry ${writerRegistry}, ` +
+        `expected ${expectedRegistry} — refusing to submit into the wrong ledger.`,
+    );
+    process.exit(1);
+  }
+  console.error(`registry: ${expectedRegistry} (pinned, matches writer)`);
+} else {
+  console.error(
+    `registry: ${writerRegistry} (unpinned — set --registry / FOUR02_REPUTATION_REGISTRY to pin it)`,
+  );
+}
+
 // ---- bundle commitment: JSON file + prominent keccak256 ----
 const bundle = {
   format: '402:panel-batch/v1',
@@ -233,7 +371,7 @@ const bundle = {
   generatedAt: new Date().toISOString(),
   chunks: chunks.map((c, i) => ({
     epochId: epochIdFor(day, i),
-    batchHash: computeBatchHash(c),
+    batchHash: computeBatchHash(epochIdFor(day, i), c),
     entries: c.map((e) => ({ agentId: e.agentId.toString(), agreementBps: e.agreementBps })),
   })),
 };
@@ -254,7 +392,7 @@ if (batch.length > 10) console.error(`  ... and ${batch.length - 10} more`);
 console.error('=== BUNDLE COMMITMENT ===');
 console.error(`bundle file: ${bundlePath}`);
 console.error(`bundle hash: ${bundleHash}`);
-console.error('Verify: recompute keccak256(abi.encode(agentIds, agreementBps)) per chunk');
+console.error('Verify: recompute keccak256(abi.encode(epochId, agentIds, agreementBps)) per chunk');
 console.error('and compare to the batchHash in the onchain BatchSubmitted event.');
 console.error('=========================');
 
@@ -302,7 +440,7 @@ if (!broadcast) {
   console.error('---');
   console.error('DRY RUN — nothing broadcast. Re-run with --broadcast to submit.');
   for (const p of pending) {
-    console.error(`  would submit epoch ${p.epochId}: ${p.chunk.length} agents, batchHash ${computeBatchHash(p.chunk)}`);
+    console.error(`  would submit epoch ${p.epochId}: ${p.chunk.length} agents, batchHash ${computeBatchHash(p.epochId, p.chunk)}`);
   }
   if (alarms.length > 0) {
     console.error(`ALARM: ${alarms.length} chunk(s) need human investigation: ${alarms.join(', ')}`);
@@ -318,11 +456,8 @@ console.error(`keeper:   ${account.address}`);
 
 // Safety: the writer must be allowlisted on the registry, or every
 // recordCommerceEvent call reverts and we burn gas for nothing.
-const registry = (await publicClient.readContract({
-  address: writerAddress,
-  abi: writerAbi,
-  functionName: 'REGISTRY',
-})) as `0x${string}`;
+// (writerRegistry was read once up front for the I1 registry pin.)
+const registry = writerRegistry;
 const allowlisted = await publicClient.readContract({
   address: getAddress(registry),
   abi: registryAbi,
@@ -358,6 +493,16 @@ const wallet = createWalletClient({ account, chain: ink, transport: http(rpcUrl)
 // planned indices; re-checked onchain before each attempt).
 let nextChunkIndex = chunks.length;
 
+// M4: what ACTUALLY landed onchain. Halving splits chunks under fresh
+// chunk indices, so the submitted record can differ from the pre-broadcast
+// bundle plan — this array is the receipt.
+const submitted: {
+  epochId: number;
+  batchHash: `0x${string}`;
+  txHash: `0x${string}`;
+  entries: BatchEntry[];
+}[] = [];
+
 async function submitWithRetry(
   chunkDay: number,
   chunkIndex: number,
@@ -383,7 +528,7 @@ async function submitWithRetry(
 
   const agentIds = entries.map((e) => e.agentId);
   const bps = entries.map((e) => BigInt(e.agreementBps));
-  const batchHash = computeBatchHash(entries);
+  const batchHash = computeBatchHash(epochId, entries);
   let request;
   try {
     ({ request } = await publicClient.simulateContract({
@@ -394,10 +539,43 @@ async function submitWithRetry(
       args: [BigInt(epochId), agentIds, bps, batchHash],
     }));
   } catch (e) {
+    // M1: duplicate-submission race. A previous attempt (concurrent run,
+    // retried cron) may have landed while we were simulating. Re-read the
+    // replay guard for the ORIGINAL epochId first: if it is submitted now,
+    // skip — never halve, never broadcast.
+    const raced = await publicClient.readContract({
+      address: writerAddress,
+      abi: writerAbi,
+      functionName: 'epochSubmitted',
+      args: [BigInt(epochId)],
+    });
+    const raceDisp = classifyChunk(raced, db.isEpochSubmitted(epochId));
+    if (raceDisp === 'alarm') {
+      alarms.push(epochId);
+      console.error(
+        `!!! ALARM: epoch ${epochId} was submitted onchain during our simulation — outside this keeper. Skipping.`,
+      );
+      return;
+    }
+    if (raceDisp === 'skip') {
+      console.error(`epoch ${epochId}: submitted while simulating — skipping`);
+      return;
+    }
+    // A decoded contract revert is deterministic (bad input, stale epoch,
+    // wrong keeper, hash mismatch): halving cannot fix it. Refuse loudly.
+    const revertName = decodeRevertName(e);
+    if (revertName !== null) {
+      console.error(
+        `REFUSING: submitBatch simulation reverted deterministically with ${revertName} ` +
+          `for epoch ${epochId} — fix the input/config, do not rerun blindly.`,
+      );
+      process.exit(1);
+    }
     if (entries.length <= 1) throw e;
-    // Simulation failed (e.g. gas estimate over the block limit on a
-    // congested RPC): halve the chunk and retry each half under fresh
-    // chunk indices. Recursion bottoms out at single entries.
+    // Only non-revert failures (gas estimation over the block limit on a
+    // congested RPC, transport errors) reach here: halve the chunk and
+    // retry each half under fresh chunk indices. Recursion bottoms out at
+    // single entries.
     console.error(
       `simulation failed for epoch ${epochId} (${entries.length} entries): ${(e as Error).message}`,
     );
@@ -417,11 +595,49 @@ async function submitWithRetry(
     process.exit(1);
   }
   db.markEpochSubmitted(epochId, hash);
+  submitted.push({ epochId, batchHash, txHash: hash, entries });
   console.error(`confirmed in block ${receipt.blockNumber}`);
 }
 
 for (const p of pending) {
   await submitWithRetry(day, p.chunkIndex, p.chunk);
+}
+
+// M4: the submitted receipt. The pre-broadcast bundle is the commitment;
+// this file records reality (halving may have split chunks under fresh
+// epochIds with different batchHashes). A bundle-drift monitor must treat
+// a mismatch after a keeper-logged halving split as expected, not as
+// "stop the cron".
+if (submitted.length > 0) {
+  const submittedBundle = {
+    format: '402:panel-batch-submitted/v1',
+    epochDay: day,
+    writer: writerAddress,
+    registry: writerRegistry,
+    generatedAt: new Date().toISOString(),
+    preBroadcastBundleHash: bundleHash,
+    chunks: submitted.map((s) => ({
+      epochId: s.epochId,
+      batchHash: s.batchHash,
+      txHash: s.txHash,
+      entries: s.entries.map((e) => ({
+        agentId: e.agentId.toString(),
+        agreementBps: e.agreementBps,
+      })),
+    })),
+  };
+  const submittedJson = JSON.stringify(
+    submittedBundle,
+    (_k, v) => (typeof v === 'bigint' ? v.toString() : v),
+    2,
+  );
+  const submittedPath = join(bundleDir, `panel-batch-${day}.submitted.json`);
+  writeFileSync(submittedPath, submittedJson);
+  const submittedHash = keccak256(toBytes(submittedJson));
+  console.error('=== SUBMITTED RECEIPT ===');
+  console.error(`submitted file: ${submittedPath}`);
+  console.error(`submitted hash: ${submittedHash}`);
+  console.error('=========================');
 }
 
 if (alarms.length > 0) {

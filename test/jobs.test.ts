@@ -971,6 +971,58 @@ await check('GET /jobs/worker/:agentId/history returns DB jobs + mocked reputati
   assert.equal(rep.reliability, '95');
 });
 
+await check('GET /jobs/worker/:agentId/history omits panelEvents when no writer is configured', async () => {
+  const res = await getJson(app, `/jobs/worker/${AGENT_ID}/history`);
+  assert.equal(res.status, 200);
+  assert.ok(
+    !('panelEvents' in (res.body as Record<string, unknown>)),
+    'panelEvents must be omitted without FOUR02_PANEL_WRITER',
+  );
+});
+
+await check('GET /jobs/worker/:agentId/history includes panelEvents when the writer count is available', async () => {
+  const parent = new Hono();
+  parent.route(
+    '/jobs',
+    createJobsApp(jobsConfig(), {
+      db: new JobsDb(':memory:'),
+      getReceipt,
+      getOnchainJob,
+      identityOwner,
+      reputationSummary,
+      panelEventCount: async () => '3',
+      rateLimitBucket: { windowMs: 60_000, max: 10_000 },
+    }),
+  );
+  const res = await getJson(parent, `/jobs/worker/${AGENT_ID}/history`);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.panelEvents, '3');
+});
+
+await check('GET /jobs/worker/:agentId/history stays 200 when the panel count RPC fails', async () => {
+  const parent = new Hono();
+  parent.route(
+    '/jobs',
+    createJobsApp(jobsConfig(), {
+      db: new JobsDb(':memory:'),
+      getReceipt,
+      getOnchainJob,
+      identityOwner,
+      reputationSummary,
+      panelEventCount: async () => {
+        throw new Error('rpc down');
+      },
+      rateLimitBucket: { windowMs: 60_000, max: 10_000 },
+    }),
+  );
+  const res = await getJson(parent, `/jobs/worker/${AGENT_ID}/history`);
+  assert.equal(res.status, 200);
+  assert.ok(
+    !('panelEvents' in (res.body as Record<string, unknown>)),
+    'fail-soft: RPC failure omits the field instead of 500ing',
+  );
+});
+
 await check('job-activity flows into the lounge feed', async () => {
   const loungeDb = new LoungeDb(':memory:');
   const seen: JobActivityEvent[] = [];

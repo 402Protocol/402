@@ -30,10 +30,11 @@ contract PanelBatchWriterTest is Test {
     }
 
     function _hash(
+        uint256 epochId,
         uint256[] memory ids,
         uint256[] memory bps
     ) internal pure returns (bytes32) {
-        return keccak256(abi.encode(ids, bps));
+        return keccak256(abi.encode(epochId, ids, bps));
     }
 
     function _one(uint256 id, uint256 bps_) internal pure returns (uint256[] memory ids, uint256[] memory bps) {
@@ -130,11 +131,11 @@ contract PanelBatchWriterTest is Test {
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 10_000);
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.NotKeeper.selector);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
 
         // The new keeper works.
         vm.prank(stranger);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
         assertTrue(writer.epochSubmitted(EPOCH));
     }
 
@@ -146,7 +147,7 @@ contract PanelBatchWriterTest is Test {
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 10_000);
         vm.prank(stranger);
         vm.expectRevert(PanelBatchWriter.NotKeeper.selector);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
     }
 
     // ------------------------------------------------------------------------
@@ -166,7 +167,7 @@ contract PanelBatchWriterTest is Test {
         for (uint256 i = 0; i < dayList.length; i++) {
             (uint256[] memory ids2, uint256[] memory bps2) = _one(7 + i, 8_000);
             vm.prank(keeper);
-            writer.submitBatch(dayList[i], ids2, bps2, _hash(ids2, bps2));
+            writer.submitBatch(dayList[i], ids2, bps2, _hash(dayList[i], ids2, bps2));
             assertTrue(writer.epochSubmitted(dayList[i]));
         }
     }
@@ -175,28 +176,28 @@ contract PanelBatchWriterTest is Test {
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 8_000);
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.EpochOutOfWindow.selector);
-        writer.submitBatch(20260926000, ids, bps, _hash(ids, bps)); // -3d
+        writer.submitBatch(20260926000, ids, bps, _hash(20260926000, ids, bps)); // -3d
     }
 
     function test_submitBatch_rejectsEpochTooNew() public {
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 8_000);
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.EpochOutOfWindow.selector);
-        writer.submitBatch(20261002000, ids, bps, _hash(ids, bps)); // +3d
+        writer.submitBatch(20261002000, ids, bps, _hash(20261002000, ids, bps)); // +3d
     }
 
     function test_submitBatch_rejectsMalformedEpochDay() public {
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 8_000);
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.EpochOutOfWindow.selector);
-        writer.submitBatch(20261345000, ids, bps, _hash(ids, bps)); // month 13
+        writer.submitBatch(20261345000, ids, bps, _hash(20261345000, ids, bps)); // month 13
     }
 
     function test_submitBatch_rejectsImpossibleDate() public {
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 8_000);
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.EpochOutOfWindow.selector);
-        writer.submitBatch(20260230000, ids, bps, _hash(ids, bps)); // Feb 30
+        writer.submitBatch(20260230000, ids, bps, _hash(20260230000, ids, bps)); // Feb 30
     }
 
     function test_submitBatch_windowFollowsWarp() public {
@@ -205,7 +206,7 @@ contract PanelBatchWriterTest is Test {
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 8_000);
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.EpochOutOfWindow.selector);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
     }
 
     // ------------------------------------------------------------------------
@@ -221,7 +222,7 @@ contract PanelBatchWriterTest is Test {
         bps[1] = 10_000;
 
         vm.prank(keeper);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
 
         assertTrue(writer.epochSubmitted(EPOCH));
         assertEq(registry.getEventCount(42), 1);
@@ -253,7 +254,7 @@ contract PanelBatchWriterTest is Test {
 
     function test_submitBatch_emitsBatchSubmittedWithHash() public {
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 8_000);
-        bytes32 h = _hash(ids, bps);
+        bytes32 h = _hash(EPOCH, ids, bps);
         vm.prank(keeper);
         vm.expectEmit(true, false, false, true);
         emit PanelBatchWriter.BatchSubmitted(EPOCH, 1, h);
@@ -269,7 +270,7 @@ contract PanelBatchWriterTest is Test {
 
     function test_batchHash_matchesTypeScriptKeeper() public {
         // Cross-language pin: the TS keeper computes
-        // keccak256(abi.encode(agentIds, agreementBps)) via viem's
+        // keccak256(abi.encode(epochId, agentIds, agreementBps)) via viem's
         // encodeAbiParameters. This must equal the Solidity-side value or
         // every real batch reverts with BatchHashMismatch.
         uint256[] memory ids = new uint256[](2);
@@ -279,8 +280,8 @@ contract PanelBatchWriterTest is Test {
         bps[0] = 8_000;
         bps[1] = 10_000;
         assertEq(
-            keccak256(abi.encode(ids, bps)),
-            0xba02fb79c00e05ab3511be728de7c028e3aa8510ed894d2c98efa60e74b58f45,
+            keccak256(abi.encode(EPOCH, ids, bps)),
+            0x0811edb1ae1335c298f30f75f5125f9f22db92cba568a2a0f6918f3c21ca01da,
             "TS keeper's pinned hash must match the contract's encoding"
         );
         // And the contract accepts it.
@@ -289,9 +290,25 @@ contract PanelBatchWriterTest is Test {
             EPOCH,
             ids,
             bps,
-            0xba02fb79c00e05ab3511be728de7c028e3aa8510ed894d2c98efa60e74b58f45
+            0x0811edb1ae1335c298f30f75f5125f9f22db92cba568a2a0f6918f3c21ca01da
         );
         assertTrue(writer.epochSubmitted(EPOCH));
+    }
+
+    function test_submitBatch_rejectsCrossEpochReplay() public {
+        // The batchHash binds the epochId: an identical (agentIds, bps)
+        // payload hashed for one epoch must revert under another, so a
+        // batch cannot be replayed across epochIds inside the ±2d window.
+        (uint256[] memory ids, uint256[] memory bps) = _one(7, 8_000);
+        bytes32 hashForEpoch = _hash(EPOCH, ids, bps);
+        vm.prank(keeper);
+        vm.expectRevert(PanelBatchWriter.BatchHashMismatch.selector);
+        writer.submitBatch(EPOCH + 1, ids, bps, hashForEpoch);
+        // The correctly-bound hash for the other epoch is accepted.
+        vm.prank(keeper);
+        writer.submitBatch(EPOCH + 1, ids, bps, _hash(EPOCH + 1, ids, bps));
+        assertTrue(writer.epochSubmitted(EPOCH + 1));
+        assertFalse(writer.epochSubmitted(EPOCH));
     }
 
     // ------------------------------------------------------------------------
@@ -302,22 +319,22 @@ contract PanelBatchWriterTest is Test {
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 8_000);
 
         vm.prank(keeper);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
 
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.EpochAlreadySubmitted.selector);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
     }
 
     function test_submitBatch_allowsDifferentChunksSameDay() public {
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 8_000);
 
         vm.prank(keeper);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps)); // chunk 0
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps)); // chunk 0
 
         (uint256[] memory ids2, uint256[] memory bps2) = _one(8, 8_000);
         vm.prank(keeper);
-        writer.submitBatch(EPOCH + 1, ids2, bps2, _hash(ids2, bps2)); // chunk 1, same day
+        writer.submitBatch(EPOCH + 1, ids2, bps2, _hash(EPOCH + 1, ids2, bps2)); // chunk 1, same day
         assertEq(registry.getEventCount(8), 1);
     }
 
@@ -325,7 +342,7 @@ contract PanelBatchWriterTest is Test {
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 8_000);
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.InvalidEpochId.selector);
-        writer.submitBatch(0, ids, bps, _hash(ids, bps));
+        writer.submitBatch(0, ids, bps, _hash(0, ids, bps));
     }
 
     function test_submitBatch_rejectsLengthMismatch() public {
@@ -336,7 +353,7 @@ contract PanelBatchWriterTest is Test {
         bps[0] = 8_000;
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.LengthMismatch.selector);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
     }
 
     function test_submitBatch_rejectsEmptyBatch() public {
@@ -355,7 +372,7 @@ contract PanelBatchWriterTest is Test {
         }
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.BatchSizeInvalid.selector);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
     }
 
     function test_submitBatch_acceptsMaxBatch() public {
@@ -368,7 +385,7 @@ contract PanelBatchWriterTest is Test {
             bps[i] = 10_000;
         }
         vm.prank(keeper);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
         assertEq(registry.getEventCount(70), 1);
     }
 
@@ -376,7 +393,7 @@ contract PanelBatchWriterTest is Test {
         (uint256[] memory ids, uint256[] memory bps) = _one(0, 8_000);
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.ZeroAgentId.selector);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
     }
 
     function test_submitBatch_rejectsDuplicateAgentIds() public {
@@ -388,7 +405,7 @@ contract PanelBatchWriterTest is Test {
         bps[1] = 9_000;
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.AgentIdsNotSorted.selector);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
     }
 
     function test_submitBatch_rejectsUnsortedAgentIds() public {
@@ -400,14 +417,14 @@ contract PanelBatchWriterTest is Test {
         bps[1] = 9_000;
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.AgentIdsNotSorted.selector);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
     }
 
     function test_submitBatch_rejectsBpsOver10000() public {
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 10_001);
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.ScoreOutOfRange.selector);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
     }
 
     // ------------------------------------------------------------------------
@@ -426,7 +443,7 @@ contract PanelBatchWriterTest is Test {
 
         vm.prank(keeper);
         vm.expectRevert(PanelBatchWriter.AgentIdsNotSorted.selector);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
 
         // Nothing was written, and the epoch is still submittable.
         assertEq(registry.getEventCount(7), 0);
@@ -435,7 +452,7 @@ contract PanelBatchWriterTest is Test {
 
         ids[1] = 8;
         vm.prank(keeper);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
         assertEq(registry.getEventCount(7), 1);
         assertEq(registry.getEventCount(8), 1);
         assertEq(registry.getEventCount(9), 1);
@@ -450,7 +467,7 @@ contract PanelBatchWriterTest is Test {
         // events (the panel carrier) must not change that.
         (uint256[] memory ids, uint256[] memory bps) = _one(7, 10_000);
         vm.prank(keeper);
-        writer.submitBatch(EPOCH, ids, bps, _hash(ids, bps));
+        writer.submitBatch(EPOCH, ids, bps, _hash(EPOCH, ids, bps));
         assertEq(registry.reliability(7), 0);
         // …and a perfect panel score does not conjure a dispute rate either.
         assertEq(registry.disputeRate(7), 0);

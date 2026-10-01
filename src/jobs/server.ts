@@ -72,6 +72,7 @@ import {
 import {
   defaultGetOnchainJob,
   defaultIdentityOwner,
+  defaultPanelEventCount,
   defaultReputationSummary,
   defaultVerifySeatPairing,
   verifyBountyClaimed,
@@ -166,6 +167,13 @@ export interface JobsDeps {
   /** Onchain job reader for POST /jobs/:id/sync (eth_call getJob). */
   getOnchainJob?: GetOnchainJob;
   reputationSummary?: (agentId: bigint) => Promise<ReputationSummary | null>;
+  /**
+   * Per-writer panel-event count (registry.getLastIndex on the
+   * PanelBatchWriter). Defaults to a viem client against
+   * config.reputationRegistry when config.panelWriter is set; null when the
+   * writer is not configured (not deployed yet). Injectable for tests.
+   */
+  panelEventCount?: ((agentId: bigint) => Promise<string | null>) | null;
   /**
    * Live TRACES seat-pairing verifier. Defaults to a viem client against
    * config.seatsContract; null when no seat contract is configured (seat
@@ -325,6 +333,13 @@ export function createJobsApp(
   const reputationSummary =
     deps.reputationSummary ??
     defaultReputationSummary(config.rpcUrl, config.reputationRegistry);
+  // Panel-event count: only when the writer is configured (deployed). Null
+  // means "don't ask" — the history handler omits the field entirely.
+  const panelEventCount =
+    deps.panelEventCount ??
+    (config.panelWriter
+      ? defaultPanelEventCount(config.rpcUrl, config.reputationRegistry, config.panelWriter)
+      : null);
   const limiter = new AuthorRateLimiter();
   const bucket = deps.rateLimitBucket ?? JOBS_ACTION_BUCKET;
   const ipBucket = deps.ipRateLimitBucket ?? deps.rateLimitBucket ?? JOBS_IP_BUCKET;
@@ -583,6 +598,20 @@ export function createJobsApp(
     } catch {
       reputation = null;
     }
+    // Medium 3: panel snapshots ride as EscrowCompleted, so
+    // summary().totalEvents mixes advisory panel scores with real commerce.
+    // When FOUR02_PANEL_WRITER is configured (and the registry read
+    // worked), report the per-writer count so consumers can tell the two
+    // apart. Fail-soft: an RPC failure omits the field rather than failing
+    // the read.
+    let panelEvents: string | null = null;
+    if (panelEventCount && reputation !== null) {
+      try {
+        panelEvents = await panelEventCount(agentIdBig);
+      } catch {
+        panelEvents = null;
+      }
+    }
     // G1: requester concentration. A resume of 50 jobs from 1 requester
     // smells farmed; the per-requester counts make that visible.
     const jobsByRequester: Record<string, number> = {};
@@ -619,6 +648,7 @@ export function createJobsApp(
       agentId,
       jobs,
       reputation,
+      ...(panelEvents !== null ? { panelEvents } : {}),
       uniqueRequesters: Object.keys(jobsByRequester).length,
       jobsByRequester,
       currentOwner,

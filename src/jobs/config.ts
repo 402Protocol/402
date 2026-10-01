@@ -30,6 +30,14 @@ export interface JobsConfig {
   dbPath: string;
   /** Four02ReputationRegistry address for the worker-resume reads. */
   reputationRegistry: Address;
+  /**
+   * PanelBatchWriter address (FOUR02_PANEL_WRITER). When set, the worker
+   * history endpoint reports the per-agent panel-event count
+   * (registry.getLastIndex on the writer) so panel snapshots — recorded as
+   * EscrowCompleted — are not mistaken for real commerce in totalEvents.
+   * Null when unset (writer not deployed yet).
+   */
+  panelWriter: Address | null;
   /** Per-requester rolling-24h post cap (JOBS_DAILY_POST_CAP, default 50). */
   dailyPostCap: number;
   /**
@@ -148,6 +156,12 @@ export function loadJobsConfig(
   if (!isAddress(reputationRegistry)) {
     throw new Error('FOUR02_REPUTATION_REGISTRY is not a valid Ethereum address');
   }
+  // PanelBatchWriter for the worker-history panel-event count. Optional:
+  // the writer is not deployed yet, so unset is the normal state.
+  const panelWriterRaw = (env.FOUR02_PANEL_WRITER ?? '').trim();
+  if (panelWriterRaw && !isAddress(panelWriterRaw)) {
+    throw new Error('FOUR02_PANEL_WRITER is not a valid Ethereum address');
+  }
   const dailyPostCapRaw = env.JOBS_DAILY_POST_CAP ?? String(DEFAULT_JOBS_DAILY_POST_CAP);
   if (!/^\d+$/.test(dailyPostCapRaw)) {
     throw new Error('JOBS_DAILY_POST_CAP must be a positive integer');
@@ -214,6 +228,7 @@ export function loadJobsConfig(
     rpcUrl: env.INK_RPC_URL ?? INK_RPC_URL,
     dbPath: env.FOUR02_JOBS_DB_PATH ?? './jobs.db',
     reputationRegistry: getAddress(reputationRegistry),
+    panelWriter: panelWriterRaw ? getAddress(panelWriterRaw) : null,
     dailyPostCap,
     seatsRequired,
     seatsContract: seatsContractRaw ? getAddress(seatsContractRaw) : null,
