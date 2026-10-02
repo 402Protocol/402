@@ -31,7 +31,15 @@ def main() -> None:
     ap.add_argument("--sell-amount", required=True, help="amount in base units (integer string)")
     ap.add_argument("--taker", required=True, help="taker wallet address (used for calldata + allowance checks)")
     ap.add_argument("--slippage-bps", default="100", help="slippage tolerance in bps, default 100 = 1%")
+    ap.add_argument("--fee-bps", default="0", help="integrator fee in bps, 0 = none (max 1000)")
+    ap.add_argument("--fee-recipient", default="", help="address receiving the integrator fee (required when --fee-bps > 0)")
     args = ap.parse_args()
+
+    fee_bps = int(args.fee_bps)
+    if fee_bps < 0 or fee_bps > 1000:
+        raise SystemExit("--fee-bps must be 0-1000")
+    if fee_bps > 0 and not args.fee_recipient:
+        raise SystemExit("--fee-recipient is required when --fee-bps > 0")
 
     entry = dynamic_credential_entry("custom.0x")
     surrogate = str(entry["surrogate"]).strip()
@@ -40,16 +48,18 @@ def main() -> None:
     placement = entry.get("placement") or {}
     header_name = placement.get("custom_header", "0x-api-key")
 
-    params = urllib.parse.urlencode(
-        {
-            "chainId": args.chain_id,
-            "sellToken": args.sell_token,
-            "buyToken": args.buy_token,
-            "sellAmount": args.sell_amount,
-            "taker": args.taker,
-            "slippageBps": args.slippage_bps,
-        }
-    )
+    params = {
+        "chainId": args.chain_id,
+        "sellToken": args.sell_token,
+        "buyToken": args.buy_token,
+        "sellAmount": args.sell_amount,
+        "taker": args.taker,
+        "slippageBps": args.slippage_bps,
+    }
+    if fee_bps > 0:
+        params["swapFeeBps"] = str(fee_bps)
+        params["swapFeeRecipient"] = args.fee_recipient
+    params = urllib.parse.urlencode(params)
     url = f"https://api.0x.org/swap/allowance-holder/quote?{params}"
     ensure_allowed_url(url, ALLOWED_HOSTS)
 
@@ -76,6 +86,8 @@ def main() -> None:
         print(json.dumps({"error": "no buyAmount/transaction", "body": data}), file=sys.stderr)
         sys.exit(1)
     tx = data["transaction"] or {}
+    fees = data.get("fees") or {}
+    integrator = fees.get("integratorFee") or {}
     out = {
         "buyAmount": data.get("buyAmount"),
         "sellAmount": data.get("sellAmount"),
@@ -84,6 +96,10 @@ def main() -> None:
         "estimatedPriceImpact": data.get("estimatedPriceImpact"),
         "liquidityAvailable": data.get("liquidityAvailable"),
         "issues": data.get("issues"),
+        "integratorFee": {
+            "amount": integrator.get("amount"),
+            "token": integrator.get("token"),
+        } if integrator.get("amount") else None,
         "transaction": {
             "to": tx.get("to"),
             "data": tx.get("data"),

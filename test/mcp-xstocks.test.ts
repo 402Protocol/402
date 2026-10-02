@@ -138,4 +138,36 @@ await check('xstocks_balance reads wallet', async () => {
   assert.ok(typeof d.usdc === 'string' && typeof d.eth === 'string');
 });
 
+await check('xstocks_buy with fee configured discloses + takes integrator fee', async () => {
+  process.env.FOUR02_XSTOCKS_FEE_BPS = '50';
+  process.env.FOUR02_XSTOCKS_FEE_RECIPIENT = '0xaA4E163dA1545F6967d284C0C5CFA469C644eD23';
+  const feeServer = createMcpServer(loadMcpConfig());
+  const [ct2, st2] = InMemoryTransport.createLinkedPair();
+  const feeClient = new Client({ name: 'xstocks-fee-test-client', version: '0.0.0' });
+  await Promise.all([feeClient.connect(ct2), feeServer.connect(st2)]);
+  const d = textOf(
+    await feeClient.callTool({
+      name: 'xstocks_buy',
+      arguments: { ticker: 'AAPL', amountUsd: '10', walletAddress: PROBE_WALLET, backupVerified: true },
+    }),
+  );
+  assert.equal(d.ok, true);
+  assert.equal(d.fee.feeBps, 50);
+  assert.equal(d.fee.feeRecipient, getAddress('0xaA4E163dA1545F6967d284C0C5CFA469C644eD23'));
+  assert.ok(d.fee.taken, 'integrator fee should be reported');
+  assert.equal(d.fee.taken.token, 'wAAPLx');
+  assert.ok(parseFloat(d.fee.taken.amount) > 0, 'fee amount must be positive');
+  assert.equal(d.fee.taken.recipient, getAddress('0xaA4E163dA1545F6967d284C0C5CFA469C644eD23'));
+  // buyAmount is net of the 50 bps fee
+  const q = textOf(
+    await client.callTool({ name: 'xstocks_quote', arguments: { ticker: 'AAPL', amountUsd: '10' } }),
+  );
+  assert.ok(
+    parseFloat(d.expectedWrappedOut) < parseFloat(q.expectedWrappedOut),
+    'fee-on buy should net less than the fee-free quote',
+  );
+  delete process.env.FOUR02_XSTOCKS_FEE_BPS;
+  delete process.env.FOUR02_XSTOCKS_FEE_RECIPIENT;
+});
+
 console.log(`\n${passed} xstocks checks passed${process.exitCode ? ' (with failures)' : ''}`);

@@ -160,7 +160,10 @@ and she signs + broadcasts them herself with her own wallet key. The server
 never sees keys and never broadcasts. Buy/sell tools require
 `backupVerified:true` — no trading until the wallet has been through the
 `wallet_create` -> human backup -> `wallet_verify_backup` ritual and is
-funded with Ink ETH + USDC.
+funded with Ink ETH + USDC. **Fees:** the operator can take an integrator cut
+via `FOUR02_XSTOCKS_FEE_BPS` (0–1000, default 0 = off) +
+`FOUR02_XSTOCKS_FEE_RECIPIENT` (default: the 402 treasury) — applied once per
+trade on the stock leg, disclosed in every quote and trade output.
 
 **Exact "point your Muse here" prompt** — the human pastes this into their
 agent:

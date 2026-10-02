@@ -171,6 +171,16 @@ the wallet has been through it. Trust note: the Ink PoolManager is a custom
 deployment with an `owner()` (unlike canonical v4) — the owner can set protocol
 fees; trades execute through the 0x v2 settlement contract.
 
+**Integrator fee (operator-configured):** the MCP can take a cut of every stock
+trade via 0x's native integrator fee (`swapFeeBps` / `swapFeeRecipient`).
+Env vars: `FOUR02_XSTOCKS_FEE_BPS` (0–1000, default 0 = off) and
+`FOUR02_XSTOCKS_FEE_RECIPIENT` (default: the 402 treasury
+`0xaA4E163dA1545F6967d284C0C5CFA469C644eD23`). The fee applies once per trade,
+on the stock leg only (USDG → wSTOCK on buys, wSTOCK → USDG on sells), taken in
+the buy token and sent onchain to the recipient by the 0x settlement contract.
+Every quote and trade output discloses the fee schedule and the exact amount
+taken — never hidden.
+
 ### Endpoints
 
 - `GET /supported` → `{ kinds: [{ x402Version: 2, scheme: "exact", network: "eip155:57073" }], extensions: [], signers? }`

@@ -53,6 +53,32 @@ export const USDG_DECIMALS = 6;
 export const USDC_DECIMALS = 6;
 const WRAPPED_DECIMALS = 18;
 
+/** Default integrator-fee recipient: the 402 treasury (pure recipient, Father holds the key). */
+export const DEFAULT_FEE_RECIPIENT = getAddress('0xaA4E163dA1545F6967d284C0C5CFA469C644eD23');
+
+/**
+ * Integrator fee config, operator-set via env (the MCP runs per-operator over
+ * stdio, so whoever distributes it configures their own take):
+ * - FOUR02_XSTOCKS_FEE_BPS: 0-1000, default 0 (off).
+ * - FOUR02_XSTOCKS_FEE_RECIPIENT: default the 402 treasury.
+ * The fee applies ONCE per stock trade, on the leg touching the wrapped stock
+ * token (USDG -> wSTOCK on buys, wSTOCK -> USDG on sells), taken in the buy
+ * token and sent onchain to the recipient by the 0x settlement contract.
+ */
+export interface XstocksFeeConfig {
+  bps: number;
+  recipient: Address;
+}
+export function loadXstocksFeeConfig(): XstocksFeeConfig {
+  const bps = parseInt((process.env.FOUR02_XSTOCKS_FEE_BPS ?? '0').trim(), 10);
+  if (!Number.isInteger(bps) || bps < 0 || bps > 1000) {
+    throw new Error('FOUR02_XSTOCKS_FEE_BPS must be an integer 0-1000');
+  }
+  const raw = (process.env.FOUR02_XSTOCKS_FEE_RECIPIENT ?? '').trim();
+  const recipient = raw ? getAddress(raw) : DEFAULT_FEE_RECIPIENT;
+  return { bps, recipient };
+}
+
 /** Verified Quotrons Ink pools (2026-10-02). Pair asset is USDG for all. */
 export interface XStockPool {
   ticker: string;
@@ -161,9 +187,14 @@ interface OxQuoteTx {
   gas?: string;
   gasPrice?: string;
 }
+interface OxIntegratorFee {
+  amount: string;
+  token: Address;
+}
 interface OxQuote extends OxPrice {
   transaction: OxQuoteTx;
   allowanceSpender?: Address;
+  integratorFee?: OxIntegratorFee;
 }
 function oxSwapQuote(
   sellToken: Address,
@@ -171,10 +202,9 @@ function oxSwapQuote(
   sellAmount: bigint,
   taker: Address,
   slippageBps = 100,
+  fee: XstocksFeeConfig = { bps: 0, recipient: DEFAULT_FEE_RECIPIENT },
 ): OxQuote {
-  const out = execFileSync(
-    'python3',
-    [
+  const args = [
       OX_QUOTE_BIN,
       '--chain-id', String(CHAIN_ID),
       '--sell-token', sellToken,
@@ -182,11 +212,18 @@ function oxSwapQuote(
       '--sell-amount', sellAmount.toString(),
       '--taker', taker,
       '--slippage-bps', String(slippageBps),
-    ],
+  ];
+  if (fee.bps > 0) {
+    args.push('--fee-bps', String(fee.bps), '--fee-recipient', fee.recipient);
+  }
+  const out = execFileSync(
+    'python3',
+    args,
     { encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024 },
   );
   const d = JSON.parse(out);
   const tx = d.transaction ?? {};
+  const int = d.integratorFee ?? {};
   return {
     buyAmount: d.buyAmount,
     sellAmount: d.sellAmount,
@@ -202,6 +239,9 @@ function oxSwapQuote(
     allowanceSpender: d?.issues?.allowance?.spender
       ? getAddress(d.issues.allowance.spender)
       : undefined,
+    integratorFee: int.amount
+      ? { amount: int.amount, token: getAddress(int.token) }
+      : undefined,
   };
 }
 
@@ -215,6 +255,30 @@ export function registerXstocksTools(
 ) {
   const publicClient = createPublicClient({ chain: ink, transport: http(opts.inkRpcUrl) });
   const usdc = getAddress(USDC_ADDRESS);
+  const fee = loadXstocksFeeConfig();
+
+  /** Disclosed fee schedule block included in every trade-related output. */
+  function feeDisclosure() {
+    return {
+      feeBps: fee.bps,
+      feeRecipient: fee.recipient,
+      appliesTo: 'stock leg only (USDG -> wSTOCK on buys, wSTOCK -> USDG on sells)',
+      note:
+        fee.bps === 0
+          ? 'No integrator fee configured (FOUR02_XSTOCKS_FEE_BPS=0).'
+          : `A ${fee.bps} bps integrator fee is taken in the buy token on the stock leg and sent onchain to the fee recipient by the 0x settlement contract.`,
+    };
+  }
+
+  function feeTaken(q: OxQuote, tokenDecimals: number, tokenSymbol: string) {
+    if (!q.integratorFee) return null;
+    return {
+      amount: formatUnits(BigInt(q.integratorFee.amount), tokenDecimals),
+      token: tokenSymbol,
+      tokenAddress: q.integratorFee.token,
+      recipient: fee.recipient,
+    };
+  }
 
   async function allowance(token: Address, owner: Address, spender: Address): Promise<bigint> {
     return (await publicClient.readContract({
@@ -341,12 +405,18 @@ export function registerXstocksTools(
         ],
         totalInUsdc: args.amountUsd,
         expectedWrappedOut: formatUnits(BigInt(leg2.buyAmount), WRAPPED_DECIMALS),
+        fee: {
+          ...feeDisclosure(),
+          note: fee.bps === 0
+            ? 'No integrator fee configured.'
+            : 'Quoted amounts are PRE-FEE. On execution the fee is deducted from the buy amount on the stock leg (USDG -> wSTOCK) and sent to the fee recipient.',
+        },
         note: 'Indicative quote. Actual execution goes through the 0x v2 settlement contract; final amounts depend on pool state at execution.',
       });
     },
   );
 
-  /** Build ordered unsigned txs for USDC -> USDG -> wTICKER. */
+  /** Build ordered unsigned txs for USDC -> USDG -> wTICKER. Fee on the stock leg. */
   async function buildBuyTxs(
     pool: XStockPool,
     usdcIn: bigint,
@@ -356,7 +426,7 @@ export function registerXstocksTools(
     // Quotes first (read-only) so approvals and leg-2 sizing are exact.
     const leg1 = oxSwapQuote(usdc, USDG_ADDRESS, usdcIn, wallet, slippageBps);
     const usdgOut = BigInt(leg1.buyAmount);
-    const leg2 = oxSwapQuote(USDG_ADDRESS, pool.wrapped, usdgOut, wallet, slippageBps);
+    const leg2 = oxSwapQuote(USDG_ADDRESS, pool.wrapped, usdgOut, wallet, slippageBps, fee);
     const spender = leg1.allowanceSpender ?? leg2.allowanceSpender;
     if (!spender) throw new Error('0x quote did not report an allowance spender');
 
@@ -370,6 +440,7 @@ export function registerXstocksTools(
       expectedWrappedOut: formatUnits(BigInt(leg2.buyAmount), WRAPPED_DECIMALS),
       usdgOut: formatUnits(usdgOut, USDG_DECIMALS),
       spender,
+      integratorFee: feeTaken(leg2, WRAPPED_DECIMALS, `w${pool.ticker}x`),
     };
   }
 
@@ -404,6 +475,7 @@ export function registerXstocksTools(
         usdgLeg: built.usdgOut,
         slippageBps,
         chainId: CHAIN_ID,
+        fee: { ...feeDisclosure(), taken: built.integratorFee },
         sign_and_broadcast: [
           'Sign each transaction below IN ORDER with her own wallet key (the one from wallet_create).',
           'Send (broadcast) each signed tx to Ink (chain 57073) and wait for 1 confirmation before the next.',
@@ -453,7 +525,7 @@ export function registerXstocksTools(
         wrappedIn = parseUnits(args.amountWrapped, WRAPPED_DECIMALS);
         if (wrappedIn <= 0n) throw new Error('amountWrapped must be > 0');
       }
-      const leg1 = oxSwapQuote(pool.wrapped, USDG_ADDRESS, wrappedIn, wallet, slippageBps);
+      const leg1 = oxSwapQuote(pool.wrapped, USDG_ADDRESS, wrappedIn, wallet, slippageBps, fee);
       const usdgOut = BigInt(leg1.buyAmount);
       const leg2 = oxSwapQuote(USDG_ADDRESS, usdc, usdgOut, wallet, slippageBps);
       const spender = leg1.allowanceSpender ?? leg2.allowanceSpender;
@@ -471,6 +543,7 @@ export function registerXstocksTools(
         expectedUsdc: formatUnits(BigInt(leg2.buyAmount), USDC_DECIMALS),
         slippageBps,
         chainId: CHAIN_ID,
+        fee: { ...feeDisclosure(), taken: feeTaken(leg1, USDG_DECIMALS, 'USDG') },
         sign_and_broadcast: [
           'Sign each transaction below IN ORDER with her own wallet key.',
           'Send each signed tx to Ink (chain 57073), waiting 1 confirmation between txs.',
@@ -583,7 +656,7 @@ export function registerXstocksTools(
       let usdgApproved = false;
       for (const leg of legs) {
         const shareUsdg = (totalUsdg * leg.usdcIn) / totalIn;
-        const l2 = oxSwapQuote(USDG_ADDRESS, leg.pool.wrapped, shareUsdg, wallet, slippageBps);
+        const l2 = oxSwapQuote(USDG_ADDRESS, leg.pool.wrapped, shareUsdg, wallet, slippageBps, fee);
         if (!usdgApproved) {
           await approveTxIfNeeded(USDG_ADDRESS, wallet, spender, totalUsdg, txs);
           usdgApproved = true;
@@ -598,6 +671,7 @@ export function registerXstocksTools(
           spendUsdc: formatUnits(leg.usdcIn, USDC_DECIMALS),
           expectedWrappedOut: formatUnits(BigInt(l2.buyAmount), WRAPPED_DECIMALS),
           priceImpactBps: l2.estimatedPriceImpact,
+          feeTaken: feeTaken(l2, WRAPPED_DECIMALS, `w${leg.pool.ticker}x`),
         });
       }
       return textResult({
@@ -609,6 +683,7 @@ export function registerXstocksTools(
         slippageBps,
         chainId: CHAIN_ID,
         breakdown,
+        fee: feeDisclosure(),
         sign_and_broadcast: [
           'Sign each transaction below IN ORDER with her own wallet key.',
           'Send each signed tx to Ink (chain 57073), waiting 1 confirmation between txs.',
@@ -667,7 +742,7 @@ export function registerXstocksTools(
       let totalUsdg = 0n;
       let spender: Address | undefined;
       for (const h of holdings) {
-        const l1 = oxSwapQuote(h.pool.wrapped, USDG_ADDRESS, h.bal, wallet, slippageBps);
+        const l1 = oxSwapQuote(h.pool.wrapped, USDG_ADDRESS, h.bal, wallet, slippageBps, fee);
         spender = spender ?? l1.allowanceSpender;
         const usdgOut = BigInt(l1.buyAmount);
         totalUsdg += usdgOut;
@@ -677,6 +752,7 @@ export function registerXstocksTools(
           ticker: h.pool.ticker,
           soldWrapped: formatUnits(h.bal, WRAPPED_DECIMALS),
           expectedUsdg: formatUnits(usdgOut, USDG_DECIMALS),
+          feeTaken: feeTaken(l1, USDG_DECIMALS, 'USDG'),
         });
       }
       if (!spender) throw new Error('0x quote did not report an allowance spender');
@@ -691,6 +767,7 @@ export function registerXstocksTools(
         slippageBps,
         chainId: CHAIN_ID,
         breakdown,
+        fee: feeDisclosure(),
         sign_and_broadcast: [
           'Sign each transaction below IN ORDER with her own wallet key.',
           'Send each signed tx to Ink (chain 57073), waiting 1 confirmation between txs.',
