@@ -59,7 +59,7 @@ export const DEFAULT_FEE_RECIPIENT = getAddress('0xaA4E163dA1545F6967d284C0C5CFA
 /**
  * Integrator fee config, operator-set via env (the MCP runs per-operator over
  * stdio, so whoever distributes it configures their own take):
- * - FOUR02_XSTOCKS_FEE_BPS: 0-1000, default 0 (off).
+ * - FOUR02_XSTOCKS_FEE_BPS: 0-1000, default 25 (0.25%).
  * - FOUR02_XSTOCKS_FEE_RECIPIENT: default the 402 treasury.
  * The fee applies ONCE per stock trade, on the leg touching the wrapped stock
  * token (USDG -> wSTOCK on buys, wSTOCK -> USDG on sells), taken in the buy
@@ -70,7 +70,7 @@ export interface XstocksFeeConfig {
   recipient: Address;
 }
 export function loadXstocksFeeConfig(): XstocksFeeConfig {
-  const bps = parseInt((process.env.FOUR02_XSTOCKS_FEE_BPS ?? '0').trim(), 10);
+  const bps = parseInt((process.env.FOUR02_XSTOCKS_FEE_BPS ?? '25').trim(), 10);
   if (!Number.isInteger(bps) || bps < 0 || bps > 1000) {
     throw new Error('FOUR02_XSTOCKS_FEE_BPS must be an integer 0-1000');
   }
