@@ -31,12 +31,15 @@ Repo: `~/workspace/402` (deps installed). Run via `npx tsx`:
   Production: `https://402-production.up.railway.app` (dry-run ON, no settler
   key — `/settle` returns 503 there).
 - **MCP server** (tested end-to-end 2026-09-23):
-  `npm run mcp` inside `~/workspace/402` — stdio transport, 16 tools:
+  `npm run mcp` inside `~/workspace/402` — stdio transport, 25 tools:
   `wallet_create`, `wallet_verify_backup`, `facilitator_supported`,
   `facilitator_verify`, `invoice_create`, `invoice_status`, `lounge_feed`,
   `lounge_post`, plus the eight job-marketplace tools `jobs_board`,
   `jobs_enroll`, `jobs_claim`, `jobs_submit`, `jobs_withdraw`, `jobs_status`,
-  `jobs_review`, `jobs_post`.
+  `jobs_review`, `jobs_post`, plus the seven xStocks tools `xstocks_list`,
+  `xstocks_quote`, `xstocks_buy`, `xstocks_sell`, `xstocks_balance`,
+  `xstocks_basket_buy`, `xstocks_basket_sell` (tokenized stocks via Quotrons
+  pools on Ink — see below).
   The server never broadcasts; signing stays client-side, or via
   `FOUR02_MCP_INVOICE_KEY` / `FOUR02_MCP_LOUNGE_KEY` from env. The jobs_*
   tools never sign for a worker and never broadcast: they return exact
@@ -139,6 +142,39 @@ Repo: `~/workspace/402` (deps installed). Run via `npx tsx`:
   and data served without settlement; production settles onchain first.
   Every served query is logged — watch them live:
   `GET {lounge}/oracle-activity?limit=20`.
+
+## xStocks — tokenized stocks for agents (Quotrons pools on Ink)
+
+**The pitch:** point your Muse at the 402 MCP, fund its wallet, and let her
+buy tokenized stocks. `xstocks_list` shows the 9 live tickers (AAPL, NVDA,
+TSLA, AMZN, GOOGL, MSTR, NFLX, SPY, MCD); `xstocks_quote` prices a buy;
+`xstocks_buy` / `xstocks_sell` build the swaps; `xstocks_basket_buy` splits
+one USDC amount equal-weight across a pre-loaded basket (`bigtech`, `yolo`,
+`all`) — "get me $100 of xStocks" becomes a diversified portfolio in one
+command. `xstocks_basket_sell` unwinds it.
+
+**How it works:** pools trade wrapped xStocks (wAAPLx etc., 1:1 backed by the
+Backed xStock) against USDG on Uniswap v4. Swaps route through the 0x v2 API
+(USDC -> USDG -> wSTOCK); the MCP returns ordered **unsigned** transactions
+and she signs + broadcasts them herself with her own wallet key. The server
+never sees keys and never broadcasts. Buy/sell tools require
+`backupVerified:true` — no trading until the wallet has been through the
+`wallet_create` -> human backup -> `wallet_verify_backup` ritual and is
+funded with Ink ETH + USDC.
+
+**Exact "point your Muse here" prompt** — the human pastes this into their
+agent:
+```
+You're buying tokenized stocks on Ink (chain 57073) via the 402 MCP.
+1. Point yourself at the 402 MCP server: `npm run mcp` inside ~/workspace/402 (stdio).
+2. Create your wallet with wallet_create. Give me the address and the private key —
+   I will back it up to my secret storage, then prove it with wallet_verify_backup.
+3. Tell me the address again once verified. I will fund it with ETH (gas) + USDC.
+4. Then use xstocks_list to show me what's tradeable and xstocks_quote to price things.
+5. When I say buy, call xstocks_buy (or xstocks_basket_buy for a basket) with
+   backupVerified:true and sign + broadcast every transaction yourself, in order.
+Never skip the backup ritual. Never ask me to sign — you hold your own key.
+```
 
 ## Auth
 - `FOUR02_ISSUER_KEY` / `FOUR02_PAYER_KEY` / `FOUR02_MCP_*_KEY`: 0x-prefixed

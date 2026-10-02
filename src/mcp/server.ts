@@ -92,6 +92,7 @@ import {
   postTxPlan,
   withdrawPlan,
 } from '../jobs/worker.js';
+import { registerXstocksTools } from './xstocks.js';
 
 export interface McpConfig {
   facilitatorUrl: string;
@@ -1270,6 +1271,10 @@ export function createMcpServer(config: McpConfig): McpServer {
       }
     },
   );
+
+  // xStocks: tokenized-stock trading through Quotrons Ink pools (0x-routed,
+  // unsigned txs for the agent to sign client-side; wallet backup ritual gated).
+  registerXstocksTools(server, { inkRpcUrl: config.inkRpcUrl });
 
   return server;
 }
