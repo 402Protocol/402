@@ -18,6 +18,14 @@
   fresh wallet, feeRecipient = treasury, token = Ink USDC,
   reputationRegistry = V2 above, identityRegistry = 0x7274e874CA62410a93Bd8bf61c69d8045E399c02.
   Source verified on the Ink explorer.
+- **BountyEscrow v2 (2026-10-02):** `0x04dd0829407261767e39c3a7d9438dd7d2d37d00`
+  (tx `0x5635127c9f56c689707e1a19ec44ba623026775d1e935c26acaff22e70a85e34`).
+  Identical params to v1 except `feeRecipient` = new treasury
+  `0xaA4E163dA1545F6967d284C0C5CFA469C644eD23` (old treasury was reused in
+  another project). Deployed by 402 Manager; all 11 immutables re-verified
+  onchain. v1 goes dormant — no live bounties existed to migrate. Registry
+  owner must call `addWriter(v2)` on Four02ReputationRegistryV2 before the
+  first v2 bounty.
 - V1 registry `0x33E2c56035C059553a37a3A56199B5b5b3DA3365` remains abandoned.
 
 ## What it is

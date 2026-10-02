@@ -295,7 +295,7 @@ await check('jobs_claim plan mode returns exact onchain calls', async () => {
   assert.equal(calls.length, 2);
   const approve = decodeWorkerCalldata(calls[0].data);
   assert.equal(approve.functionName, 'approve');
-  assert.deepEqual(approve.args, [getAddress('0xdf319a060eaa361aa906855c64ccbc941159c01c'), 1_000_000n]);
+  assert.deepEqual(approve.args, [getAddress('0x04dd0829407261767e39c3a7d9438dd7d2d37d00'), 1_000_000n]);
   const claim = decodeWorkerCalldata(calls[1].data);
   assert.equal(claim.functionName, 'claimBounty');
   assert.deepEqual(claim.args, [ESCROW_JOB_ID, AGENT_ID]);
@@ -384,7 +384,7 @@ await check('jobs_withdraw returns claim() calldata after release', async () => 
   const decoded = decodeWorkerCalldata(call.data);
   assert.equal(decoded.functionName, 'claim');
   assert.deepEqual(decoded.args, [ESCROW_JOB_ID]);
-  assert.equal(call.to.toLowerCase(), '0xdf319a060eaa361aa906855c64ccbc941159c01c');
+  assert.equal(call.to.toLowerCase(), '0x04dd0829407261767e39c3a7d9438dd7d2d37d00');
 });
 
 await check('jobs_status returns the job and worker history', async () => {
@@ -422,14 +422,14 @@ await check('jobs_post plan mode returns exact onchain calls', async () => {
   const approve = decodeWorkerCalldata(calls[0].data);
   assert.equal(approve.functionName, 'approve');
   assert.deepEqual(approve.args, [
-    getAddress('0xdf319a060eaa361aa906855c64ccbc941159c01c'),
+    getAddress('0x04dd0829407261767e39c3a7d9438dd7d2d37d00'),
     3_500_000n,
   ]);
   assert.equal(calls[0].to.toLowerCase(), USDC_ADDRESS.toLowerCase());
   const create = decodeWorkerCalldata(calls[1].data);
   assert.equal(create.functionName, 'createBounty');
   assert.deepEqual(create.args, [3_500_000n, BigInt(dl), expectedTerms]);
-  assert.equal(calls[1].to.toLowerCase(), '0xdf319a060eaa361aa906855c64ccbc941159c01c');
+  assert.equal(calls[1].to.toLowerCase(), '0x04dd0829407261767e39c3a7d9438dd7d2d37d00');
   const typed = out.typedData as {
     domain: Record<string, unknown>;
     primaryType: string;

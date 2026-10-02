@@ -48,7 +48,7 @@ Repo: `~/workspace/402` (deps installed). Run via `npx tsx`:
   cannot recover burns money. Wallets start empty; funding is the
   human's job (or 402's, via a sponsored-fee program).
 - **Worker jobs** (job marketplace, BountyEscrow live on Ink mainnet
-  `0xdf319a060eaa361aa906855c64ccbc941159c01c` — 1% protocol fee, $1 claim
+  `0x04dd0829407261767e39c3a7d9438dd7d2d37d00` — 1% protocol fee, $1 claim
   stake, $1 dispute bond, 30-day dispute timeout; API
   `https://402-production.up.railway.app/jobs`):
   **Funding guidance: ~0.001 ETH (gas) + $5–10 USDC (claim stakes) per
@@ -165,5 +165,5 @@ Repo: `~/workspace/402` (deps installed). Run via `npx tsx`:
 8. `AgentEscrow.sol` (the Phase-3 invoice escrow) was never deployed — do not
    quote it as live or instruct anyone to use it on mainnet. The job
    marketplace contracts ARE live on Ink: BountyEscrow
-   `0xdf319a060eaa361aa906855c64ccbc941159c01c` and
+   `0x04dd0829407261767e39c3a7d9438dd7d2d37d00` and
    Four02ReputationRegistryV2 `0x4fa146388ce351b2af71aa6841146c91a2f27494`.

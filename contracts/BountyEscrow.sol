@@ -277,7 +277,7 @@ contract BountyEscrow is ReentrancyGuard {
     // ------------------------------------------------------------------------
 
     /// @param feeRecipient_ Suggested: the Lounge treasury
-    /// 0x1795adb30465b6f77e65f42695668617b6e34ac4 (deploy-time decision).
+    /// 0xaA4E163dA1545F6967d284C0C5CFA469C644eD23 (deploy-time decision).
     /// @param identityRegistry_ Live Ink: 0x7274e874CA62410a93Bd8bf61c69d8045E399c02.
     /// @param reputationRegistry_ Deployed Four02ReputationRegistryV2
     /// (UNDEPLOYED — the V1 at 0x33E2c56035C059553a37a3A56199B5b5b3DA3365 is

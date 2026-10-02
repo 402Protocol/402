@@ -43,7 +43,7 @@ if/when they finalize — a contribution to the stack, not a land grab.
 One contract: `Four02ValidationRegistry`.
 
 External references (all immutable at deploy):
-- `escrow` — BountyEscrow (`0xdf319a060eaa361aa906855c64ccbc941159c01c`)
+- `escrow` — BountyEscrow v2 (`0x04dd0829407261767e39c3a7d9438dd7d2d37d00`; v1 `0xdf319a060eaa361aa906855c64ccbc941159c01c` dormant since 2026-10-02)
 - `token` — Ink USDC (`0x2D270e6886d130D724215A266106e6832161EAEd`)
 - `identityRegistry` — `0x7274e874CA62410a93Bd8bf61c69d8045E399c02` (optional agent binding)
 - `humanFallback` — Father's fresh wallet (quorum-failure backstop only)

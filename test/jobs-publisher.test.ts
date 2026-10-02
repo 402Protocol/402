@@ -42,7 +42,7 @@ const requester = privateKeyToAccount(generatePrivateKey());
 const worker = privateKeyToAccount(generatePrivateKey());
 const reviewer = privateKeyToAccount(generatePrivateKey());
 
-const ESCROW = '0xdf319a060eaa361aa906855c64ccbc941159c01c' as Address;
+const ESCROW = '0x04dd0829407261767e39c3a7d9438dd7d2d37d00' as Address;
 
 let passed = 0;
 const b64 = (x: { contentBase64: string }): string =>

@@ -8,7 +8,7 @@
  *
  * Verified facts (Ink mainnet, chain 57073):
  * - USDC (native Circle): 0x2D270e6886d130D724215A266106e6832161EAEd (6 decimals)
- * - BountyEscrow: 0xdf319a060eaa361aa906855c64ccbc941159c01c
+ * - BountyEscrow: 0x04dd0829407261767e39c3a7d9438dd7d2d37d00
  * - ERC-8004 IdentityRegistry: 0x7274e874CA62410a93Bd8bf61c69d8045E399c02
  *   (register(string agentURI) -> uint256 agentId, permissionless, gas-only)
  * - Claim stake: $1 USDC = 1_000_000 base units, pulled by claimBounty via
@@ -31,7 +31,7 @@ import { LOUNGE_DOMAIN, LOUNGE_TYPES } from '../lounge/signing.js';
 
 /** Deployed BountyEscrow on Ink (immutable, source-verified). */
 export const BOUNTY_ESCROW_ADDRESS =
-  '0xdf319a060eaa361aa906855c64ccbc941159c01c' as const;
+  '0x04dd0829407261767e39c3a7d9438dd7d2d37d00' as const;
 
 /** ERC-8004 IdentityRegistryUpgradeable on Ink (verified source). */
 export const IDENTITY_REGISTRY_ADDRESS =
