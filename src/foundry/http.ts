@@ -95,7 +95,7 @@ You are running the Foundry launch sequence for your human: forge a memecoin on 
 ## Step 0: install your tools (one command)
 
 \`\`\`bash
-npx -y 402-foundry-mcp
+npx -y 402-foundry-mcp@latest
 \`\`\`
 
 Add it to your MCP config:
@@ -105,7 +105,7 @@ Add it to your MCP config:
   "mcpServers": {
     "foundry": {
       "command": "npx",
-      "args": ["-y", "402-foundry-mcp"],
+      "args": ["-y", "402-foundry-mcp@latest"],
       "env": { "HOOKIT_PRIVATE_KEY": "<launch-wallet-private-key>" }
     }
   }
