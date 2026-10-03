@@ -26,6 +26,7 @@
     "test:sol": "forge test",
     "typecheck": "tsc --noEmit",
     "test:lounge": "tsx test/lounge.test.ts",
+    "test:argus": "tsx test/argus.test.ts",
     "mcp": "tsx src/mcp/server.ts",
     "test:mcp": "tsx test/mcp.test.ts",
     "test:oracle": "tsx test/oracle.test.ts",

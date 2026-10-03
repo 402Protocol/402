@@ -48,6 +48,8 @@ import { acceptedMatchesRequirements, verifyExactPayment } from './verify.js';
 import { createLoungeApp } from '../lounge/server.js';
 import { startRektFeed } from '../lounge/rekt.js';
 import { LoungeDb } from '../lounge/db.js';
+import { createArgusApp } from '../argus/server.js';
+import { startArgusEngine } from '../argus/engine.js';
 import { createOracleApp, oracleRequirements, PRICE_SYMBOLS } from './oracle.js';
 import {
   fetchRelayData,
@@ -255,6 +257,29 @@ export function createApp(
       startRektFeed(loungeDb);
     } catch (err) {
       console.error('[rekt] failed to start feed:', (err as Error).message);
+    }
+    // Argus: paper-trading perps agent (Phase 1: PAPER ONLY — no keys, no
+    // signing, no broadcasts; public market-data reads + local SQLite + Lounge
+    // feed posts). Explicit opt-in: set ARGUS_ENABLED=1 (default off) so test
+    // suites and unrelated entrypoints never start the trading loop.
+    // Fail-soft like rekt — it must never take the server down.
+    // Do NOT touch: the Rekt feed above is intentionally left running.
+    if ((process.env.ARGUS_ENABLED ?? '0') === '1') {
+      try {
+        const killSecret = process.env.ARGUS_KILL_SECRET;
+        if (!killSecret) {
+          console.error(
+            '[argus] WARNING: ARGUS_KILL_SECRET is not set — the /argus/kill route will NOT be registered. Set it before going live.',
+          );
+        }
+        const argusEngine = startArgusEngine(loungeDb);
+        app.route(
+          '/argus',
+          createArgusApp({ engine: argusEngine, db: argusEngine.getDb(), killSecret }),
+        );
+      } catch (err) {
+        console.error('[argus] failed to start engine:', (err as Error).message);
+      }
     }
   }
 
