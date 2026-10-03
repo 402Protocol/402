@@ -14,6 +14,9 @@
  *   GET  /foundry/modules    modules from the catalog
  *   GET  /foundry/pairs      pairs from the catalog
  *   POST /foundry/dry-run    prepare-launch verdict (unsigned, never signed)
+ *   GET  /foundry/skill.md   the one-line agent onboarding: install the
+ *                            Foundry MCP and run the launch sequence. This is
+ *                            the handoff: give this URL to an agent, boom done.
  *
  * Safety properties (all enforced here, not trusted from callers):
  *   - This surface is read + simulate only. There is no code path here that
@@ -74,6 +77,79 @@ function errMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/**
+ * The one-line agent onboarding, served at GET /foundry/skill.md.
+ * Written for the agent reading it: install, wallet ritual, identity,
+ * the gated sequence, the rules. Kept tight on purpose.
+ */
+const FOUNDRY_SKILL = `# Foundry skill
+
+You are running the Foundry launch sequence for your human: forge a memecoin on Ink. Your human approves before anything real happens. Agents propose, humans approve.
+
+## Step 0: install your tools (one command)
+
+\`\`\`bash
+npx -y foundry-mcp
+\`\`\`
+
+Add it to your MCP config:
+
+\`\`\`json
+{
+  "mcpServers": {
+    "foundry": {
+      "command": "npx",
+      "args": ["-y", "foundry-mcp"],
+      "env": { "HOOKIT_PRIVATE_KEY": "<launch-wallet-private-key>" }
+    }
+  }
+}
+\`\`\`
+
+No-install fallback (reads and dry runs only, signs nothing):
+
+- GET https://402-production.up.railway.app/foundry/presets
+- GET https://402-production.up.railway.app/foundry/modules
+- GET https://402-production.up.railway.app/foundry/pairs
+- POST https://402-production.up.railway.app/foundry/dry-run
+
+## Step 1: wallet (first run only)
+
+1. Generate a fresh launch wallet. Never reuse a wallet between agents.
+2. Show the human the address and the seed phrase. The human backs it up offline and confirms.
+3. Fund it: 0.0005 ETH plus gas, on Ink. (Kraken withdraws ETH directly to Ink.)
+4. HOOKIT_PRIVATE_KEY goes in the MCP env. Never print it, never paste it into chat, never commit it.
+
+## Step 2: identity
+
+Check if you have an ERC-8004 identity. If not, register one (ask the human for anything you need). Pass your id as erc8004Id on every request_ tool. No ID, no launch.
+
+## Step 3: forge
+
+foundry_list_presets, foundry_list_modules, foundry_list_pairs. YOU choose the name, ticker, preset, and pair.
+
+## Step 4: dry run
+
+foundry_prepare_launch. Always a dry run, enforced. Show the human the verdict in plain words, including the opening anti-snipe tax if the preset carries one. Most presets open with a 90 percent anti-snipe tax for about 30 seconds. Say so.
+
+## Step 5: approval
+
+foundry_request_launch writes a pending approval. Tell the human what approving would do, then wait. Nothing is signed, funded, or launched without the human's word.
+
+## Step 6: launch
+
+On approval the launch executes and the record lands in foundry_launches under your ERC-8004 id. That is your track record.
+
+## Rules (never break)
+
+- Dry run before every launch.
+- Human approval before every launch, fee claim, and ETH send.
+- One ERC-8004 identity per agent. No ID, no launch.
+- Disclose the anti-snipe tax plainly.
+- Keys live in the environment only.
+- Never skip a step.
+`;
+
 export function createFoundryHttpApp(
   opts: FoundryHttpOptions = {},
 ): Hono {
@@ -109,6 +185,15 @@ export function createFoundryHttpApp(
 
   app.get('/health', (c) =>
     c.json({ ok: true, dryRunOnly: true, time: Date.now() }),
+  );
+
+  // The one-line agent onboarding. Give this URL to an agent: it installs
+  // the Foundry MCP and runs the launch sequence end to end. Docs only,
+  // no signing, no keys, nothing gated.
+  app.get('/skill.md', (c) =>
+    c.text(FOUNDRY_SKILL, 200, {
+      'content-type': 'text/markdown; charset=utf-8',
+    }),
   );
 
   // Public launch feed: every executed launch, latest first. Powers the

@@ -249,4 +249,17 @@ await check('GET /foundry/launches returns latest-first feed', async () => {
   }
 });
 
+await check('GET /foundry/skill.md serves the agent onboarding', async () => {
+  const { app } = mountedApp();
+  const res = await app.request('/foundry/skill.md');
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') ?? '', /text\/markdown/);
+  const text = await res.text();
+  assert.match(text, /npx -y foundry-mcp/);
+  assert.match(text, /HOOKIT_PRIVATE_KEY/);
+  assert.match(text, /No ID, no launch/);
+  assert.match(text, /Agents propose, humans approve/);
+  assert.match(text, /Never skip a step/);
+});
+
 console.log(`\nfoundry-http: ${passed} checks passed`);
