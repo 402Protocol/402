@@ -18,7 +18,7 @@ market-data reads.
 | `executor.ts` | Simulated fills at mark ± slippage, taker fee deducted from cash, positions, unrealized/realized PnL, stop-loss sweep, bankruptcy guard (auto-liquidate at full margin loss). Sanity-checks insane inputs. |
 | `db.ts` | `ArgusDb` (node:sqlite): portfolio, positions, trades, reasoning, equity_snapshots. Source of truth across restarts. |
 | `feed.ts` | Auto-posts every fill to the Lounge feed as the Argus system author. **Override note:** Father explicitly overrode the per-post-approval rule for Argus paper trades (2026-10-02, locked). Approval returns for real money. |
-| `engine.ts` | Tick loop (default 5 min): market snapshot → stops/liquidations → daily-loss-cap check → per-product strategy → risk → fill → persist → reason → feed post. Fail-soft; `ARGUS_ENABLED=0` disables. |
+| `engine.ts` | Tick loop (default 30s): market snapshot → stops/liquidations → daily-loss-cap check → per-product strategy → risk → fill → persist → reason → feed post. Fail-soft; `ARGUS_ENABLED=0` disables. |
 | `server.ts` | Hono routes (see Endpoints). Kill route registered ONLY with `ARGUS_KILL_SECRET` — otherwise it doesn't exist (fail closed). |
 
 ## Endpoints (mounted at `/argus`)
@@ -34,7 +34,7 @@ market-data reads.
 |---|---|---|
 | `ARGUS_ENABLED` | `0` | Set to `1` to run the engine (required on Railway). `0`/unset = engine off, `/argus` routes not mounted. |
 | `ARGUS_DB_PATH` | `./argus.db` | SQLite file (use `/data/argus.db` on Railway) |
-| `ARGUS_TICK_MS` | `300000` | 5 min; min 10s |
+| `ARGUS_TICK_MS` | `30000` | 30s; min 10s |
 | `ARGUS_KILL_SECRET` | — | **Father must set this.** Without it, `/argus/kill` is not registered and boot logs a loud warning. |
 | `ARGUS_PAIRS_URL` | Nado prod pairs | override for testing |
 | `ARGUS_INDEXER_URL` | Nado prod archive | override for testing |

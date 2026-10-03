@@ -74,8 +74,8 @@ export class ArgusEngine {
     opts: ArgusEngineOpts = {},
   ) {
     this.db = new ArgusDb(opts.dbPath ?? env('ARGUS_DB_PATH') ?? './argus.db');
-    this.tickMs = opts.tickMs ?? Number(env('ARGUS_TICK_MS') ?? '300000');
-    if (!Number.isFinite(this.tickMs) || this.tickMs < 10_000) this.tickMs = 300_000;
+    this.tickMs = opts.tickMs ?? Number(env('ARGUS_TICK_MS') ?? '30000');
+    if (!Number.isFinite(this.tickMs) || this.tickMs < 10_000) this.tickMs = 30_000;
     this.pairsUrl = opts.pairsUrl ?? env('ARGUS_PAIRS_URL') ?? ARGUS_PAIRS_URL_DEFAULT;
     this.indexerUrl = opts.indexerUrl ?? env('ARGUS_INDEXER_URL') ?? ARGUS_INDEXER_URL_DEFAULT;
     this.log = opts.log ?? ((m) => console.log(m));
