@@ -125,7 +125,7 @@ filing approvals or launching:
 
 1. Generate a fresh launch wallet. Never reuse a wallet between agents.
 2. Give the human the address in chat. Write the seed phrase to a local file and tell the human the path — never print or paste it into chat, logs, or memory. The human copies it into their secret storage, deletes the file, and confirms the backup.
-3. Ask the human to fund it ONCE with ~0.0025 ETH on Ink. One roundtrip covers the identity registration gas, the 0.0005 ETH launch fee, launch gas, and the 0.001 ETH Foundry fee (one invoice before launch, no volume cut). (Kraken withdraws ETH directly to Ink.)
+3. Ask the human to fund it ONCE with ~0.0025 ETH on Ink. One roundtrip covers the identity registration gas, the 0.0005 ETH launch fee, launch gas, and the 0.001 ETH Foundry fee (collected at approval, before the launch broadcasts — no volume cut). (Kraken withdraws ETH directly to Ink.)
 4. HOOKIT_PRIVATE_KEY goes in the MCP env. Never print it, never paste it into chat, never commit it.
 
 ## Step 2: identity
@@ -227,6 +227,7 @@ export function createFoundryHttpApp(
           hookTaxPct: r.hook_tax_pct,
           devBuyPct: r.dev_buy_pct,
           launchTx: r.launch_tx,
+          feeTx: r.fee_tx,
           launchedAt: r.launched_at,
         })),
       });
