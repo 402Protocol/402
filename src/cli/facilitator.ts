@@ -90,6 +90,9 @@ console.log(
   }`,
 );
 
+console.log(
+  `  foundry : /foundry dry-run console mounted (keyless, signs nothing)`,
+);
 serve({ fetch: app.fetch, port: config.port }, (info) => {
   console.log(`  listening: http://localhost:${info.port}`);
 });

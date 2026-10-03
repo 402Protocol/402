@@ -60,6 +60,7 @@ import {
 } from './relay.js';
 import { settlementRow } from './tape.js';
 import { createJobsApp } from '../jobs/server.js';
+import { createFoundryHttpApp } from '../foundry/http.js';
 import { createAgentsApp } from '../jobs/agents.js';
 import { defaultResolveAgentSeat } from '../jobs/escrow.js';
 import { JobsDb } from '../jobs/db.js';
@@ -233,6 +234,14 @@ export function createApp(
   app.use('/settle', rateLimit(opts.rateLimits?.settle ?? DEFAULT_SETTLE_LIMIT));
   // /relay/execute can spend operator gas — same strict bucket as /settle.
   app.use('/relay/execute', rateLimit(opts.rateLimits?.settle ?? DEFAULT_SETTLE_LIMIT));
+
+  // Foundry: public dry-run console for the agentic token launchpad.
+  // Keyless and sign-free by construction (see src/foundry/http.ts) — always
+  // mounted, no env gate. Per-IP backstop here; the dry-run budget itself is
+  // global (Hookit allows 50 prepare-launch/hour per egress IP, and this
+  // server is one IP to them).
+  app.use('/foundry/*', rateLimit({ windowMs: 60_000, max: 60 }));
+  app.route('/foundry', createFoundryHttpApp());
 
   app.get('/health', (c) =>
     c.json({ ok: true, dryRun: config.dryRun, time: Date.now() }),

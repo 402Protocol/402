@@ -41,6 +41,13 @@ export type HookitExecutor = (
 ) => Promise<unknown>;
 
 /**
+ * Per-tool timeout for Hookit calls. The Hookit server builds full launch
+ * calldata even for dry runs, which routinely exceeds the MCP SDK's 60s
+ * default — a dry-run would die with -32001 before the server answered.
+ */
+export const HOOKIT_TOOL_TIMEOUT_MS = 180_000;
+
+/**
  * Default executor: speaks MCP stdio to a `npx -y hookit-mcp` child process.
  * Refuses to run when HOOKIT_PRIVATE_KEY is absent — without a key the child
  * cannot sign, and we fail closed instead of half-working.
@@ -66,7 +73,11 @@ export async function defaultHookitExecutor(
   );
   await client.connect(transport);
   try {
-    return await client.callTool({ name: tool, arguments: params });
+    return await client.callTool(
+      { name: tool, arguments: params },
+      undefined,
+      { timeout: HOOKIT_TOOL_TIMEOUT_MS },
+    );
   } finally {
     await client.close();
   }

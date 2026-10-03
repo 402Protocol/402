@@ -39,7 +39,8 @@
     "claim": "tsx src/cli/claim.ts",
     "test:claim": "tsx test/claim.test.ts",
     "test:policies": "tsx test/policies.test.ts",
-    "test:foundry": "tsx test/foundry.test.ts"
+    "test:foundry": "tsx test/foundry.test.ts",
+    "test:foundry-http": "tsx test/foundry-http.test.ts"
   },
   "type": "module",
   "version": "0.3.0"
