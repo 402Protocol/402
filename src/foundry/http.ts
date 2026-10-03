@@ -112,7 +112,9 @@ Add it to your MCP config:
 }
 \`\`\`
 
-No-install fallback (reads and dry runs only, signs nothing):
+No-install fallback (steps 3-4 only: reads and dry runs, signs nothing).
+Steps 5-6 require the MCP install from Step 0 — there is no HTTP path for
+filing approvals or launching:
 
 - GET https://402-production.up.railway.app/foundry/presets
 - GET https://402-production.up.railway.app/foundry/modules
@@ -122,27 +124,27 @@ No-install fallback (reads and dry runs only, signs nothing):
 ## Step 1: wallet (first run only)
 
 1. Generate a fresh launch wallet. Never reuse a wallet between agents.
-2. Show the human the address and the seed phrase. The human backs it up offline and confirms.
-3. Ask the human to fund it ONCE with ~0.0015 ETH on Ink. One roundtrip covers the identity registration gas, the 0.0005 ETH launch fee, and launch gas. (Kraken withdraws ETH directly to Ink.)
+2. Give the human the address in chat. Write the seed phrase to a local file and tell the human the path — never print or paste it into chat, logs, or memory. The human copies it into their secret storage, deletes the file, and confirms the backup.
+3. Ask the human to fund it ONCE with ~0.0025 ETH on Ink. One roundtrip covers the identity registration gas, the 0.0005 ETH launch fee, launch gas, and the 0.001 ETH Foundry fee (one invoice before launch, no volume cut). (Kraken withdraws ETH directly to Ink.)
 4. HOOKIT_PRIVATE_KEY goes in the MCP env. Never print it, never paste it into chat, never commit it.
 
 ## Step 2: identity
 
-Check if you have an ERC-8004 identity. If not, register one as soon as the wallet is funded, then continue. You will need an Ink wallet with gas for that, so ask the human for it. Pass your id as erc8004Id on every request_ tool. No ID, no launch.
+Check if you have an ERC-8004 identity. If not, register one as soon as the wallet is funded, then continue. You will need an Ink wallet with gas for that, so ask the human for it. Pass your id as erc8004Id on every foundry_ MCP tool. (The HTTP dry-run doesn't take it.) No ID, no launch.
 
 ## Step 3: forge
 
-foundry_list_presets, foundry_list_modules, foundry_list_pairs. YOU choose the name, ticker, preset, and pair.
+foundry_list_presets, foundry_list_modules, foundry_list_pairs. YOU choose the name, ticker (or symbol — both work), preset, and pair.
 
 ## Step 4: dry run
 
 foundry_prepare_launch. Always a dry run, enforced. Show the human the verdict in plain words, including the opening anti-snipe tax if the preset carries one. Most presets open with a 90 percent anti-snipe tax for about 30 seconds. Say so.
 
-## Step 5: approval
+## Step 5: approval (MCP only — no HTTP fallback)
 
 foundry_request_launch writes a pending approval. Tell the human what approving would do, then wait. Nothing is signed, funded, or launched without the human's word.
 
-## Step 6: launch
+## Step 6: launch (MCP only)
 
 On approval the launch executes and the record lands in foundry_launches under your ERC-8004 id. That is your track record.
 
@@ -307,17 +309,17 @@ export function createFoundryHttpApp(
           result: verdict,
         });
       }
-      // Surface the opening anti-snipe tax as a first-class warning. Every
-      // Hookit preset (including "clean") opens with ~90% anti-snipe for
-      // about 30 seconds, and the upstream verdict does not say so — a
-      // normie launching their first coin should read it here, not discover
-      // it as a surprise. Skip only if the verdict already discloses it.
-      const warnings: string[] = [];
-      if (!/snipe/i.test(JSON.stringify(verdict ?? {}))) {
-        warnings.push(
-          'Opening anti-snipe tax: this launch opens with a 90% anti-snipe tax for about 30 seconds. The coin will look like a honeypot until it lifts. This is standard on Hookit launches, not a defect in the coin.',
-        );
-      }
+      // Surface the opening anti-snipe tax as a first-class warning, every
+      // time. Every Hookit preset (including "clean") opens with ~90%
+      // anti-snipe for about 30 seconds. The upstream verdict can mention
+      // "snipe" in machine-readable form (hook ids, calldata) without
+      // disclosing it in plain words — and relying on agent diligence for a
+      // disclosure that matters means a lazy agent skips it and the human
+      // never hears their coin looks like a honeypot for 30 seconds. Always
+      // warn; a duplicate warning costs nothing, a missing one costs trust.
+      const warnings: string[] = [
+        'Opening anti-snipe tax: this launch opens with a 90% anti-snipe tax for about 30 seconds. The coin will look like a honeypot until it lifts. This is standard on Hookit launches, not a defect in the coin.',
+      ];
       return c.json({ ok: true, dryRun: true, warnings, result: verdict });
     } catch (e) {
       return c.json({ ok: false, error: errMessage(e) }, 502);

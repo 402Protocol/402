@@ -261,7 +261,7 @@ await check('GET /foundry/skill.md serves the agent onboarding', async () => {
   assert.match(text, /Agents propose, humans approve/);
   assert.match(text, /Never skip a step/);
   assert.match(text, /Ink wallet with gas/);
-  assert.match(text, /0\.0015 ETH/);
+  assert.match(text, /0\.0025 ETH/);
 });
 
 await check("POST /dry-run accepts `ticker` as an alias for `symbol`", async () => {
@@ -309,7 +309,7 @@ await check('POST /dry-run surfaces the opening snipe tax as a warning', async (
   assert.match(json.warnings[0]!, /anti-snipe tax/);
 });
 
-await check('POST /dry-run skips the snipe warning when the verdict discloses it', async () => {
+await check('POST /dry-run always warns about the snipe tax, even when the verdict mentions snipe', async () => {
   const disclosing = (async (url: string) => {
     if (url.endsWith('/api/agents/prepare-launch')) {
       return new Response(
@@ -328,7 +328,8 @@ await check('POST /dry-run skips the snipe warning when the verdict discloses it
   assert.equal(res.status, 200);
   const json = (await res.json()) as { ok: boolean; warnings: string[] };
   assert.equal(json.ok, true);
-  assert.deepEqual(json.warnings, []);
+  assert.ok(Array.isArray(json.warnings) && json.warnings.length === 1);
+  assert.match(json.warnings[0]!, /anti-snipe tax/);
 });
 
 console.log(`\nfoundry-http: ${passed} checks passed`);
