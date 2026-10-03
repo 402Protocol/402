@@ -56,9 +56,12 @@ export interface FoundryHttpOptions {
  * POST /foundry/dry-run body. Bounds mirror the Foundry service validation;
  * fields are mapped onto Hookit's prepare-launch schema before forwarding.
  */
-const DryRunBody = z.object({
-  name: z.string().min(1).max(32),
-  symbol: z.string().regex(/^[A-Za-z0-9]{1,12}$/),
+const DryRunBody = z
+  .object({
+    name: z.string().min(1).max(32),
+    symbol: z.string().regex(/^[A-Za-z0-9]{1,12}$/).optional(),
+    /** Plain-words alias: fresh agents say "ticker", the schema says "symbol". */
+    ticker: z.string().regex(/^[A-Za-z0-9]{1,12}$/).optional(),
   pair: z.string().min(1),
   preset: z.string().min(1).optional(),
   modules: z.array(z.string().min(1)).max(12).optional(),
@@ -71,7 +74,10 @@ const DryRunBody = z.object({
   twitter: z.string().max(120).optional(),
   telegram: z.string().max(120).optional(),
   website: z.string().url().optional(),
-});
+})
+  .refine((d) => d.symbol ?? d.ticker, {
+    message: 'symbol is required ("ticker" is accepted as an alias)',
+  });
 
 function errMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -122,7 +128,7 @@ No-install fallback (reads and dry runs only, signs nothing):
 
 ## Step 2: identity
 
-Check if you have an ERC-8004 identity. If not, register one (ask the human for anything you need). Pass your id as erc8004Id on every request_ tool. No ID, no launch.
+Check if you have an ERC-8004 identity. If not, register one. You will need an Ink wallet with gas for that, so ask the human for it. Pass your id as erc8004Id on every request_ tool. No ID, no launch.
 
 ## Step 3: forge
 
@@ -258,10 +264,12 @@ export function createFoundryHttpApp(
     }
     const p = parsed.data;
     // Map onto Hookit's prepare-launch schema (their example uses
-    // lowercase pair ids like "eth").
+    // lowercase pair ids like "eth"). `ticker` is the plain-words alias
+    // fresh agents reach for; the schema calls it `symbol`.
+    const symbol = (p.symbol ?? p.ticker) as string;
     const upstream: Record<string, unknown> = {
       name: p.name,
-      symbol: p.symbol,
+      symbol,
       pair: p.pair.toLowerCase(),
     };
     if (p.preset) upstream.preset = p.preset;
@@ -299,7 +307,18 @@ export function createFoundryHttpApp(
           result: verdict,
         });
       }
-      return c.json({ ok: true, dryRun: true, result: verdict });
+      // Surface the opening anti-snipe tax as a first-class warning. Every
+      // Hookit preset (including "clean") opens with ~90% anti-snipe for
+      // about 30 seconds, and the upstream verdict does not say so — a
+      // normie launching their first coin should read it here, not discover
+      // it as a surprise. Skip only if the verdict already discloses it.
+      const warnings: string[] = [];
+      if (!/snipe/i.test(JSON.stringify(verdict ?? {}))) {
+        warnings.push(
+          'Opening anti-snipe tax: this launch opens with a 90% anti-snipe tax for about 30 seconds. The coin will look like a honeypot until it lifts. This is standard on Hookit launches, not a defect in the coin.',
+        );
+      }
+      return c.json({ ok: true, dryRun: true, warnings, result: verdict });
     } catch (e) {
       return c.json({ ok: false, error: errMessage(e) }, 502);
     }

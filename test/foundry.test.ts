@@ -20,6 +20,7 @@ import {
   defaultHookitExecutor,
   type HookitExecutor,
 } from '../src/foundry/service.js';
+import { toLaunchParams } from '../src/foundry/wrapper.js';
 
 let passed = 0;
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -346,6 +347,15 @@ await check('default executor refuses without HOOKIT_PRIVATE_KEY', async () => {
   } finally {
     if (saved !== undefined) process.env.HOOKIT_PRIVATE_KEY = saved;
   }
+});
+
+await check('ticker is accepted as an alias for symbol', () => {
+  const p = toLaunchParams({ name: 'Coin', ticker: 'TST', pair: 'eth', erc8004Id: '4076' });
+  assert.equal(p.symbol, 'TST');
+  assert.ok(!('ticker' in p));
+  assert.ok(!('erc8004Id' in p));
+  const explicit = toLaunchParams({ name: 'Coin', symbol: 'AAA', ticker: 'BBB', pair: 'eth' });
+  assert.equal(explicit.symbol, 'AAA'); // explicit symbol wins
 });
 
 console.log(`\n${passed} foundry checks passed`);

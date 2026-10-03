@@ -75,7 +75,8 @@ const erc8004IdSchema = z
 
 const launchInputSchema = {
   name: z.string().describe('Token name, 1-32 characters'),
-  symbol: z.string().describe('Token symbol, 1-12 letters or digits'),
+  symbol: z.string().optional().describe('Token symbol, 1-12 letters or digits (or pass ticker)'),
+  ticker: z.string().optional().describe('Plain-words alias for symbol'),
   pair: z.string().describe('Quote pair id from foundry_list_pairs (e.g. "eth")'),
   preset: z.string().optional().describe('Preset id from foundry_list_presets'),
   modules: z.array(z.string()).optional().describe('Module ids from foundry_list_modules'),
@@ -95,8 +96,14 @@ const launchInputSchema = {
   website: z.string().optional(),
 };
 
-function toLaunchParams(args: Record<string, unknown>): LaunchParams {
+/** Map tool args onto LaunchParams. `ticker` is the plain-words alias fresh
+ * agents reach for; the schema calls it `symbol`. Exported for tests. */
+export function toLaunchParams(args: Record<string, unknown>): LaunchParams {
   const { erc8004Id: _gate, ...rest } = args;
+  if (rest.symbol === undefined && typeof rest.ticker === 'string') {
+    rest.symbol = rest.ticker;
+  }
+  delete rest.ticker;
   return rest as unknown as LaunchParams;
 }
 

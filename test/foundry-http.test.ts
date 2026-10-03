@@ -260,6 +260,74 @@ await check('GET /foundry/skill.md serves the agent onboarding', async () => {
   assert.match(text, /No ID, no launch/);
   assert.match(text, /Agents propose, humans approve/);
   assert.match(text, /Never skip a step/);
+  assert.match(text, /Ink wallet with gas/);
+});
+
+await check("POST /dry-run accepts `ticker` as an alias for `symbol`", async () => {
+  const { app, mock } = mountedApp();
+  const { symbol: _drop, ...withoutSymbol } = dryRunBody;
+  const res = await app.request('/foundry/dry-run', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...withoutSymbol, ticker: 'TST' }),
+  });
+  assert.equal(res.status, 200);
+  const json = (await res.json()) as { ok: boolean };
+  assert.equal(json.ok, true);
+  const launchCalls = mock.calls.filter((c) =>
+    c.url.endsWith('/api/agents/prepare-launch'),
+  );
+  assert.equal(launchCalls.length, 1);
+  const sent = JSON.parse(launchCalls[0]!.init!.body as string) as Record<string, unknown>;
+  assert.equal(sent.symbol, 'TST');
+  assert.ok(!('ticker' in sent));
+});
+
+await check('POST /dry-run rejects a body with neither symbol nor ticker', async () => {
+  const { app } = mountedApp();
+  const { symbol: _drop, ...withoutSymbol } = dryRunBody;
+  const res = await app.request('/foundry/dry-run', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(withoutSymbol),
+  });
+  assert.equal(res.status, 400);
+});
+
+await check('POST /dry-run surfaces the opening snipe tax as a warning', async () => {
+  const { app } = mountedApp();
+  const res = await app.request('/foundry/dry-run', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(dryRunBody),
+  });
+  assert.equal(res.status, 200);
+  const json = (await res.json()) as { ok: boolean; warnings: string[] };
+  assert.equal(json.ok, true);
+  assert.ok(Array.isArray(json.warnings) && json.warnings.length === 1);
+  assert.match(json.warnings[0]!, /anti-snipe tax/);
+});
+
+await check('POST /dry-run skips the snipe warning when the verdict discloses it', async () => {
+  const disclosing = (async (url: string) => {
+    if (url.endsWith('/api/agents/prepare-launch')) {
+      return new Response(
+        JSON.stringify({ ok: true, snipeTaxPct: 90, warnings: ['90% snipe tax at open'] }),
+        { status: 200 },
+      );
+    }
+    return new Response(JSON.stringify(CATALOG), { status: 200 });
+  }) as unknown as typeof fetch;
+  const { app } = mountedApp({ fetchFn: disclosing });
+  const res = await app.request('/foundry/dry-run', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(dryRunBody),
+  });
+  assert.equal(res.status, 200);
+  const json = (await res.json()) as { ok: boolean; warnings: string[] };
+  assert.equal(json.ok, true);
+  assert.deepEqual(json.warnings, []);
 });
 
 console.log(`\nfoundry-http: ${passed} checks passed`);
