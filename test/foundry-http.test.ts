@@ -13,8 +13,11 @@
  * No network (fetch is injected), no keys, nothing signed. Deterministic.
  */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
 import { Hono } from 'hono';
 import { createFoundryHttpApp } from '../src/foundry/http.js';
+import { FoundryDb } from '../src/foundry/db.js';
 
 let passed = 0;
 async function check(name: string, fn: () => Promise<void> | void) {
@@ -211,6 +214,39 @@ await check('upstream 429 is passed through as 429', async () => {
     body: JSON.stringify(dryRunBody),
   });
   assert.equal(res.status, 429);
+});
+
+await check('GET /foundry/launches returns latest-first feed', async () => {
+  const tmp = `${os.tmpdir()}/foundry-http-test-${Date.now()}.db`;
+  process.env.FOUNDRY_DB_PATH = tmp;
+  try {
+    const db = new FoundryDb(tmp);
+    db.insertLaunch({
+      id: 'lnch_1', erc8004Id: '4076', tokenName: 'First', tokenSymbol: 'FST',
+      preset: 'clean', modulesJson: null, pair: 'eth', snipeTaxPct: 90,
+      hookTaxPct: 0, devBuyPct: 0, launchTx: '0xaaa', launchedAt: 100,
+    });
+    db.insertLaunch({
+      id: 'lnch_2', erc8004Id: '4076', tokenName: 'Second', tokenSymbol: 'SND',
+      preset: 'community', modulesJson: null, pair: 'usdg', snipeTaxPct: 90,
+      hookTaxPct: 3, devBuyPct: 1, launchTx: '0xbbb', launchedAt: 200,
+    });
+    db.close();
+    const { app } = mountedApp();
+    const res = await app.request('/foundry/launches');
+    assert.equal(res.status, 200);
+    const json = (await res.json()) as { ok: boolean; result: any[] };
+    assert.equal(json.ok, true);
+    assert.equal(json.result.length, 2);
+    assert.equal(json.result[0]!.tokenSymbol, 'SND'); // latest first
+    assert.equal(json.result[0]!.erc8004Id, '4076');
+    assert.equal(json.result[1]!.tokenSymbol, 'FST');
+    const limited = await app.request('/foundry/launches?limit=1');
+    assert.equal(((await limited.json()) as { result: any[] }).result.length, 1);
+  } finally {
+    delete process.env.FOUNDRY_DB_PATH;
+    fs.rmSync(tmp, { force: true });
+  }
 });
 
 console.log(`\nfoundry-http: ${passed} checks passed`);

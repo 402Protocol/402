@@ -35,6 +35,7 @@
  */
 import { Hono } from 'hono';
 import { z } from 'zod';
+import { FoundryDb } from './db.js';
 
 const HOOKIT_API_URL =
   (process.env.HOOKIT_API_URL ?? '').trim() || 'https://www.hookit.fun';
@@ -109,6 +110,37 @@ export function createFoundryHttpApp(
   app.get('/health', (c) =>
     c.json({ ok: true, dryRunOnly: true, time: Date.now() }),
   );
+
+  // Public launch feed: every executed launch, latest first. Powers the
+  // spectacle on the site. Rows carry nothing sensitive.
+  const dbPath = (process.env.FOUNDRY_DB_PATH ?? '').trim() || 'data/foundry.db';
+  const db = new FoundryDb(dbPath);
+  app.get('/launches', (c) => {
+    try {
+      const raw = Number.parseInt(c.req.query('limit') ?? '20', 10);
+      const limit = Math.min(Math.max(Number.isFinite(raw) ? raw : 20, 1), 100);
+      const rows = db.listLaunches().slice(0, limit);
+      return c.json({
+        ok: true,
+        result: rows.map((r) => ({
+          id: r.id,
+          erc8004Id: r.erc8004_id,
+          tokenName: r.token_name,
+          tokenSymbol: r.token_symbol,
+          preset: r.preset,
+          modules: r.modules_json ? JSON.parse(r.modules_json) : null,
+          pair: r.pair,
+          snipeTaxPct: r.snipe_tax_pct,
+          hookTaxPct: r.hook_tax_pct,
+          devBuyPct: r.dev_buy_pct,
+          launchTx: r.launch_tx,
+          launchedAt: r.launched_at,
+        })),
+      });
+    } catch (e) {
+      return c.json({ ok: false, error: errMessage(e) }, 502);
+    }
+  });
 
   for (const [route, pick] of [
     ['/presets', (cat: any) => cat.presets],
