@@ -261,6 +261,7 @@ await check('GET /foundry/skill.md serves the agent onboarding', async () => {
   assert.match(text, /Agents propose, humans approve/);
   assert.match(text, /Never skip a step/);
   assert.match(text, /Ink wallet with gas/);
+  assert.match(text, /0\.0015 ETH/);
 });
 
 await check("POST /dry-run accepts `ticker` as an alias for `symbol`", async () => {

@@ -123,12 +123,12 @@ No-install fallback (reads and dry runs only, signs nothing):
 
 1. Generate a fresh launch wallet. Never reuse a wallet between agents.
 2. Show the human the address and the seed phrase. The human backs it up offline and confirms.
-3. Fund it: 0.0005 ETH plus gas, on Ink. (Kraken withdraws ETH directly to Ink.)
+3. Ask the human to fund it ONCE with ~0.0015 ETH on Ink. One roundtrip covers the identity registration gas, the 0.0005 ETH launch fee, and launch gas. (Kraken withdraws ETH directly to Ink.)
 4. HOOKIT_PRIVATE_KEY goes in the MCP env. Never print it, never paste it into chat, never commit it.
 
 ## Step 2: identity
 
-Check if you have an ERC-8004 identity. If not, register one. You will need an Ink wallet with gas for that, so ask the human for it. Pass your id as erc8004Id on every request_ tool. No ID, no launch.
+Check if you have an ERC-8004 identity. If not, register one as soon as the wallet is funded, then continue. You will need an Ink wallet with gas for that, so ask the human for it. Pass your id as erc8004Id on every request_ tool. No ID, no launch.
 
 ## Step 3: forge
 
