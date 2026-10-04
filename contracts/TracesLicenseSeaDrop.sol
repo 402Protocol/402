@@ -12,6 +12,7 @@ import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {ICreatorToken} from "@creator-token-standards/interfaces/ICreatorToken.sol";
 import {ICreatorTokenLegacy} from "@creator-token-standards/interfaces/ICreatorTokenLegacy.sol";
 import {ERC721CCompat} from "./ERC721CCompat.sol";
+import {ERC8048} from "./ERC8048.sol";
 import {INonFungibleSeaDropToken} from "./seadrop/INonFungibleSeaDropToken.sol";
 import {ISeaDropTokenContractMetadata} from "./seadrop/ISeaDropTokenContractMetadata.sol";
 import {ISeaDropConfig} from "./seadrop/ISeaDropConfig.sol";
@@ -25,6 +26,20 @@ import {
 /// @notice Minimal view of the canonical ERC-8004 Identity Registry (ERC-721).
 interface IIdentityRegistry {
     function ownerOf(uint256 agentId) external view returns (address);
+}
+
+/// @notice Minimal view of an ERC-8217 agent-binding adapter (e.g. Adapter8004).
+///         The adapter permanently owns the ERC-8004 identity NFTs it mints;
+///         whoever holds the bound token controls the agent through it.
+///         `standard` is the adapter's TokenStandard enum (0 = ERC721).
+interface IAgentBindingAdapter {
+    function register(uint8 standard, address tokenContract, uint256 tokenId, string calldata agentURI)
+        external
+        returns (uint256 agentId);
+    function bindingOf(uint256 agentId)
+        external
+        view
+        returns (uint8 standard, address tokenContract, uint256 tokenId);
 }
 
 /// @title TracesLicenseSeaDrop
@@ -66,6 +81,7 @@ contract TracesLicenseSeaDrop is
     Ownable,
     ReentrancyGuard,
     ERC721CCompat,
+    ERC8048,
     INonFungibleSeaDropToken
 {
     using Strings for uint256;
@@ -109,6 +125,10 @@ contract TracesLicenseSeaDrop is
     error MaxSupplyExceedsCeiling(uint256 requested, uint256 ceiling);
     error SeatNotPaired();
     error PairingNotStale();
+    error AgentAdapterNotSet();
+    error AgentAdapterAlreadySet(address current);
+    error AgentsAfterFirstMint();
+    error AgentIdsOutOfRange(uint256 first, uint256 last);
 
     // ------------------------------------------------------------------------
     // Events
@@ -120,6 +140,10 @@ contract TracesLicenseSeaDrop is
     ///         license follows the token: the seller's agent is unpaired and
     ///         the buyer's seat arrives clean.
     event SeatUnpaired(uint256 indexed tokenId, uint256 indexed agentId);
+    /// @notice Emitted when the owner sets the ERC-8217 binding adapter.
+    event AgentAdapterSet(address indexed adapter);
+    /// @notice Emitted for each tokenId registered with the binding adapter.
+    event AgentRegistered(uint256 indexed tokenId, uint256 indexed agentId);
 
     // ------------------------------------------------------------------------
     // State
@@ -162,6 +186,15 @@ contract TracesLicenseSeaDrop is
     ///         Not reset on transfer (by design — resets are gameable via
     ///         self-transfer).
     mapping(uint256 => uint256) public lastPairAt;
+
+    /// @notice ERC-8217 binding adapter. Set once by the owner before any
+    ///         mint; immutable afterwards. The adapter mints and permanently
+    ///         owns one ERC-8004 identity per registered tokenId — holders
+    ///         control (not own) the identity through it.
+    address public agentAdapter;
+    /// @notice seat tokenId => bound ERC-8004 agentId + 1 (0 = not registered).
+    ///         Written by registerAgents, pre-mint only.
+    mapping(uint256 => uint256) internal _agentPlusOne;
 
     string private _baseTokenURI;
 
@@ -215,7 +248,19 @@ contract TracesLicenseSeaDrop is
         nextTokenId = lastId + 1;
         _seaDropMinted[minter] += quantity;
         for (uint256 i = 0; i < quantity; ++i) {
-            _safeMint(minter, firstId + i);
+            uint256 tokenId = firstId + i;
+            _safeMint(minter, tokenId);
+            // Mint = identity: a token with a pre-registered bound agent is
+            // born paired to it, so the seat license works with zero holder
+            // action. Tokens without a registered agent keep the legacy
+            // behavior (unpaired; pairSeat with a self-owned agent).
+            uint256 agentPlusOne = _agentPlusOne[tokenId];
+            if (agentPlusOne != 0) {
+                uint256 agentId = agentPlusOne - 1;
+                seatToAgent[tokenId] = agentId;
+                agentToSeat[agentId] = tokenId;
+                emit SeatPaired(tokenId, agentId, minter);
+            }
         }
     }
 
@@ -524,6 +569,113 @@ contract TracesLicenseSeaDrop is
     }
 
     // ------------------------------------------------------------------------
+    // ERC-8217 agent binding (mint = identity)
+    // ------------------------------------------------------------------------
+
+    /**
+     * @notice Set the ERC-8217 binding adapter (one-time, pre-mint).
+     *         The adapter must already be deployed and initialized against
+     *         the canonical ERC-8004 Identity Registry. Cannot be changed
+     *         afterwards: bindings written through it are permanent.
+     */
+    function setAgentAdapter(address adapter) external onlyOwner {
+        if (agentAdapter != address(0)) revert AgentAdapterAlreadySet(agentAdapter);
+        if (adapter == address(0)) revert ZeroAddress();
+        if (totalSupply() != 0) revert AgentsAfterFirstMint();
+        agentAdapter = adapter;
+        emit AgentAdapterSet(adapter);
+    }
+
+    /**
+     * @notice Register ERC-8004 agent identities for tokenIds [first, last]
+     *         via the binding adapter. Owner-only, pre-mint only: the adapter
+     *         only lets the token contract bind IDs that have no owner yet.
+     * @dev Each agent's URI is prefix + tokenId + suffix (decide the soul
+     *      URL scheme before running this — it is written onchain).
+     *      Registration is idempotent per tokenId: already-registered IDs
+     *      are skipped, so ranges can be retried or split across batches.
+     *      Keep batches modest (a few hundred IDs): each registration mints
+     *      an ERC-8004 identity plus adapter storage writes.
+     */
+    function registerAgents(uint256 first, uint256 last, string calldata prefix, string calldata suffix)
+        external
+        onlyOwner
+        nonReentrant
+    {
+        address adapter = agentAdapter;
+        if (adapter == address(0)) revert AgentAdapterNotSet();
+        if (totalSupply() != 0) revert AgentsAfterFirstMint();
+        if (first == 0 || last < first || last > _maxSupply) {
+            revert AgentIdsOutOfRange(first, last);
+        }
+        IAgentBindingAdapter binding = IAgentBindingAdapter(adapter);
+        for (uint256 id = first; id <= last; ++id) {
+            if (_agentPlusOne[id] != 0) continue;
+            uint256 agentId = binding.register(
+                0, // ERC721
+                address(this),
+                id,
+                string.concat(prefix, id.toString(), suffix)
+            );
+            _agentPlusOne[id] = agentId + 1;
+            emit AgentRegistered(id, agentId);
+        }
+    }
+
+    /**
+     * @notice The bound ERC-8004 agent for a tokenId.
+     * @return registered True if an agent was registered pre-mint.
+     * @return agentId The bound agent ID (0 when unregistered).
+     */
+    function agentOf(uint256 tokenId) external view returns (bool registered, uint256 agentId) {
+        uint256 plusOne = _agentPlusOne[tokenId];
+        if (plusOne == 0) return (false, 0);
+        return (true, plusOne - 1);
+    }
+
+    // ------------------------------------------------------------------------
+    // Onchain metadata (ERC-8048 soul — inherits the reference module)
+    // ------------------------------------------------------------------------
+    //
+    // Reads go through ERC8048.metadata (draft-conformant, returns bytes).
+    // Keys: "context" (soul/persona), "name", "trait[<slot>]", "tier",
+    // "rank", "image", "endpoint[web]". tokenURI is untouched.
+
+    /**
+     * @notice Write an onchain metadata value (UTF-8 text). Owner-only.
+     *         Reverts for locked keys — locking is permanent, lock post-reveal.
+     */
+    function setTokenMetadata(uint256 tokenId, string calldata key, string calldata value)
+        external
+        onlyOwner
+    {
+        _setMetadata(tokenId, key, bytes(value));
+    }
+
+    /**
+     * @notice Batch-write one metadata key across many tokens. Owner-only.
+     * @dev tokenIds and values must be the same length.
+     */
+    function setTokenMetadataBatch(
+        uint256[] calldata tokenIds,
+        string calldata key,
+        string[] calldata values
+    ) external onlyOwner {
+        if (tokenIds.length != values.length) revert EmptyBatch();
+        for (uint256 i = 0; i < tokenIds.length; ++i) {
+            _setMetadata(tokenIds[i], key, bytes(values[i]));
+        }
+    }
+
+    /**
+     * @notice Permanently lock a metadata key. After this, no one — not
+     *         even the owner — can write that key again. Lock post-reveal.
+     */
+    function lockMetadata(string calldata key) external onlyOwner {
+        _lockMetadata(key);
+    }
+
+    // ------------------------------------------------------------------------
     // Owner controls
     // ------------------------------------------------------------------------
 
@@ -548,7 +700,7 @@ contract TracesLicenseSeaDrop is
     function supportsInterface(bytes4 interfaceId)
         public
         view
-        override(ERC721, ERC721Enumerable, ERC2981, IERC165)
+        override(ERC721, ERC721Enumerable, ERC2981, ERC8048, IERC165)
         returns (bool)
     {
         return
@@ -560,9 +712,11 @@ contract TracesLicenseSeaDrop is
     }
 
     /// @dev OZ v5 transfer hook: on real transfers the seat's pairing is
-    ///      auto-cleared FIRST, so the license always follows the token
-    ///      holder — no stale seller pairings, no buyer repair step. Then
-    ///      the transfer is gated through the ERC-721C validator.
+    ///      resolved to its bound agent FIRST, so the license and the identity
+    ///      both follow the token holder — no stale seller pairings, no buyer
+    ///      repair step. A token with no registered bound agent keeps the
+    ///      legacy behavior (pairing cleared; buyer pairs their own agent).
+    ///      Then the transfer is gated through the ERC-721C validator.
     ///      Mints/burns are never gated (reference semantics).
     function _update(address to, uint256 tokenId, address auth)
         internal
@@ -576,6 +730,13 @@ contract TracesLicenseSeaDrop is
                 seatToAgent[tokenId] = 0;
                 agentToSeat[agentId] = 0;
                 emit SeatUnpaired(tokenId, agentId);
+            }
+            uint256 boundPlusOne = _agentPlusOne[tokenId];
+            if (boundPlusOne != 0) {
+                uint256 boundAgentId = boundPlusOne - 1;
+                seatToAgent[tokenId] = boundAgentId;
+                agentToSeat[boundAgentId] = tokenId;
+                emit SeatPaired(tokenId, boundAgentId, to);
             }
             _validateTransferWithValidator(_msgSender(), from, to, tokenId);
         }
