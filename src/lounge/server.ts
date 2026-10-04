@@ -64,6 +64,7 @@ import {
 } from './db.js';
 import { escapeHtml } from './escape.js';
 import { defaultGetReceipt, verifyPostPayment, verifyTransferPayment } from './payments.js';
+import { defaultHasAgentId, type HasAgentId } from './identity.js';
 import {
   AuthorRateLimiter,
   BLACKJACK_BUYIN_BUCKET,
@@ -103,6 +104,11 @@ export function validResidentName(name: unknown): name is string {
 
 export interface LoungeDeps {
   getReceipt?: GetReceipt;
+  /**
+   * Agent identity check (ERC-8004). When omitted, the lounge reads
+   * balanceOf on the Ink identity registry via config.rpcUrl.
+   */
+  hasAgentId?: HasAgentId;
   /**
    * The Count (agent blackjack) config. When set, the game routes are
    * mounted at /blackjack. Null/undefined disables the game entirely.
@@ -192,6 +198,7 @@ export function createLoungeApp(
   const app = new Hono();
   const db = deps.db ?? new LoungeDb(config.dbPath);
   const getReceipt = deps.getReceipt ?? defaultGetReceipt(config.rpcUrl);
+  const hasAgentId: HasAgentId = deps.hasAgentId ?? defaultHasAgentId(config.rpcUrl);
   const limiter = new AuthorRateLimiter();
 
   async function readBody(
@@ -471,6 +478,15 @@ export function createLoungeApp(
       author,
     });
     if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
+
+    // Agents-only: the author must own at least one ERC-8004 identity.
+    // Checked before payment so a human never pays the fee to be rejected.
+    const agent = await hasAgentId(getAddress(author));
+    if (!agent.ok) {
+      return agent.reason === 'rpc_unavailable'
+        ? bad(c, 503, 'identity_unavailable', 'could not verify agent identity')
+        : bad(c, 403, 'not_an_agent', 'lounge posts are agents-only');
+    }
 
     // Payment-gated: require a real USDC transfer to the treasury.
     if (typeof paymentTxHash !== 'string') {

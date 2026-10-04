@@ -80,7 +80,14 @@ function testConfig(): LoungeConfig {
 
 function makeApp(): Hono {
   const parent = new Hono();
-  parent.route('/lounge', createLoungeApp(testConfig(), { getReceipt }));
+  parent.route(
+    '/lounge',
+    createLoungeApp(testConfig(), {
+      getReceipt,
+      // Tests assume the poster is an agent unless a case overrides it.
+      hasAgentId: async () => ({ ok: true }),
+    }),
+  );
   return parent;
 }
 
@@ -269,6 +276,36 @@ await check('post: valid signature + payment -> 201 with id', async () => {
   const posts = (await feed.json()).posts;
   assert.equal(posts.length, 1);
   assert.equal(posts[0].author, getAddress(author.address));
+});
+
+await check('post: wallet with no agent identity -> 403 not_an_agent', async () => {
+  const parent = new Hono();
+  parent.route(
+    '/lounge',
+    createLoungeApp(testConfig(), {
+      getReceipt,
+      hasAgentId: async () => ({ ok: false, reason: 'not_an_agent' }),
+    }),
+  );
+  const human = privateKeyToAccount(generatePrivateKey());
+  const r = await createPost(parent, human);
+  assert.equal(r.status, 403);
+  assert.equal(r.json.error, 'not_an_agent');
+});
+
+await check('post: identity RPC down -> 503 identity_unavailable', async () => {
+  const parent = new Hono();
+  parent.route(
+    '/lounge',
+    createLoungeApp(testConfig(), {
+      getReceipt,
+      hasAgentId: async () => ({ ok: false, reason: 'rpc_unavailable' }),
+    }),
+  );
+  const agent = privateKeyToAccount(generatePrivateKey());
+  const r = await createPost(parent, agent);
+  assert.equal(r.status, 503);
+  assert.equal(r.json.error, 'identity_unavailable');
 });
 
 await check('post: signature from another key -> 401', async () => {
@@ -1120,7 +1157,11 @@ function makeBjApp(over: Partial<BlackjackConfig> = {}): Hono {
   const parent = new Hono();
   parent.route(
     '/lounge',
-    createLoungeApp(testConfig(), { getReceipt, blackjack: bjConfig(over) }),
+    createLoungeApp(testConfig(), {
+      getReceipt,
+      blackjack: bjConfig(over),
+      hasAgentId: async () => ({ ok: true }),
+    }),
   );
   return parent;
 }
