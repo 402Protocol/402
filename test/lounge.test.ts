@@ -31,6 +31,7 @@ import { createApp } from '../src/facilitator/server.js';
 import { loadLoungeConfig, type LoungeConfig } from '../src/lounge/config.js';
 import { sortPosts } from '../src/lounge/server.js';
 import { createLoungeApp } from '../src/lounge/server.js';
+import type { HasAgentId } from '../src/lounge/identity.js';
 import { AuthorRateLimiter, POST_BUCKET } from '../src/lounge/ratelimit.js';
 import { LOUNGE_DOMAIN, LOUNGE_TYPES } from '../src/lounge/signing.js';
 import type { GetReceipt, Post, ReceiptLike } from '../src/lounge/types.js';
@@ -553,6 +554,35 @@ await check('vote: signed for post A, submitted to post B -> 401', async () => {
 });
 
 // ---------- comments ----------
+await check('comments: wallet with no agent identity gets 403 not_an_agent', async () => {
+  const { LoungeDb } = await import('../src/lounge/db.js');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const db = new LoungeDb(
+    join(tmpdir(), `comment-agent-test-${randomBytes(4).toString('hex')}.db`),
+  );
+  try {
+    const mkApp = (hasAgentId: HasAgentId) => {
+      const p = new Hono();
+      p.route('/lounge', createLoungeApp(testConfig(), { getReceipt, db, hasAgentId }));
+      return p;
+    };
+    const author = privateKeyToAccount(generatePrivateKey());
+    const postId = (await createPost(mkApp(async () => ({ ok: true })), author)).json.id;
+    const stranger = privateKeyToAccount(generatePrivateKey());
+    const res = await createComment(
+      mkApp(async () => ({ ok: false, reason: 'not_an_agent' })),
+      postId,
+      stranger,
+      { body: 'hi' },
+    );
+    assert.equal(res.status, 403);
+    assert.equal(res.json.error, 'not_an_agent');
+  } finally {
+    db.close();
+  }
+});
+
 await check('comments: flat chronological list + commentCount', async () => {
   const app = makeApp();
   const author = privateKeyToAccount(generatePrivateKey());
@@ -810,15 +840,22 @@ await check('chat: resident with a paid post can send a signed message', async (
   assert.match(res.json.id, /^[0-9a-f]{32}$/);
 });
 
-await check('chat: wallet with no posts gets 403 not_a_resident', async () => {
-  const app = makeApp();
+await check('chat: wallet with no agent identity gets 403 not_an_agent', async () => {
+  const parent = new Hono();
+  parent.route(
+    '/lounge',
+    createLoungeApp(testConfig(), {
+      getReceipt,
+      hasAgentId: async () => ({ ok: false, reason: 'not_an_agent' }),
+    }),
+  );
   const stranger = privateKeyToAccount(generatePrivateKey());
-  const res = await sendChat(app, stranger);
+  const res = await sendChat(parent, stranger);
   assert.equal(res.status, 403);
-  assert.equal(res.json.error, 'not_a_resident');
+  assert.equal(res.json.error, 'not_an_agent');
 });
 
-await check('chat: named town resident with no paid post can chat', async () => {
+await check('chat: named town resident who is an agent can chat', async () => {
   const { LoungeDb } = await import('../src/lounge/db.js');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -829,7 +866,14 @@ await check('chat: named town resident with no paid post can chat', async () => 
     const named = privateKeyToAccount(generatePrivateKey());
     assert.equal(db.setResidentName(named.address, 'TownCrier', 1, 'sig'), 'ok');
     const parent = new Hono();
-    parent.route('/lounge', createLoungeApp(testConfig(), { getReceipt, db }));
+    parent.route(
+      '/lounge',
+      createLoungeApp(testConfig(), {
+        getReceipt,
+        db,
+        hasAgentId: async () => ({ ok: true }),
+      }),
+    );
     const res = await sendChat(parent, named, { message: 'resident here' });
     assert.equal(res.status, 201);
   } finally {

@@ -44,8 +44,8 @@ export function formatTradePost(
   const action = trade.action === 'open' ? 'entered' : 'exited';
   const title =
     trade.action === 'open'
-      ? `Argus ${action} ${dir} ${trade.ticker} ${fmtUsd(trade.notionalUsd)} @ ${fmtPrice(trade.price)} (paper)`
-      : `Argus ${action} ${dir} ${trade.ticker} ${trade.realizedPnlUsd !== null && trade.realizedPnlUsd >= 0 ? '+' : ''}${fmtUsd(trade.realizedPnlUsd ?? 0)} (paper)`;
+      ? `Argus ${action} ${dir} ${trade.ticker} ${fmtUsd(trade.notionalUsd)} @ ${fmtPrice(trade.price)}`
+      : `Argus ${action} ${dir} ${trade.ticker} ${trade.realizedPnlUsd !== null && trade.realizedPnlUsd >= 0 ? '+' : ''}${fmtUsd(trade.realizedPnlUsd ?? 0)}`;
 
   const lines: string[] = [
     `${dir} ${trade.ticker} ${trade.action === 'open' ? 'opened' : 'closed'}: ${trade.sizeBase.toFixed(6)} @ ${fmtPrice(trade.price)}`,

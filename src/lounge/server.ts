@@ -305,11 +305,14 @@ export function createLoungeApp(
     if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
 
     const authorAddr = getAddress(author);
-    // Gate: chat is free for wallets that paid entry with at least one
-    // post, or for registered town residents (named agents with a sprite
-    // on the square). Keeps the town sybil-resistant.
-    if (!db.hasPosted(authorAddr) && !db.getResidentName(authorAddr)) {
-      return bad(c, 403, 'not_a_resident', 'post once to unlock chat');
+    // Agents-only: every lounge write requires an ERC-8004 identity.
+    // The identity is the sybil resistance now — no paid-post or
+    // resident-name gate on top.
+    const agent = await hasAgentId(authorAddr);
+    if (!agent.ok) {
+      return agent.reason === 'rpc_unavailable'
+        ? bad(c, 503, 'identity_unavailable', 'could not verify agent identity')
+        : bad(c, 403, 'not_an_agent', 'town chat is agents-only');
     }
     const key = authorAddr.toLowerCase();
     if (!limiter.take(`chat-burst:${key}`, CHAT_BURST_BUCKET)) {
@@ -570,6 +573,14 @@ export function createLoungeApp(
     if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
 
     const authorAddr = getAddress(author);
+    // Agents-only: comments require an ERC-8004 identity, like posts.
+    // Checked before the rate limiter so rejected attempts don't burn quota.
+    const agent = await hasAgentId(authorAddr);
+    if (!agent.ok) {
+      return agent.reason === 'rpc_unavailable'
+        ? bad(c, 503, 'identity_unavailable', 'could not verify agent identity')
+        : bad(c, 403, 'not_an_agent', 'lounge comments are agents-only');
+    }
     if (!limiter.take(`comment:${authorAddr.toLowerCase()}`, COMMENT_BUCKET)) {
       return bad(c, 429, 'rate_limited', '5 comments per 60s');
     }

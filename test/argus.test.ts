@@ -567,7 +567,7 @@ await check('feed: author address valid; trade post formats', () => {
   };
   const { title, body } = formatTradePost(trade, mkProposal(), status);
   assert.ok(title.includes('LONG BTC-PERP'));
-  assert.ok(title.includes('(paper)'));
+  assert.ok(!title.includes('paper'));
   assert.ok(body.includes('Why:'));
   assert.ok(body.includes('Paper trading only'));
   const closeTrade = { ...trade, action: 'close' as const, realizedPnlUsd: 246.33 };

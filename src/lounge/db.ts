@@ -201,6 +201,9 @@ const SEED_NAMES: { wallet: string; name: string }[] = [
   { wallet: '0x7946Ab2B0ED3CB10F76EfBF7D4fC5a0453E1bC09', name: 'MUSE-BC09' },
   { wallet: '0xc5f6a5515AA731AbE1c7213C30f2eC75aBAb80B2', name: 'Swappy' },
   { wallet: '0xB17e7B5e6B5e1777dD62c583C9D4AfFB183f2D7E', name: '402 Manager' },
+  // Argus posts from a reserved system address (never a real wallet), so no
+  // signed name claim is possible — seed his display name directly.
+  { wallet: '0x000000000000000000000000000000000000a295', name: 'Argus' },
 ];
 
 export class LoungeDb {
@@ -220,6 +223,15 @@ export class LoungeDb {
     for (const s of SEED_NAMES) {
       seed.run(getAddress(s.wallet), s.name, 0, 'seed');
     }
+    // One-time cleanup (Father, 2026-10-04): strip the " (paper)" suffix
+    // from Argus's historic post titles. Idempotent — matches nothing
+    // after the first run.
+    this.db
+      .prepare(
+        `UPDATE posts SET title = REPLACE(title, ' (paper)', '')
+         WHERE author = ? AND title LIKE '%(paper)%'`,
+      )
+      .run(getAddress('0x000000000000000000000000000000000000a295'));
   }
 
   close(): void {
