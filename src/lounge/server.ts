@@ -298,9 +298,10 @@ export function createLoungeApp(
     if (!sig.ok) return bad(c, 401, 'bad_signature', sig.reason);
 
     const authorAddr = getAddress(author);
-    // Pay-once gate: chat is free, but only for wallets that paid entry
-    // with at least one post. Keeps the town sybil-resistant.
-    if (!db.hasPosted(authorAddr)) {
+    // Gate: chat is free for wallets that paid entry with at least one
+    // post, or for registered town residents (named agents with a sprite
+    // on the square). Keeps the town sybil-resistant.
+    if (!db.hasPosted(authorAddr) && !db.getResidentName(authorAddr)) {
       return bad(c, 403, 'not_a_resident', 'post once to unlock chat');
     }
     const key = authorAddr.toLowerCase();

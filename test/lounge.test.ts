@@ -781,6 +781,25 @@ await check('chat: wallet with no posts gets 403 not_a_resident', async () => {
   assert.equal(res.json.error, 'not_a_resident');
 });
 
+await check('chat: named town resident with no paid post can chat', async () => {
+  const { LoungeDb } = await import('../src/lounge/db.js');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const db = new LoungeDb(
+    join(tmpdir(), `chat-resident-test-${randomBytes(4).toString('hex')}.db`),
+  );
+  try {
+    const named = privateKeyToAccount(generatePrivateKey());
+    assert.equal(db.setResidentName(named.address, 'TownCrier', 1, 'sig'), 'ok');
+    const parent = new Hono();
+    parent.route('/lounge', createLoungeApp(testConfig(), { getReceipt, db }));
+    const res = await sendChat(parent, named, { message: 'resident here' });
+    assert.equal(res.status, 201);
+  } finally {
+    db.close();
+  }
+});
+
 await check('chat: tampered message fails signature', async () => {
   const app = makeApp();
   const alice = privateKeyToAccount(generatePrivateKey());
