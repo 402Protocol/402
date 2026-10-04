@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS launches (
   erc8004_id TEXT NOT NULL,
   token_name TEXT NOT NULL,
   token_symbol TEXT NOT NULL,
+  token_address TEXT,
   preset TEXT,
   modules_json TEXT,
   pair TEXT NOT NULL,
@@ -69,6 +70,7 @@ export interface LaunchRow {
   erc8004_id: string;
   token_name: string;
   token_symbol: string;
+  token_address: string | null;
   preset: string | null;
   modules_json: string | null;
   pair: string;
@@ -93,6 +95,10 @@ export class FoundryDb {
       .all() as { name: string }[];
     if (!cols.some((c) => c.name === 'fee_tx')) {
       this.db.exec(`ALTER TABLE launches ADD COLUMN fee_tx TEXT`);
+    }
+    // Migration: token_address links each launch to its hookit.fun page.
+    if (!cols.some((c) => c.name === 'token_address')) {
+      this.db.exec(`ALTER TABLE launches ADD COLUMN token_address TEXT`);
     }
   }
 
@@ -152,6 +158,7 @@ export class FoundryDb {
     erc8004Id: string;
     tokenName: string;
     tokenSymbol: string;
+    tokenAddress: string | null;
     preset: string | null;
     modulesJson: string | null;
     pair: string;
@@ -165,12 +172,12 @@ export class FoundryDb {
     this.db
       .prepare(
         `INSERT INTO launches
-           (id, erc8004_id, token_name, token_symbol, preset, modules_json, pair,
+           (id, erc8004_id, token_name, token_symbol, token_address, preset, modules_json, pair,
             snipe_tax_pct, hook_tax_pct, dev_buy_pct, launch_tx, fee_tx, launched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        l.id, l.erc8004Id, l.tokenName, l.tokenSymbol, l.preset, l.modulesJson,
+        l.id, l.erc8004Id, l.tokenName, l.tokenSymbol, l.tokenAddress, l.preset, l.modulesJson,
         l.pair, l.snipeTaxPct, l.hookTaxPct, l.devBuyPct, l.launchTx, l.feeTx, l.launchedAt,
       );
   }
@@ -206,6 +213,7 @@ function rowToLaunch(row: Record<string, unknown>): LaunchRow {
     erc8004_id: row.erc8004_id as string,
     token_name: row.token_name as string,
     token_symbol: row.token_symbol as string,
+    token_address: (row.token_address as string | null) ?? null,
     preset: row.preset as string | null,
     modules_json: row.modules_json as string | null,
     pair: row.pair as string,

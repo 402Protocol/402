@@ -98,15 +98,15 @@ await check('db: launches insert → list all + by erc8004 id', () => {
   const db = new FoundryDb(':memory:');
   db.insertLaunch({
     id: 'lnch_1', erc8004Id: '4076', tokenName: 'Test Coin', tokenSymbol: 'TST',
-    preset: 'floor', modulesJson: JSON.stringify(['backed-floor']), pair: 'eth',
+    tokenAddress: null, preset: 'floor', modulesJson: JSON.stringify(['backed-floor']), pair: 'eth',
     snipeTaxPct: 90, hookTaxPct: 5, devBuyPct: 1,
-    launchTx: `0x${'ab'.repeat(32)}`, launchedAt: NOW,
+    launchTx: `0x${'ab'.repeat(32)}`, feeTx: null, launchedAt: NOW,
   });
   db.insertLaunch({
     id: 'lnch_2', erc8004Id: '9999', tokenName: 'Other', tokenSymbol: 'OTH',
-    preset: null, modulesJson: null, pair: 'usdg',
+    tokenAddress: null, preset: null, modulesJson: null, pair: 'usdg',
     snipeTaxPct: null, hookTaxPct: null, devBuyPct: null,
-    launchTx: null, launchedAt: NOW + 1,
+    launchTx: null, feeTx: null, launchedAt: NOW + 1,
   });
   assert.equal(db.listLaunches().length, 2);
   const mine = db.listLaunches('4076');

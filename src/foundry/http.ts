@@ -38,7 +38,6 @@
  */
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { FoundryDb } from './db.js';
 
 const HOOKIT_API_URL =
   (process.env.HOOKIT_API_URL ?? '').trim() || 'https://www.hookit.fun';
@@ -65,7 +64,7 @@ const DryRunBody = z
   pair: z.string().min(1),
   preset: z.string().min(1).optional(),
   modules: z.array(z.string().min(1)).max(12).optional(),
-  hookTaxPct: z.number().min(0).max(100).optional(),
+  hookTaxPct: z.number().min(0).max(9).optional(), // hookit range is 0-9
   devBuyPct: z.number().min(0).max(2.5).optional(),
   /** 0x payout address; mapped to { kind: 'wallet', address }. */
   payout: z.string().min(1).optional(),
@@ -130,7 +129,12 @@ filing approvals or launching:
 
 ## Step 2: identity
 
-Check if you have an ERC-8004 identity. If not, register one as soon as the wallet is funded, then continue. You will need an Ink wallet with gas for that, so ask the human for it. Pass your id as erc8004Id on every foundry_ MCP tool. (The HTTP dry-run doesn't take it.) No ID, no launch.
+Check if you have an ERC-8004 identity. If not, register one from your funded
+launch wallet as soon as it is funded, then continue: call
+register(string agentURI) on 0x7274e874CA62410a93Bd8bf61c69d8045E399c02
+(the ERC-8004 identity registry on Ink, permissionless, gas-only) with your
+agent card URI, and note the returned agent id. Pass your id as erc8004Id on
+every foundry_ MCP tool. (The HTTP dry-run doesn't take it.) No ID, no launch.
 
 ## Step 3: forge
 
@@ -146,7 +150,7 @@ foundry_request_launch writes a pending approval. Tell the human what approving 
 
 ## Step 6: launch (MCP only)
 
-On approval the launch executes and the record lands in foundry_launches under your ERC-8004 id. That is your track record.
+On approval the launch executes and the record lands in foundry_launches under your ERC-8004 id. That is your track record. The 0.001 ETH Foundry fee is collected AFTER a successful launch; a failed launch collects nothing. Anyone can see the token at https://www.hookit.fun/token/<token-address>.
 
 ## Rules (never break)
 
@@ -204,37 +208,10 @@ export function createFoundryHttpApp(
     }),
   );
 
-  // Public launch feed: every executed launch, latest first. Powers the
-  // spectacle on the site. Rows carry nothing sensitive.
-  const dbPath = (process.env.FOUNDRY_DB_PATH ?? '').trim() || 'data/foundry.db';
-  const db = new FoundryDb(dbPath);
-  app.get('/launches', (c) => {
-    try {
-      const raw = Number.parseInt(c.req.query('limit') ?? '20', 10);
-      const limit = Math.min(Math.max(Number.isFinite(raw) ? raw : 20, 1), 100);
-      const rows = db.listLaunches().slice(0, limit);
-      return c.json({
-        ok: true,
-        result: rows.map((r) => ({
-          id: r.id,
-          erc8004Id: r.erc8004_id,
-          tokenName: r.token_name,
-          tokenSymbol: r.token_symbol,
-          preset: r.preset,
-          modules: r.modules_json ? JSON.parse(r.modules_json) : null,
-          pair: r.pair,
-          snipeTaxPct: r.snipe_tax_pct,
-          hookTaxPct: r.hook_tax_pct,
-          devBuyPct: r.dev_buy_pct,
-          launchTx: r.launch_tx,
-          feeTx: r.fee_tx,
-          launchedAt: r.launched_at,
-        })),
-      });
-    } catch (e) {
-      return c.json({ ok: false, error: errMessage(e) }, 502);
-    }
-  });
+  // No public launch feed: launches are recorded in each agent's local MCP
+  // database (their reputation trail), not here. Anyone who wants to see a
+  // token can look it up on Hookit: https://www.hookit.fun
+  // (per Father's call 2026-10-04: link Hookit's site, don't show our own feed).
 
   for (const [route, pick] of [
     ['/presets', (cat: any) => cat.presets],

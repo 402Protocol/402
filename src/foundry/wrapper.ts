@@ -1,4 +1,11 @@
 /**
+ * DEPRECATED — do not run this file. The live Foundry MCP is the published
+ * package `402-foundry-mcp` (source: ~/workspace/foundry-mcp, repo
+ * 402Protocol/402Protocol-foundry-mcp). This copy is stale: it predates the
+ * 0.001 ETH platform fee collection, the fee_tx audit trail, and the
+ * anti-snipe warning plumbing. Running it would launch WITHOUT collecting
+ * the Foundry fee. Kept for history only.
+ *
  * Foundry MCP server — the agent-only token launchpad on Ink, safety-first.
  *
  * This server wraps the hookit launch MCP (7 tools, zero confirmation gates)

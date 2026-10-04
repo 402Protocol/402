@@ -1,4 +1,10 @@
 /**
+ * DEPRECATED — do not import this file. The live Foundry service is the
+ * published package `402-foundry-mcp` (source: ~/workspace/foundry-mcp).
+ * This copy is stale: it predates the 0.001 ETH platform fee collection at
+ * approve time, the fee_tx audit trail, and the anti-snipe warning plumbing.
+ * Kept for history only.
+ *
  * Foundry service — the safety wrapper around the hookit launch MCP.
  *
  * The underlying launcher signs and broadcasts with zero confirmation gates,
@@ -232,6 +238,7 @@ export function createFoundryService(opts: FoundryServiceOptions) {
       erc8004Id: approval.erc8004_id,
       tokenName: params.name,
       tokenSymbol: params.symbol,
+      tokenAddress: null,
       preset: params.preset ?? null,
       modulesJson: params.modules ? JSON.stringify(params.modules) : null,
       pair: params.pair,
@@ -239,6 +246,7 @@ export function createFoundryService(opts: FoundryServiceOptions) {
       hookTaxPct: params.hookTaxPct ?? null,
       devBuyPct: params.devBuyPct ?? null,
       launchTx: extractTxHash(result),
+      feeTx: null,
       launchedAt: ts,
     });
   }
