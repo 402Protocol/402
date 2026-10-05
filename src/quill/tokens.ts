@@ -1,10 +1,13 @@
 /**
  * Quill X token storage.
  *
- * Access + refresh tokens live in a single JSON file that is gitignored
- * (state/quill-tokens.json). The file is written with mode 0600. Secrets are
- * never logged and never returned to callers — getValidAccessToken hands out
- * only the access token string after refreshing it when needed.
+ * Access + refresh tokens live in a single JSON file. The path is
+ * QUILL_X_TOKEN_PATH when set, otherwise /data/quill-tokens.json when /data
+ * exists (Railway: persists across deploys), otherwise
+ * <cwd>/state/quill-tokens.json (local dev, gitignored). The file is
+ * written with mode 0600. Secrets are never logged and never returned to
+ * callers — getValidAccessToken hands out only the access token string
+ * after refreshing it when needed.
  *
  * Shape on disk:
  *   { access_token, refresh_token, expires_at_ms, obtained_at_ms }
@@ -33,6 +36,10 @@ export interface StoredTokens {
 const REFRESH_SKEW_MS = 60_000;
 
 export function defaultTokenPath(): string {
+  const fromEnv = process.env.QUILL_X_TOKEN_PATH;
+  if (fromEnv) return fromEnv;
+  // /data persists across Railway deploys; the working directory does not.
+  if (existsSync('/data')) return '/data/quill-tokens.json';
   return join(process.cwd(), 'state', 'quill-tokens.json');
 }
 

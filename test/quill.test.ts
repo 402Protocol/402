@@ -29,6 +29,7 @@ import {
   X_TOKEN_URL,
 } from '../src/quill/oauth.js';
 import {
+  defaultTokenPath,
   getValidAccessToken,
   loadStoredTokens,
   saveStoredTokens,
@@ -290,8 +291,15 @@ function tmpPath(): string {
   return join(dir, 'quill-tokens.json');
 }
 
-await check('token file save/load roundtrip, mode 0600', () => {
-  const path = tmpPath();
+await check('defaultTokenPath: env override wins', () => {
+  const prev = process.env.QUILL_X_TOKEN_PATH;
+  process.env.QUILL_X_TOKEN_PATH = '/data/custom-tokens.json';
+  assert.equal(defaultTokenPath(), '/data/custom-tokens.json');
+  if (prev === undefined) delete process.env.QUILL_X_TOKEN_PATH;
+  else process.env.QUILL_X_TOKEN_PATH = prev;
+});
+
+await check('token file save/load roundtrip, mode 0600', () => {  const path = tmpPath();
   const stored = {
     access_token: 'AT-1',
     refresh_token: 'RT-1',
