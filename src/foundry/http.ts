@@ -14,6 +14,10 @@
  *   GET  /foundry/modules    modules from the catalog
  *   GET  /foundry/pairs      pairs from the catalog
  *   POST /foundry/dry-run    prepare-launch verdict (unsigned, never signed)
+ *   POST /foundry/image     token-art upload: PNG (multipart), returns a
+ *                            public URL for the launch `image` field. Size
+ *                            cap + hourly budget; content-hashed filenames.
+ *   GET  /foundry/img/:hash serves an uploaded PNG (immutable, cacheable)
  *   GET  /foundry/skill.md   the one-line agent onboarding: install the
  *                            Foundry MCP and run the launch sequence. This is
  *                            the handoff: give this URL to an agent, boom done.
@@ -29,6 +33,13 @@
  *   - Hookit budgets prepare-launch at 50 calls/hour per egress IP, and our
  *     server is one IP to them — so the dry-run budget is GLOBAL (40/hour
  *     with headroom), not per visitor. Over budget => 429.
+ *   - Token-art uploads are unauthenticated by design (agents have no login),
+ *     so the endpoint is deliberately small: PNG only (magic bytes checked),
+ *     2 MB cap, GLOBAL 20/hour budget, content-hashed filenames (same bytes
+ *     => same URL, no enumeration), served immutable. Disk abuse surface is
+ *     bounded by (budget x cap) per hour. Set FOUNDRY_IMAGE_DIR to a
+ *     persistent volume (e.g. /data/foundry-images) or uploads vanish on
+ *     redeploy.
  *   - The catalog is cached in-memory (10 min TTL) so public traffic cannot
  *     be used to hammer Hookit's API.
  *
@@ -38,17 +49,35 @@
  */
 import { Hono } from 'hono';
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const HOOKIT_API_URL =
   (process.env.HOOKIT_API_URL ?? '').trim() || 'https://www.hookit.fun';
 const CATALOG_TTL_MS = 10 * 60_000;
 /** Hookit: 50 prepare-launch/hour per egress IP. We are one IP. Keep headroom. */
 const DRY_RUN_PER_HOUR = 40;
+/** Token-art uploads: PNG only, 2 MB cap, tight hourly budget (abuse backstop). */
+const IMAGE_MAX_BYTES = 2_000_000;
+const IMAGE_UPLOADS_PER_HOUR = 20;
+const IMAGE_DIR =
+  (process.env.FOUNDRY_IMAGE_DIR ?? '').trim() ||
+  join(process.cwd(), 'data', 'foundry-images');
+/** Public mount path of this sub-app in the facilitator (used for image URLs). */
+const PUBLIC_BASE_PATH = '/foundry';
+/** PNG magic bytes: 89 50 4E 47 0D 0A 1A 0A. Checked, not trusted from headers. */
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 export interface FoundryHttpOptions {
   fetchFn?: typeof fetch;
   /** Override the global dry-run budget (tests). */
   dryRunPerHour?: number;
+  /** Override the token-art upload directory (tests). Defaults to FOUNDRY_IMAGE_DIR. */
+  imageDir?: string;
+  /** Override the global image-upload budget (tests). */
+  imageUploadsPerHour?: number;
 }
 
 /**
@@ -138,7 +167,7 @@ every foundry_ MCP tool. (The HTTP dry-run doesn't take it.) No ID, no launch.
 
 ## Step 3: forge
 
-foundry_list_presets, foundry_list_modules, foundry_list_pairs. YOU choose the name, ticker (or symbol — both work), preset, and pair.
+foundry_list_presets, foundry_list_modules, foundry_list_pairs. YOU choose the name, ticker (or symbol — both work), preset, and pair. You also invent the description and twitter/telegram/website. Generate the token art yourself, upload the PNG to POST /foundry/image (multipart field "image"), and pass the returned URL as image (it lands in the onchain metadata). If you can't generate or upload art, skip the image rather than asking the human — everything creative is your job. Funding the wallet and approving the launch stay human.
 
 ## Step 4: dry run
 
@@ -192,6 +221,22 @@ export function createFoundryHttpApp(
     }
     if (windowUsed >= dryRunBudget) return false;
     windowUsed += 1;
+    return true;
+  }
+
+  // Global image-upload budget: same fixed-window shape as dry runs.
+  const imageBudget = opts.imageUploadsPerHour ?? IMAGE_UPLOADS_PER_HOUR;
+  const imageDir = opts.imageDir ?? IMAGE_DIR;
+  let imgWindowStart = 0;
+  let imgWindowUsed = 0;
+  function imageUploadAllowed(): boolean {
+    const now = Date.now();
+    if (now - imgWindowStart >= 3_600_000) {
+      imgWindowStart = now;
+      imgWindowUsed = 0;
+    }
+    if (imgWindowUsed >= imageBudget) return false;
+    imgWindowUsed += 1;
     return true;
   }
 
@@ -302,6 +347,73 @@ export function createFoundryHttpApp(
     } catch (e) {
       return c.json({ ok: false, error: errMessage(e) }, 502);
     }
+  });
+
+  // Token-art upload. Agents generate their own PFP, POST the PNG here, and
+  // pass the returned URL as the launch `image` field (it lands in the
+  // onchain metadata). Unauthenticated by design (agents have no login);
+  // the limits in the header comment are the abuse backstop.
+  app.post('/image', async (c) => {
+    if (!imageUploadAllowed()) {
+      return c.json(
+        { ok: false, error: 'image upload budget exhausted for this hour, try again later' },
+        429,
+      );
+    }
+    let body: Record<string, string | File>;
+    try {
+      body = await c.req.parseBody();
+    } catch {
+      return c.json({ ok: false, error: 'expected multipart form data' }, 400);
+    }
+    const file = body['image'] ?? body['file'];
+    if (!(file instanceof File)) {
+      return c.json({ ok: false, error: 'no PNG file uploaded (field: image)' }, 400);
+    }
+    const bytes = Buffer.from(await file.arrayBuffer());
+    if (bytes.length === 0 || bytes.length > IMAGE_MAX_BYTES) {
+      return c.json(
+        { ok: false, error: `PNG must be non-empty and under ${IMAGE_MAX_BYTES / 1_000_000} MB` },
+        413,
+      );
+    }
+    if (!bytes.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
+      return c.json({ ok: false, error: 'not a PNG (magic bytes mismatch)' }, 400);
+    }
+    const hash = createHash('sha256').update(bytes).digest('hex');
+    try {
+      mkdirSync(imageDir, { recursive: true });
+      const dest = join(imageDir, `${hash}.png`);
+      if (!existsSync(dest)) writeFileSync(dest, bytes);
+    } catch (e) {
+      return c.json({ ok: false, error: `storage failure: ${errMessage(e)}` }, 500);
+    }
+    const url = `${new URL(c.req.url).origin}${PUBLIC_BASE_PATH}/img/${hash}.png`;
+    return c.json({ ok: true, url });
+  });
+
+  // Serve uploaded token art. Hash-only filenames: no traversal is possible
+  // (64 hex chars enforced), content is immutable => long cache.
+  app.get('/img/:hash', (c) => {
+    let hash = c.req.param('hash');
+    // The public URL carries the .png extension; the on-disk name is bare hex.
+    if (hash.endsWith('.png')) hash = hash.slice(0, -4);
+    if (!/^[0-9a-f]{64}$/.test(hash)) {
+      return c.json({ ok: false, error: 'not found' }, 404);
+    }
+    const dest = join(imageDir, `${hash}.png`);
+    if (!existsSync(dest)) {
+      return c.json({ ok: false, error: 'not found' }, 404);
+    }
+    const bytes = readFileSync(dest);
+    return new Response(bytes as unknown as BodyInit, {
+      status: 200,
+      headers: {
+        'content-type': 'image/png',
+        'content-length': String(bytes.length),
+        'cache-control': 'public, max-age=31536000, immutable',
+      },
+    });
   });
 
   return app;

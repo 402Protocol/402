@@ -302,4 +302,142 @@ await check('POST /dry-run always warns about the snipe tax, even when the verdi
   assert.match(json.warnings[0]!, /anti-snipe tax/);
 });
 
+// ---- POST /foundry/image: token-art upload ----
+
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const tinyPng = () => Buffer.concat([PNG_MAGIC, Buffer.from('fake-png-payload')]);
+
+function mountedAppWithImages(
+  opts: { fetchFn?: typeof fetch; imageUploadsPerHour?: number } = {},
+) {
+  const dir = mkdtempSync(join(tmpdir(), 'foundry-img-'));
+  const { app, mock } = (() => {
+    const m = mockFetch();
+    const app = new Hono();
+    app.route(
+      '/foundry',
+      createFoundryHttpApp({
+        fetchFn: opts.fetchFn ?? m.fn,
+        imageDir: dir,
+        imageUploadsPerHour: opts.imageUploadsPerHour,
+      }),
+    );
+    return { app, mock: m };
+  })();
+  return { app, mock, dir };
+}
+
+function pngForm(bytes: Buffer, name = 'art.png', type = 'image/png') {
+  const form = new FormData();
+  form.append('image', new File([new Uint8Array(bytes)], name, { type }));
+  return form;
+}
+
+await check('POST /foundry/image uploads a PNG and returns a public URL', async () => {
+  const { app } = mountedAppWithImages();
+  const res = await app.request('/foundry/image', {
+    method: 'POST',
+    body: pngForm(tinyPng()),
+  });
+  assert.equal(res.status, 200);
+  const json = (await res.json()) as { ok: boolean; url: string };
+  assert.equal(json.ok, true);
+  assert.match(json.url, /^https?:\/\/[^/]+\/foundry\/img\/[0-9a-f]{64}\.png$/);
+});
+
+await check('uploaded PNG is served back at its URL', async () => {
+  const { app } = mountedAppWithImages();
+  const payload = tinyPng();
+  const up = await app.request('/foundry/image', {
+    method: 'POST',
+    body: pngForm(payload),
+  });
+  const { url } = (await up.json()) as { url: string };
+  const path = new URL(url).pathname;
+  const res = await app.request(path);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('content-type'), 'image/png');
+  assert.deepEqual(Buffer.from(await res.arrayBuffer()), payload);
+});
+
+await check('re-uploading identical bytes returns the same URL', async () => {
+  const { app } = mountedAppWithImages();
+  const payload = tinyPng();
+  const a = (await (await app.request('/foundry/image', { method: 'POST', body: pngForm(payload) })).json()) as { url: string };
+  const b = (await (await app.request('/foundry/image', { method: 'POST', body: pngForm(payload) })).json()) as { url: string };
+  assert.equal(a.url, b.url);
+});
+
+await check('POST /foundry/image rejects non-PNG bytes', async () => {
+  const { app } = mountedAppWithImages();
+  const res = await app.request('/foundry/image', {
+    method: 'POST',
+    body: pngForm(Buffer.from('this is not a png'), 'art.png', 'image/png'),
+  });
+  assert.equal(res.status, 400);
+  const json = (await res.json()) as { ok: boolean };
+  assert.equal(json.ok, false);
+});
+
+await check('POST /foundry/image rejects missing file', async () => {
+  const { app } = mountedAppWithImages();
+  const res = await app.request('/foundry/image', {
+    method: 'POST',
+    body: (() => {
+      const f = new FormData();
+      f.append('note', 'no file here');
+      return f;
+    })(),
+  });
+  assert.equal(res.status, 400);
+});
+
+await check('POST /foundry/image rejects oversize PNG with 413', async () => {
+  const { app } = mountedAppWithImages();
+  const big = Buffer.concat([PNG_MAGIC, Buffer.alloc(2_000_001 - PNG_MAGIC.length, 0)]);
+  const res = await app.request('/foundry/image', {
+    method: 'POST',
+    body: pngForm(big),
+  });
+  assert.equal(res.status, 413);
+});
+
+await check('POST /foundry/image enforces the hourly budget with 429', async () => {
+  const { app } = mountedAppWithImages({ imageUploadsPerHour: 1 });
+  const first = await app.request('/foundry/image', {
+    method: 'POST',
+    body: pngForm(tinyPng()),
+  });
+  assert.equal(first.status, 200);
+  const second = await app.request('/foundry/image', {
+    method: 'POST',
+    body: pngForm(tinyPng()),
+  });
+  assert.equal(second.status, 429);
+});
+
+await check('GET /foundry/img/:hash 404s on malformed and missing hashes', async () => {
+  const { app } = mountedAppWithImages();
+  const bad = await app.request('/foundry/img/not-a-hash');
+  assert.equal(bad.status, 404);
+  const missing = await app.request(
+    '/foundry/img/' + '0'.repeat(64),
+  );
+  assert.equal(missing.status, 404);
+});
+
+await check('skill.md tells agents they invent the creative, including art upload', async () => {
+  const { app } = mountedApp();
+  const res = await app.request('/foundry/skill.md');
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  assert.match(text, /POST \/foundry\/image/);
+  assert.match(text, /everything creative is your job/);
+  assert.match(text, /Funding the wallet and approving the launch stay human/);
+});
+
 console.log(`\nfoundry-http: ${passed} checks passed`);
