@@ -61,6 +61,7 @@ import {
 import { settlementRow } from './tape.js';
 import { createJobsApp } from '../jobs/server.js';
 import { createFoundryHttpApp } from '../foundry/http.js';
+import { createQuillHttpApp } from '../quill/http.js';
 import { createAgentsApp } from '../jobs/agents.js';
 import { defaultResolveAgentSeat } from '../jobs/escrow.js';
 import { JobsDb } from '../jobs/db.js';
@@ -242,6 +243,12 @@ export function createApp(
   // server is one IP to them).
   app.use('/foundry/*', rateLimit({ windowMs: 60_000, max: 60 }));
   app.route('/foundry', createFoundryHttpApp());
+
+  // Quill: @quill_fourzero X poster. OAuth 2.0 + PKCE login, tokens in
+  // state/quill-tokens.json (gitignored, 0600), posting is dry-run-first.
+  // 503s until QUILL_X_CLIENT_ID/QUILL_X_CLIENT_SECRET are set.
+  app.use('/quill/*', rateLimit({ windowMs: 60_000, max: 60 }));
+  app.route('/quill', createQuillHttpApp());
 
   app.get('/health', (c) =>
     c.json({ ok: true, dryRun: config.dryRun, time: Date.now() }),
