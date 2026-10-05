@@ -5,8 +5,10 @@
  *   GET  /quill/oauth/start     redirect to X's authorize URL (PKCE + state)
  *   GET  /quill/oauth/callback  ?code=&state= → exchange, store tokens,
  *                                plain success page (never shows secrets)
- *   POST /quill/post            { text, dryRun } — dryRun defaults true;
- *                                real posts need an explicit dryRun: false
+ *   POST /quill/post            { text, dryRun, replyTo } — dryRun defaults
+ *                                true; real posts need an explicit
+ *                                dryRun: false; replyTo is an optional
+ *                                tweet id to reply to
  *   GET  /quill/status          configured? authorized? expiry? (no secrets)
  *
  * Safety properties:
@@ -134,8 +136,9 @@ export function createQuillHttpApp(opts: QuillHttpOptions = {}): Hono {
 
   // Post a tweet. Dry-run is the default: the payload is validated and
   // returned, nothing is sent to X. Pass dryRun: false for a real post.
+  // Optional replyTo: tweet id to reply to.
   app.post('/post', async (c) => {
-    let body: { text?: unknown; dryRun?: unknown };
+    let body: { text?: unknown; dryRun?: unknown; replyTo?: unknown };
     try {
       body = (await c.req.json()) as typeof body;
     } catch {
@@ -145,6 +148,10 @@ export function createQuillHttpApp(opts: QuillHttpOptions = {}): Hono {
     if (!text.trim()) {
       return c.json({ ok: false, error: 'text is required' }, 400);
     }
+    const replyToTweetId =
+      typeof body.replyTo === 'string' && body.replyTo.trim()
+        ? body.replyTo.trim()
+        : undefined;
     const dryRun = body.dryRun !== false;
     const config = quillXConfigFromEnv();
     if (!config) {
@@ -170,7 +177,7 @@ export function createQuillHttpApp(opts: QuillHttpOptions = {}): Hono {
       );
     }
     try {
-      const result = await postTweet({ fetchFn, accessToken, text, dryRun });
+      const result = await postTweet({ fetchFn, accessToken, text, dryRun, replyToTweetId });
       return c.json(result);
     } catch (e) {
       if (e instanceof TweetTooLongError) {

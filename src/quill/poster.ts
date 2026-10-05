@@ -19,6 +19,8 @@ export interface PostTweetArgs {
   text: string;
   /** Default true: validate + log, never send. Pass false to really post. */
   dryRun?: boolean;
+  /** Optional: post as a reply to this tweet id. */
+  replyToTweetId?: string;
 }
 
 export interface PostResult {
@@ -48,6 +50,7 @@ export async function postTweet({
   accessToken,
   text,
   dryRun = true,
+  replyToTweetId,
 }: PostTweetArgs): Promise<PostResult> {
   const length = tweetLength(text);
   if (length > MAX_TWEET_CHARS) throw new TweetTooLongError(length);
@@ -57,13 +60,17 @@ export async function postTweet({
     return { ok: true, dryRun: true, posted: false, length, tweetId: null };
   }
 
+  const payload: Record<string, unknown> = { text };
+  if (replyToTweetId) {
+    payload.reply = { in_reply_to_tweet_id: replyToTweetId };
+  }
   const res = await fetchFn(X_TWEETS_URL, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       authorization: `Bearer ${accessToken}`,
     },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(payload),
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => '');

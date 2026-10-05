@@ -266,6 +266,23 @@ await check('real post uses bearer + { text }', async () => {
   assert.deepEqual(JSON.parse(init.body), { text: 'hello ink' });
 });
 
+await check('replyTo adds reply.in_reply_to_tweet_id', async () => {
+  const m = mockFetch();
+  m.respondWith(() => ({ json: { data: { id: '333' } } }));
+  const r = await postTweet({
+    fetchFn: m.fn,
+    accessToken: 'AT',
+    text: 'ughhh you are right',
+    dryRun: false,
+    replyToTweetId: '2107222633427111975',
+  });
+  assert.equal(r.posted, true);
+  assert.deepEqual(JSON.parse(m.calls[0].init.body), {
+    text: 'ughhh you are right',
+    reply: { in_reply_to_tweet_id: '2107222633427111975' },
+  });
+});
+
 // ---------- tokens.ts ----------
 
 function tmpPath(): string {
