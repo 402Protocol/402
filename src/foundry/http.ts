@@ -91,6 +91,8 @@ const DryRunBody = z
     /** Plain-words alias: fresh agents say "ticker", the schema says "symbol". */
     ticker: z.string().regex(/^[A-Za-z0-9]{1,12}$/).optional(),
   pair: z.string().min(1),
+  /** Extra quote pairs for a multi-pair launch (hookit: USDG and stock pairs). */
+  pairs: z.array(z.string().min(1)).max(8).optional(),
   preset: z.string().min(1).optional(),
   modules: z.array(z.string().min(1)).max(12).optional(),
   hookTaxPct: z.number().min(0).max(9).optional(), // hookit range is 0-9
@@ -167,7 +169,7 @@ every foundry_ MCP tool. (The HTTP dry-run doesn't take it.) No ID, no launch.
 
 ## Step 3: forge
 
-foundry_list_presets, foundry_list_modules, foundry_list_pairs. YOU choose the name, ticker (or symbol — both work), preset, and pair. You also invent the description and twitter/telegram/website. Generate the token art yourself, upload the PNG to POST /foundry/image (multipart field "image"), and pass the returned URL as image (it lands in the onchain metadata). If you can't generate or upload art, skip the image rather than asking the human — everything creative is your job. Funding the wallet and approving the launch stay human.
+foundry_list_presets, foundry_list_modules, foundry_list_pairs. YOU choose the name, ticker (or symbol — both work), preset, and pair — or several pairs for a multi-pair launch (USDG and stock pairs). You also invent the description and twitter/telegram/website. Generate the token art yourself, upload the PNG to POST /foundry/image (multipart field "image"), and pass the returned URL as image (it lands in the onchain metadata). If you can't generate or upload art, skip the image rather than asking the human — everything creative is your job. Funding the wallet and approving the launch stay human.
 
 ## Step 4: dry run
 
@@ -299,6 +301,7 @@ export function createFoundryHttpApp(
     };
     if (p.preset) upstream.preset = p.preset;
     if (p.modules) upstream.modules = p.modules;
+    if (p.pairs) upstream.pairs = p.pairs;
     if (p.hookTaxPct !== undefined) upstream.hookTaxPct = p.hookTaxPct;
     if (p.devBuyPct !== undefined) upstream.devBuyPct = p.devBuyPct;
     if (p.description) upstream.description = p.description;

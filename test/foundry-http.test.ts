@@ -128,6 +128,35 @@ await check('POST /dry-run maps body onto prepare-launch schema', async () => {
   assert.ok(!('dryRun' in sent)); // unsigned verdict is inherent, no flag needed
 });
 
+await check('POST /dry-run forwards pairs and creative fields to prepare-launch', async () => {
+  const { app, mock } = mountedApp();
+  const res = await app.request('/foundry/dry-run', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      ...dryRunBody,
+      pairs: ['usdg', 'waaplx'],
+      description: 'A test coin with lore',
+      image: 'https://example.com/art.png',
+      twitter: '@testcoin',
+      telegram: 'https://t.me/testcoin',
+      website: 'https://testcoin.example',
+    }),
+  });
+  assert.equal(res.status, 200);
+  const launchCalls = mock.calls.filter((c) =>
+    c.url.endsWith('/api/agents/prepare-launch'),
+  );
+  assert.equal(launchCalls.length, 1);
+  const sent = JSON.parse(launchCalls[0]!.init!.body as string) as Record<string, unknown>;
+  assert.deepEqual(sent.pairs, ['usdg', 'waaplx']);
+  assert.equal(sent.description, 'A test coin with lore');
+  assert.equal(sent.image, 'https://example.com/art.png');
+  assert.equal(sent.twitter, '@testcoin');
+  assert.equal(sent.telegram, 'https://t.me/testcoin');
+  assert.equal(sent.website, 'https://testcoin.example');
+});
+
 await check("POST /dry-run surfaces hookit's ok:false as 200+ok:false", async () => {
   const rejecting = (async (url: string) => {
     if (url.endsWith('/api/agents/prepare-launch')) {

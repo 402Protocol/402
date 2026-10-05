@@ -99,6 +99,8 @@ export interface LaunchParams {
   name: string;
   symbol: string;
   pair: string;
+  /** Extra quote pairs for a multi-pair launch (hookit: USDG and stock pairs). */
+  pairs?: string[];
   preset?: string;
   modules?: string[];
   hookTaxPct?: number;
@@ -162,6 +164,12 @@ function validateLaunchParams(p: LaunchParams): void {
     throw new Error('symbol must be 1-12 letters or digits');
   }
   if (!p.pair) throw new Error('pair is required');
+  if (
+    p.pairs !== undefined &&
+    (!Array.isArray(p.pairs) || p.pairs.some((x) => typeof x !== 'string' || !x))
+  ) {
+    throw new Error('pairs must be an array of pair ids');
+  }
   if (p.devBuyPct !== undefined && (p.devBuyPct < 0 || p.devBuyPct > 2.5)) {
     throw new Error('devBuyPct must be between 0 and 2.5');
   }

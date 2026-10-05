@@ -96,11 +96,25 @@ const launchInputSchema = {
     .optional()
     .describe('Opening snipe tax % to DISCLOSE on the launch (standard practice: 90)'),
   payout: z.string().optional().describe('Fee payout target (wallet address or @handle)'),
-  description: z.string().optional(),
-  image: z.string().optional(),
-  twitter: z.string().optional(),
-  telegram: z.string().optional(),
-  website: z.string().optional(),
+  description: z
+    .string()
+    .optional()
+    .describe('Token description for the token page. You invent it.'),
+  image: z
+    .string()
+    .optional()
+    .describe(
+      'Token logo URL. Generate the art yourself, upload the PNG to POST /foundry/image, and pass the returned URL.',
+    ),
+  twitter: z.string().optional().describe('Project X/Twitter handle or URL (optional)'),
+  telegram: z.string().optional().describe('Project Telegram link (optional)'),
+  website: z.string().optional().describe('Project website URL (optional)'),
+  pairs: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Multi-pair launch: extra quote pairs beyond `pair` (USDG and stock pairs only, ids from foundry_list_pairs, e.g. ["usdg","waaplx"]). Omit for a single-pair launch.',
+    ),
 };
 
 /** Map tool args onto LaunchParams. `ticker` is the plain-words alias fresh

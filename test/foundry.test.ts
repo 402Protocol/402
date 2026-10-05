@@ -358,4 +358,22 @@ await check('ticker is accepted as an alias for symbol', () => {
   assert.equal(explicit.symbol, 'AAA'); // explicit symbol wins
 });
 
+await check('toLaunchParams passes pairs and creative fields through', () => {
+  const p = toLaunchParams({
+    name: 'Coin',
+    symbol: 'TST',
+    pair: 'eth',
+    pairs: ['usdg', 'waaplx'],
+    description: 'lore',
+    image: 'https://example.com/art.png',
+    twitter: '@t',
+    telegram: 'https://t.me/t',
+    website: 'https://t.example',
+    erc8004Id: '4076',
+  });
+  assert.deepEqual(p.pairs, ['usdg', 'waaplx']);
+  assert.equal(p.description, 'lore');
+  assert.equal(p.image, 'https://example.com/art.png');
+});
+
 console.log(`\n${passed} foundry checks passed`);
