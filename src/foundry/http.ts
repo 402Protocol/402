@@ -10,6 +10,8 @@
  *
  * Routes:
  *   GET  /foundry/health     liveness
+ *   GET  /foundry/stats      onchain launch stats: count, fees, latest link
+ *                            (cached 5 min; Blockscout + Hookit board)
  *   GET  /foundry/presets    presets from the catalog
  *   GET  /foundry/modules    modules from the catalog
  *   GET  /foundry/pairs      pairs from the catalog
@@ -49,6 +51,7 @@
  */
 import { Hono } from 'hono';
 import { z } from 'zod';
+import { getFoundryStats, type FoundryStats } from './stats.js';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -245,6 +248,26 @@ export function createFoundryHttpApp(
   app.get('/health', (c) =>
     c.json({ ok: true, dryRunOnly: true, time: Date.now() }),
   );
+
+  // Public launch stats, derived onchain (cached 5 min). Powers the
+  // Foundry site's self-updating counters: launch count, fees collected,
+  // and the latest-launch link. Read-only: Blockscout + Hookit's public
+  // launch board, no keys, nothing signed.
+  const STATS_TTL_MS = 5 * 60_000;
+  let statsCache: { at: number; value: FoundryStats } | null = null;
+  app.get('/stats', async (c) => {
+    try {
+      if (!statsCache || Date.now() - statsCache.at >= STATS_TTL_MS) {
+        statsCache = {
+          at: Date.now(),
+          value: await getFoundryStats(fetchFn, HOOKIT_API_URL),
+        };
+      }
+      return c.json({ ok: true, ...statsCache.value });
+    } catch (e) {
+      return c.json({ ok: false, error: errMessage(e) }, 502);
+    }
+  });
 
   // The one-line agent onboarding. Give this URL to an agent: it installs
   // the Foundry MCP and runs the launch sequence end to end. Docs only,
