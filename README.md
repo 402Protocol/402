@@ -53,6 +53,35 @@ skill/
   SKILL.md          # the Muse skill (symlinked to ~/workspace/skills/402)
 ```
 
+## Automated checks
+
+[CI](https://github.com/402Protocol/402/actions/workflows/ci.yml) runs on pushes
+to `main`, pull requests targeting `main`, and manual runs from GitHub Actions:
+
+- Node 24: `npm ci`, `npm run typecheck` (including `worker/`), and
+  `npm run test:ci` (the invoice self-test plus every `test/*.test.ts` file).
+- Both MCP packages: locked dependency installation, typecheck, build, and tests.
+- Foundry 1.8.5: Solidity unit and fuzz tests, using the pinned Git submodules.
+
+CI has no deployment steps or production secrets. The facilitator tests make
+read-only requests to the public Ink RPC; the xStocks tests use offline quote
+and RPC fixtures. Run `FOUR02_TEST_LIVE=1 npx tsx test/mcp-xstocks.test.ts` only
+when explicitly checking the live 0x integration with its local credential helpers.
+The Solidity fork rehearsals (`*Fork*.t.sol` and
+`test_audit_fork_getJobExistsOnRealEscrow`) depend on live chain state and are
+excluded from automatic checks; `forge test` includes them locally.
+
+To reproduce the root checks, use Node 24 and run:
+
+```bash
+npm ci
+npm run typecheck
+npm run test:ci
+```
+
+`npm test` remains the smaller invoice self-test. CI reports failures but does
+not change branch protection or deploy the application.
+
 ## Quickstart — invoices
 
 ```bash

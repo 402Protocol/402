@@ -1,17 +1,58 @@
 /**
- * xStocks MCP tools smoke tests (live Ink mainnet, read-only + tx building).
+ * xStocks MCP tools smoke tests (offline fixtures by default).
  *
  *   npx tsx test/mcp-xstocks.test.ts
  *
- * Hits the 0x v2 API (stored custom.0x credential) and Ink RPC for quotes and
- * unsigned-tx building. NOTHING IS SIGNED OR BROADCAST — the tools only build
- * calldata. Amounts are tiny ($10) and read-only.
+ * FOUR02_TEST_LIVE=1 opts into the original read-only 0x API + Ink RPC smoke
+ * test and requires the local 0x credential helpers. CI uses canned quotes
+ * and RPC responses. Nothing is signed or broadcast in either mode.
  */
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { mock } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { getAddress, isAddress } from 'viem';
+import { getAddress, isAddress, toHex } from 'viem';
 import { createMcpServer, loadMcpConfig } from '../src/mcp/server.js';
+import { USDG_ADDRESS, XSTOCK_POOLS } from '../src/mcp/xstocks.js';
+
+if (process.env.FOUR02_TEST_LIVE !== '1') {
+  const spender = getAddress('0x1111111111111111111111111111111111111111');
+  mock.method(childProcess, 'execFileSync', (file: string, args: readonly string[] = []) => {
+    assert.ok(file.endsWith('/0x-price') || (file === 'python3' && args[0]?.endsWith('/ox-swap-quote.py')),
+      `unexpected external command: ${file}`);
+    const arg = (name: string) => args[args.indexOf(name) + 1];
+    assert.equal(arg('--chain-id'), '57073');
+    const sellAmount = BigInt(arg('--sell-amount'));
+    const buyToken = getAddress(arg('--buy-token'));
+    const stockLeg = XSTOCK_POOLS.some((pool) => pool.wrapped === buyToken);
+    assert.ok(stockLeg || buyToken === USDG_ADDRESS);
+    // Fixed fixture: USDC/USDG at par, wrapped shares at $100 each.
+    const gross = stockLeg ? sellAmount * 10n ** 12n / 100n : sellAmount;
+    const bps = args.includes('--fee-bps') ? BigInt(arg('--fee-bps')) : 0n;
+    const feeAmount = gross * bps / 10_000n;
+    return JSON.stringify({
+      sellAmount: sellAmount.toString(),
+      buyAmount: (gross - feeAmount).toString(),
+      liquidityAvailable: true,
+      estimatedPriceImpact: '0',
+      transaction: { to: spender, data: '0x1234', value: '0' },
+      issues: { allowance: { spender } },
+      ...(bps ? { integratorFee: { amount: feeAmount.toString(), token: buyToken } } : {}),
+    });
+  });
+  // Update named ESM imports of the mocked built-in used by xstocks.ts.
+  syncBuiltinESMExports();
+  mock.method(globalThis, 'fetch', async (_url: unknown, init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body));
+    assert.ok(['eth_call', 'eth_getBalance'].includes(request.method), `unexpected RPC: ${request.method}`);
+    return new Response(JSON.stringify({
+      jsonrpc: '2.0', id: request.id,
+      result: request.method === 'eth_call' ? toHex(0n, { size: 32 }) : '0x0',
+    }), { headers: { 'content-type': 'application/json' } });
+  });
+}
 
 // A well-known wallet with no xStock activity; used only as taker/quote subject.
 const PROBE_WALLET = getAddress('0xB17e7B5e6B5e1777dD62c583C9D4AfFB183f2D7E');
@@ -168,6 +209,13 @@ await check('xstocks_buy with fee configured discloses + takes integrator fee', 
   );
   delete process.env.FOUR02_XSTOCKS_FEE_BPS;
   delete process.env.FOUR02_XSTOCKS_FEE_RECIPIENT;
+  await feeClient.close();
+  await feeServer.close();
 });
+
+await client.close();
+await mcpServer.close();
+mock.restoreAll();
+syncBuiltinESMExports();
 
 console.log(`\n${passed} xstocks checks passed${process.exitCode ? ' (with failures)' : ''}`);

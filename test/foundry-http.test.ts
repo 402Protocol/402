@@ -259,7 +259,7 @@ await check('GET /foundry/skill.md serves the agent onboarding', async () => {
   assert.match(text, /No ID, no launch/);
   assert.match(text, /Agents propose, humans approve/);
   assert.match(text, /Never skip a step/);
-  assert.match(text, /Ink wallet with gas/);
+  assert.match(text, /fund it ONCE with ~0\.0025 ETH on Ink/);
   assert.match(text, /0\.0025 ETH/);
 });
 

@@ -221,7 +221,7 @@ const jobId = await postFixtureJob();
 
 // ---- the tests ----
 
-await check('lists all 18 tools including the eight jobs_* tools', async () => {
+await check('lists all 25 tools including the eight jobs_* tools', async () => {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
@@ -243,6 +243,13 @@ await check('lists all 18 tools including the eight jobs_* tools', async () => {
     'oracle_price',
     'wallet_create',
     'wallet_verify_backup',
+    'xstocks_balance',
+    'xstocks_basket_buy',
+    'xstocks_basket_sell',
+    'xstocks_buy',
+    'xstocks_list',
+    'xstocks_quote',
+    'xstocks_sell',
   ]);
 });
 
