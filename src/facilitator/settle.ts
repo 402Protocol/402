@@ -26,10 +26,17 @@
  *  - In-flight dedupe (H2): concurrent duplicates of the same settlement
  *    are rejected with `duplicate_settlement` while one is processing, so
  *    exactly one broadcast happens per unique authorization.
- *  - Timeout recovery (#2): the tx hash is saved the moment it is broadcast.
- *    If confirmation times out, the next attempt reconciles that transaction
- *    onchain before ever broadcasting again — a tx that confirms after the
- *    request timed out is reported as success, never double-broadcast.
+ *  - Timeout recovery (#2): a send intent is persisted BEFORE broadcast and
+ *    the tx hash is saved the moment it is broadcast. If confirmation times
+ *    out, the next attempt reconciles that transaction onchain before ever
+ *    broadcasting again — a tx that confirms after the request timed out is
+ *    reported as success, never double-broadcast. If the send outcome is
+ *    unknown (crash between broadcast and hash-save), the retry fails
+ *    closed; a consumed onchain nonce proves the payment succeeded.
+ *  - Claim fencing (#3): the in-flight claim carries an ownership token.
+ *    Only the holder may release it or write settlement state — a stale
+ *    worker that lost its claim stands down instead of broadcasting or
+ *    clobbering its replacement's recovery state.
  */
 import {
   type Address,
@@ -283,12 +290,15 @@ export async function settleExactPayment(
   opts: SettleOptions,
 ): Promise<SettleResponse> {
   const id = settlementIdentity(req);
-  if (!id) return settleInner(req, opts, null);
+  if (!id) return settleInner(req, opts, null, null);
   const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
   // Durable in-flight claim (#3): taken synchronously, before any await, so
   // a concurrent duplicate — same process or a second instance sharing the
-  // store — is guaranteed to see it.
-  if (!opts.store.tryClaimInFlight(id, nowSec)) {
+  // store — is guaranteed to see it. The claim carries an ownership token:
+  // only the holder may release it or write settlement state, so a stale
+  // worker can never clobber its replacement's claim or recovery state.
+  const claimToken = opts.store.tryClaimInFlight(id, nowSec);
+  if (!claimToken) {
     return {
       success: false,
       errorReason: 'duplicate_settlement',
@@ -298,9 +308,9 @@ export async function settleExactPayment(
     };
   }
   try {
-    return await settleInner(req, opts, id);
+    return await settleInner(req, opts, id, claimToken);
   } finally {
-    opts.store.releaseInFlight(id);
+    opts.store.releaseInFlight(id, claimToken);
   }
 }
 
@@ -308,6 +318,7 @@ async function settleInner(
   req: SettleRequest,
   opts: SettleOptions,
   id: SettlementIdentity | null,
+  claimToken: string | null,
 ): Promise<SettleResponse> {
   const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
 
@@ -374,6 +385,25 @@ async function settleInner(
     });
   const payment = { usdcAddress: cfg.usdc.address, from, to, value };
 
+  /**
+   * Fencing: when this worker no longer holds the settlement's claim
+   * (another worker took it over after it went stale), stand down instead
+   * of writing settlement state or broadcasting. Returns a claim_lost
+   * response, or null when this worker still holds the claim.
+   */
+  const assertClaim = (): SettleResponse | null => {
+    if (!id || !claimToken) return null; // no claim held (malformed request path)
+    if (opts.store.ownsClaim(id, claimToken)) return null;
+    return {
+      success: false,
+      errorReason: 'claim_lost',
+      network: cfg.caip2,
+      payer: from,
+      detail:
+        'Another worker took over this settlement; standing down to avoid a duplicate broadcast or clobbered recovery state.',
+    };
+  };
+
   // #2: reconcile a prior broadcast BEFORE any new broadcast. A retry that
   // arrives after a timeout must learn what the first transaction did —
   // confirmed (report success), finalized-without-paying (safe to retry),
@@ -382,6 +412,8 @@ async function settleInner(
   // after a timeout consumed the authorization, and the correct answer is
   // success, not `authorization_already_used`.
   if (id) {
+    const lost = assertClaim();
+    if (lost) return lost;
     const priorHash = opts.store.getBroadcast(id);
     if (priorHash) {
       let outcome: ReconcileOutcome;
@@ -413,6 +445,8 @@ async function settleInner(
         // Still in flight: wait for the original tx, don't broadcast a second.
         try {
           const receipt = await io.waitForReceipt(priorHash, SETTLEMENT_CONFIRM_TIMEOUT_MS);
+          const lostAfterWait = assertClaim();
+          if (lostAfterWait) return lostAfterWait;
           if (receiptConfirmsPayment({ receipt, ...payment })) {
             opts.store.deleteBroadcast(id);
             if (id) opts.store.mark(id, Number(validBefore));
@@ -423,8 +457,22 @@ async function settleInner(
               payer: from,
             };
           }
-          // Finalized without our payment — safe to fall through and retry.
-          opts.store.deleteBroadcast(id);
+          if (receipt.status !== 'success') {
+            // Reverted while we waited — safe to fall through and retry.
+            opts.store.deleteBroadcast(id);
+          } else {
+            // Successful receipt but no matching USDC transfer: unresolved,
+            // not failed. Preserve the hash as evidence; do not rebroadcast.
+            return {
+              success: false,
+              errorReason: 'settlement_unresolved',
+              transaction: priorHash,
+              network: cfg.caip2,
+              payer: from,
+              detail:
+                'A prior broadcast succeeded onchain but the expected USDC transfer was not found in its receipt. The authorization may be consumed; investigate the transaction before retrying.',
+            };
+          }
         } catch (e) {
           if (e instanceof WaitForTransactionReceiptTimeoutError) {
             return {
@@ -461,8 +509,38 @@ async function settleInner(
         };
       } else {
         // 'failed': the prior tx is finalized and never paid — safe to retry.
+        const lost = assertClaim();
+        if (lost) return lost;
         opts.store.deleteBroadcast(id);
       }
+    } else if (opts.store.hasBroadcastIntent(id)) {
+      // A previous attempt recorded a send intent but never saved a hash:
+      // the send outcome is unknown (crash or store failure at the broadcast
+      // boundary). Fail closed — never rebroadcast blind.
+      let consumed = false;
+      try {
+        consumed = await io.isAuthorizationUsed(from, nonce);
+      } catch {
+        // On RPC failure the outcome stays unknown.
+      }
+      if (consumed) {
+        // EIP-3009 marks the nonce only after _transfer succeeds, so a
+        // consumed nonce proves our exact payment succeeded onchain — the
+        // hash was lost, not the payment.
+        const lost = assertClaim();
+        if (lost) return lost;
+        opts.store.deleteBroadcastIntent(id);
+        opts.store.mark(id, Number(validBefore));
+        return { success: true, network: cfg.caip2, payer: from };
+      }
+      return {
+        success: false,
+        errorReason: 'settlement_unknown',
+        network: cfg.caip2,
+        payer: from,
+        detail:
+          'A previous attempt recorded a broadcast intent but no transaction hash (possible crash at the broadcast boundary), and the authorization is not consumed onchain. The transaction may be pending or never submitted. Investigate before retrying — this will not rebroadcast.',
+      };
     }
   }
 
@@ -529,6 +607,8 @@ async function settleInner(
         detail: `simulation reverted (nothing broadcast): ${(e as Error).message?.slice(0, 300)}`,
       };
     }
+    const lostDryRun = assertClaim();
+    if (lostDryRun) return lostDryRun;
     if (id) opts.store.mark(id, Number(validBefore));
     return {
       success: false,
@@ -553,6 +633,25 @@ async function settleInner(
   }
 
   try {
+    const lost = assertClaim();
+    if (lost) return lost;
+    // Persist the send intent BEFORE submission. If we crash between
+    // broadcast and saving the hash, the retry sees the intent without a
+    // hash and fails closed instead of double-broadcasting. If the intent
+    // itself cannot be persisted, refuse to broadcast without recovery.
+    if (id) {
+      try {
+        opts.store.setBroadcastIntent(id);
+      } catch (e) {
+        return {
+          success: false,
+          errorReason: 'store_unavailable',
+          network: cfg.caip2,
+          payer: from,
+          detail: `Cannot persist the send intent; refusing to broadcast without recovery. Cause: ${(e as Error).message?.slice(0, 200)}`,
+        };
+      }
+    }
     const hash = await io.broadcast({
       from,
       to,
@@ -564,15 +663,24 @@ async function settleInner(
       r,
       s,
     });
-    // #2: save the hash the moment it is broadcast, so a later attempt
+    // Save the hash the moment it is broadcast, so a later attempt
     // reconciles this transaction instead of broadcasting a duplicate.
-    if (id) opts.store.setBroadcast(id, hash);
+    // If this write fails the hash is still known in memory for this
+    // attempt; a future retry fails closed via the surviving intent.
+    if (id) {
+      try {
+        opts.store.setBroadcast(id, hash);
+        opts.store.deleteBroadcastIntent(id);
+      } catch {
+        // proceed with the in-memory hash
+      }
+    }
     let receipt: SettlementReceipt;
     try {
       receipt = await io.waitForReceipt(hash, SETTLEMENT_CONFIRM_TIMEOUT_MS);
     } catch (e) {
       if (e instanceof WaitForTransactionReceiptTimeoutError) {
-        // The hash stays in the broadcast log: the next attempt reconciles it.
+        // The hash stays in the store: the next attempt reconciles it.
         return {
           success: false,
           errorReason: 'settlement_timeout',
@@ -585,6 +693,8 @@ async function settleInner(
       }
       throw e;
     }
+    const lostAfterWait = assertClaim();
+    if (lostAfterWait) return lostAfterWait;
     // Core rule: report success only when the chain confirms the intended
     // payment. A reverted receipt is a failure — the EIP-3009 authorization
     // was never consumed, so the nonce stays unmarked and the payer can
@@ -613,8 +723,17 @@ async function settleInner(
           'Transaction succeeded onchain but the expected USDC transfer was not found in its receipt. The authorization may be consumed; investigate the transaction before retrying.',
       };
     }
-    if (id) opts.store.deleteBroadcast(id);
-    if (id) opts.store.mark(id, Number(validBefore));
+    if (id) {
+      try {
+        opts.store.deleteBroadcast(id);
+        opts.store.deleteBroadcastIntent(id);
+        opts.store.mark(id, Number(validBefore));
+      } catch {
+        // The payment is confirmed onchain; never report failure for a
+        // confirmed payment because of a local write error. The onchain
+        // authorizationState check remains the replay backstop.
+      }
+    }
     return {
       success: true,
       transaction: hash,

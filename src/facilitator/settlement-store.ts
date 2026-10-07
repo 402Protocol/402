@@ -17,15 +17,28 @@
  *  - settlement_nonces:     consumed EIP-3009 nonces (replay protection).
  *  - settlement_broadcasts: latest broadcast tx hash per authorization
  *                           (timeout recovery, fix #2).
+ *  - settlement_intents:    send intent recorded BEFORE broadcast. If a
+ *                           crash happens between broadcast and saving the
+ *                           hash, the retry sees the intent without a hash
+ *                           and fails closed instead of double-broadcasting.
  *  - settlement_inflight:   mutual-exclusion claims so two instances never
  *                           settle the same authorization concurrently.
- *                           Stale claims (older than INFLIGHT_CLAIM_TTL_SEC)
- *                           can be taken over — this is the crash-recovery
- *                           path for a dead instance's in-flight settlement.
+ *                           Claims carry ownership tokens: only the holder
+ *                           may release its claim or write settlement state,
+ *                           so a stale worker can never clobber its
+ *                           replacement's claim or recovery state. Stale
+ *                           claims (older than INFLIGHT_CLAIM_TTL_SEC) can be
+ *                           taken over — the crash-recovery path.
+ *
+ * Scaling note: SQLite WAL sharing is safe for processes on the SAME host
+ * only. Replicas on separate hosts must not share the file over a network
+ * volume (WAL over NFS is unsafe) — multi-host deployments need a
+ * client/server database (e.g. Postgres) backing this same interface.
  */
 import { DatabaseSync } from 'node:sqlite';
 import { dirname } from 'node:path';
 import { mkdirSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { getAddress, type Address, type Hex } from 'viem';
 import { chainFromCaip2 } from './chains.js';
 import type { SettleRequest } from './types.js';
@@ -82,17 +95,33 @@ export interface SettlementStore {
   setBroadcast(id: SettlementIdentity, hash: Hex): void;
   /** Forget the broadcast tx hash for this authorization. */
   deleteBroadcast(id: SettlementIdentity): void;
+  /** Record a send intent BEFORE broadcasting (crash-recovery boundary). */
+  setBroadcastIntent(id: SettlementIdentity): void;
+  /** True when a send intent exists with no saved hash (outcome unknown). */
+  hasBroadcastIntent(id: SettlementIdentity): boolean;
+  /** Clear the send intent. */
+  deleteBroadcastIntent(id: SettlementIdentity): void;
   /**
-   * Claim exclusive processing of this settlement. Returns true when this
-   * caller won the claim. A second claimant (same process or another
-   * instance) gets false while the claim is fresh; a stale claim
-   * (older than INFLIGHT_CLAIM_TTL_SEC) can be taken over.
+   * Claim exclusive processing of this settlement. Returns an ownership
+   * token when this caller won the claim, null while a fresh claim is held
+   * (same process or another instance). A stale claim (older than
+   * INFLIGHT_CLAIM_TTL_SEC) can be taken over and yields a new token.
    */
-  tryClaimInFlight(id: SettlementIdentity, nowSec: number): boolean;
-  /** Release an in-flight claim. */
-  releaseInFlight(id: SettlementIdentity): void;
+  tryClaimInFlight(id: SettlementIdentity, nowSec: number): string | null;
+  /**
+   * Release an in-flight claim. Conditional on the ownership token: a stale
+   * worker's late release never deletes its replacement's claim.
+   */
+  releaseInFlight(id: SettlementIdentity, token: string): void;
+  /** True when token is the current holder of this settlement's claim. */
+  ownsClaim(id: SettlementIdentity, token: string): boolean;
   /** Release resources (closes the DB for the SQLite store). */
   close(): void;
+}
+
+/** Fresh random claim-ownership token. */
+export function newClaimToken(): string {
+  return `0x${randomBytes(16).toString('hex')}`;
 }
 
 const SCHEMA = `
@@ -119,6 +148,16 @@ CREATE TABLE IF NOT EXISTS settlement_inflight (
   payer TEXT NOT NULL,
   nonce TEXT NOT NULL,
   claimed_at INTEGER NOT NULL,
+  claim_token TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (chain_id, token, payer, nonce)
+);
+CREATE TABLE IF NOT EXISTS settlement_intents (
+  chain_id INTEGER NOT NULL,
+  token TEXT NOT NULL,
+  payer TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
   PRIMARY KEY (chain_id, token, payer, nonce)
 );
 `;
@@ -130,10 +169,18 @@ export class SqliteSettlementStore implements SettlementStore {
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
-    // WAL mode: readers don't block writers — required for two instances.
+    // WAL mode: readers don't block writers — required for two processes on
+    // the same host. NOT safe over a network volume (see module doc).
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec('PRAGMA busy_timeout = 5000;');
     this.db.exec(SCHEMA);
+    // Migration for DBs created before claim tokens: add the column if missing.
+    const cols = this.db.prepare(`PRAGMA table_info(settlement_inflight)`).all() as {
+      name: string;
+    }[];
+    if (!cols.some((c) => c.name === 'claim_token')) {
+      this.db.exec(`ALTER TABLE settlement_inflight ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''`);
+    }
   }
 
   private norm(id: SettlementIdentity) {
@@ -207,27 +254,79 @@ export class SqliteSettlementStore implements SettlementStore {
       .run(n.chainId, n.token, n.payer, n.nonce);
   }
 
-  tryClaimInFlight(id: SettlementIdentity, nowSec: number): boolean {
+  tryClaimInFlight(id: SettlementIdentity, nowSec: number): string | null {
     const n = this.norm(id);
-    // Atomic: insert wins; on conflict we steal only a stale claim.
-    // changes === 1 means this caller holds the claim.
+    const token = newClaimToken();
+    // Atomic: insert wins; on conflict we steal only a stale claim, taking
+    // over its ownership token. changes === 1 means this caller holds it.
     const res = this.db
       .prepare(
-        `INSERT INTO settlement_inflight (chain_id, token, payer, nonce, claimed_at)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO settlement_inflight (chain_id, token, payer, nonce, claimed_at, claim_token)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT (chain_id, token, payer, nonce)
-         DO UPDATE SET claimed_at = excluded.claimed_at
+         DO UPDATE SET claimed_at = excluded.claimed_at, claim_token = excluded.claim_token
          WHERE settlement_inflight.claimed_at <= ?`,
       )
-      .run(n.chainId, n.token, n.payer, n.nonce, nowSec, nowSec - INFLIGHT_CLAIM_TTL_SEC);
-    return res.changes === 1;
+      .run(
+        n.chainId,
+        n.token,
+        n.payer,
+        n.nonce,
+        nowSec,
+        token,
+        nowSec - INFLIGHT_CLAIM_TTL_SEC,
+      );
+    return res.changes === 1 ? token : null;
   }
 
-  releaseInFlight(id: SettlementIdentity): void {
+  releaseInFlight(id: SettlementIdentity, token: string): void {
+    const n = this.norm(id);
+    // Conditional: a stale worker's late release never deletes its
+    // replacement's claim.
+    this.db
+      .prepare(
+        'DELETE FROM settlement_inflight WHERE chain_id = ? AND token = ? AND payer = ? AND nonce = ? AND claim_token = ?',
+      )
+      .run(n.chainId, n.token, n.payer, n.nonce, token);
+  }
+
+  ownsClaim(id: SettlementIdentity, token: string): boolean {
+    const n = this.norm(id);
+    const row = this.db
+      .prepare(
+        'SELECT claim_token FROM settlement_inflight WHERE chain_id = ? AND token = ? AND payer = ? AND nonce = ?',
+      )
+      .get(n.chainId, n.token, n.payer, n.nonce) as { claim_token: string } | undefined;
+    return !!row && row.claim_token === token;
+  }
+
+  setBroadcastIntent(id: SettlementIdentity): void {
     const n = this.norm(id);
     this.db
       .prepare(
-        'DELETE FROM settlement_inflight WHERE chain_id = ? AND token = ? AND payer = ? AND nonce = ?',
+        `INSERT INTO settlement_intents (chain_id, token, payer, nonce, status, created_at)
+         VALUES (?, ?, ?, ?, 'submitted', ?)
+         ON CONFLICT (chain_id, token, payer, nonce)
+         DO UPDATE SET status = 'submitted', created_at = excluded.created_at`,
+      )
+      .run(n.chainId, n.token, n.payer, n.nonce, Math.floor(Date.now() / 1000));
+  }
+
+  hasBroadcastIntent(id: SettlementIdentity): boolean {
+    const n = this.norm(id);
+    const row = this.db
+      .prepare(
+        'SELECT 1 AS one FROM settlement_intents WHERE chain_id = ? AND token = ? AND payer = ? AND nonce = ?',
+      )
+      .get(n.chainId, n.token, n.payer, n.nonce) as { one: number } | undefined;
+    return !!row;
+  }
+
+  deleteBroadcastIntent(id: SettlementIdentity): void {
+    const n = this.norm(id);
+    this.db
+      .prepare(
+        'DELETE FROM settlement_intents WHERE chain_id = ? AND token = ? AND payer = ? AND nonce = ?',
       )
       .run(n.chainId, n.token, n.payer, n.nonce);
   }

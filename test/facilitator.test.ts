@@ -11,7 +11,7 @@
  * keys, no funded keys, nothing broadcast.
  */
 import assert from 'node:assert/strict';
-import { createPublicClient, http, parseAbiItem, getAddress, keccak256, toHex, pad, WaitForTransactionReceiptTimeoutError } from 'viem';
+import { createPublicClient, http, parseAbiItem, getAddress, keccak256, toHex, pad, WaitForTransactionReceiptTimeoutError, type Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { INK_CONFIG } from '../src/facilitator/chains.js';
 import { loadConfig } from '../src/facilitator/config.js';
@@ -33,6 +33,7 @@ import {
 import {
   settlementIdentity,
   type SettlementIdentity,
+  type SettlementStore,
 } from '../src/facilitator/settlement-store.js';
 import { SqliteSettlementStore } from '../src/facilitator/settlement-store.js';
 import { mkdtempSync } from 'node:fs';
@@ -1033,6 +1034,130 @@ await check('#2: successful receipt without the expected transfer is unresolved,
   assert.equal(res2.success, false);
   assert.equal(res2.errorReason, 'settlement_unresolved');
   assert.equal(state.broadcasts, 1, 'must not rebroadcast an unresolved authorization');
+});
+
+await check('#2: pending then successful-without-transfer preserves the hash as unresolved', async () => {
+  const { state, io } = makeFakeIO();
+  const store = new NonceStore();
+  const r = await signedRequest();
+  const sid = settlementIdentity(r);
+  assert.ok(sid, 'signed request must produce a settlement identity');
+
+  // Seed the saved broadcast of a timed-out attempt.
+  store.setBroadcast(sid, FAKE_HASH);
+  // Reconcile first sees it pending (not mined yet)...
+  state.minedReceipt = null;
+  // ...then the wait returns a SUCCESSFUL receipt with no Transfer event.
+  state.waitReceipt = { status: 'success', logs: [] };
+
+  const res = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+  assert.equal(res.success, false);
+  assert.equal(res.errorReason, 'settlement_unresolved');
+  assert.equal(res.transaction, FAKE_HASH);
+  assert.equal(store.getBroadcast(sid), FAKE_HASH, 'hash must be preserved, not deleted');
+  assert.equal(state.broadcasts, 0, 'must not rebroadcast');
+});
+
+await check('#3b: stale worker stands down before broadcast when its claim was taken over', async () => {
+  const store = new NonceStore();
+  // Sabotage ownsClaim: the claim is valid when taken, then "stolen" by
+  // another worker before this worker reaches the broadcast.
+  const origOwns = store.ownsClaim.bind(store);
+  let claimLive = true;
+  store.ownsClaim = (sid: SettlementIdentity, token: string) =>
+    claimLive && origOwns(sid, token);
+
+  const { state, io } = makeFakeIO();
+  const origIsUsed = io.isAuthorizationUsed;
+  io.isAuthorizationUsed = async (from, nonce) => {
+    claimLive = false; // B took over between claim and broadcast
+    return origIsUsed(from, nonce);
+  };
+
+  const r = await signedRequest();
+  const res = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+  assert.equal(res.success, false);
+  assert.equal(res.errorReason, 'claim_lost');
+  assert.equal(state.broadcasts, 0, 'stale worker must not broadcast');
+});
+
+// A store whose hash-save fails: simulates the DB-write failure at the
+// broadcast boundary (hash known in memory, never persisted).
+class FlakyHashStore extends NonceStore {
+  failSetBroadcast = false;
+  override setBroadcast(id: SettlementIdentity, hash: Hex): void {
+    if (this.failSetBroadcast) throw new Error('db write failed');
+    super.setBroadcast(id, hash);
+  }
+}
+
+// A store whose intent write fails: the send intent cannot be persisted.
+class NoIntentStore extends NonceStore {
+  override setBroadcastIntent(_id: SettlementIdentity): void {
+    throw new Error('db down');
+  }
+}
+
+await check('#3b: DB failure between broadcast and hash-save fails closed on retry', async () => {
+  const { state, io } = makeFakeIO();
+  const store = new FlakyHashStore();
+  store.failSetBroadcast = true;
+  const r = await signedRequest();
+
+  // Attempt 1: intent persisted, broadcast ok, hash-save fails, confirm times out.
+  const res1 = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+  assert.equal(res1.success, false);
+  assert.equal(res1.errorReason, 'settlement_timeout');
+  assert.equal(res1.transaction, FAKE_HASH);
+
+  // Attempt 2: no saved hash, but the intent survives → fail closed.
+  const res2 = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+  assert.equal(res2.success, false);
+  assert.equal(res2.errorReason, 'settlement_unknown');
+  assert.equal(state.broadcasts, 1, 'must not rebroadcast when the send outcome is unknown');
+});
+
+await check('#3b: intent that cannot be persisted refuses to broadcast', async () => {
+  const { state, io } = makeFakeIO();
+  const store = new NoIntentStore();
+  const r = await signedRequest();
+  const res = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+  assert.equal(res.success, false);
+  assert.equal(res.errorReason, 'store_unavailable');
+  assert.equal(state.broadcasts, 0, 'must not broadcast without recovery');
+});
+
+await check('#3b: crashed attempt with consumed authorization recovers to success, no rebroadcast', async () => {
+  const { state, io } = makeFakeIO();
+  const store = new NonceStore();
+  const r = await signedRequest();
+  const sid = settlementIdentity(r);
+  assert.ok(sid);
+  // Simulate the crash: intent persisted, process died before the hash-save.
+  store.setBroadcastIntent(sid);
+  // The transaction did submit and consumed the authorization onchain.
+  io.isAuthorizationUsed = async () => true;
+
+  const res = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+  assert.equal(res.success, true, 'a consumed nonce proves the payment succeeded');
+  assert.equal(state.broadcasts, 0, 'must not rebroadcast');
+  assert.equal(store.hasBroadcastIntent(sid), false, 'intent cleared after recovery');
+});
+
+await check('#3b: crashed attempt with unconsumed authorization fails closed', async () => {
+  const { state, io } = makeFakeIO();
+  const store = new NonceStore();
+  const r = await signedRequest();
+  const sid = settlementIdentity(r);
+  assert.ok(sid);
+  store.setBroadcastIntent(sid);
+  // Authorization not consumed: the tx may be pending or never submitted.
+  io.isAuthorizationUsed = async () => false;
+
+  const res = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+  assert.equal(res.success, false);
+  assert.equal(res.errorReason, 'settlement_unknown');
+  assert.equal(state.broadcasts, 0, 'must not rebroadcast when the send outcome is unknown');
 });
 
 await check('#3: two instances sharing the DB reconcile a timed-out broadcast with one broadcast total', async () => {

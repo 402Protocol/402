@@ -34,13 +34,15 @@
  *                         default "0" (free at launch; open founder question).
  *   FOUR02_JOBS_DB_PATH      SQLite file for the job board, default "./jobs.db".
  *   FOUR02_SETTLEMENT_DB_PATH SQLite file for durable settlement state
- *                         (consumed nonces, broadcast tx hashes, in-flight
- *                         claims), keyed by chain+token+payer+nonce. Unset =
- *                         in-memory only: restarts and second instances
- *                         forget settlement state (the onchain
- *                         authorizationState check remains the backstop).
- *                         Production: point at a persistent volume, e.g.
- *                         /data/settlements.db.
+ *                         (consumed nonces, broadcast tx hashes, send
+ *                         intents, in-flight claims), keyed by
+ *                         chain+token+payer+nonce. Unset = in-memory only:
+ *                         restarts and second instances forget settlement
+ *                         state (the onchain authorizationState check remains
+ *                         the backstop). Production: point at a persistent
+ *                         volume on the SAME host, e.g. /data/settlements.db
+ *                         (SQLite WAL must not be shared over a network
+ *                         volume; multi-host needs a client/server DB).
  *
  * The founder holds all production keys and runs deploys. This CLI only reads
  * keys from the environment — it never prints, stores, or transmits them.

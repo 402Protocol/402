@@ -143,11 +143,14 @@ await check('#3: in-flight claim excludes a second instance until released', asy
   const a = new SqliteSettlementStore(path);
   const b = new SqliteSettlementStore(path);
   const t = nowSec();
-  assert.equal(a.tryClaimInFlight(id(), t), true, 'first claim failed');
-  assert.equal(b.tryClaimInFlight(id(), t), false, 'second instance claimed a live settlement');
-  a.releaseInFlight(id());
-  assert.equal(b.tryClaimInFlight(id(), t), true, 'claim not released');
-  b.releaseInFlight(id());
+  const tokenA = a.tryClaimInFlight(id(), t);
+  assert.ok(tokenA, 'first claim failed');
+  assert.equal(b.tryClaimInFlight(id(), t), null, 'second instance claimed a live settlement');
+  assert.equal(a.ownsClaim(id(), tokenA!), true);
+  a.releaseInFlight(id(), tokenA!);
+  const tokenB = b.tryClaimInFlight(id(), t);
+  assert.ok(tokenB, 'claim not released');
+  b.releaseInFlight(id(), tokenB!);
   a.close();
   b.close();
 });
@@ -157,16 +160,35 @@ await check('#3: stale in-flight claims can be taken over (crash recovery)', asy
   const a = new SqliteSettlementStore(path);
   const b = new SqliteSettlementStore(path);
   const t0 = nowSec();
-  assert.equal(a.tryClaimInFlight(id(), t0), true);
+  const tokenA = a.tryClaimInFlight(id(), t0);
+  assert.ok(tokenA);
   // A "died" holding the claim; after the TTL, B takes it over.
-  assert.equal(
-    b.tryClaimInFlight(id(), t0 + INFLIGHT_CLAIM_TTL_SEC + 1),
-    true,
-    'stale claim not taken over',
-  );
+  const tokenB = b.tryClaimInFlight(id(), t0 + INFLIGHT_CLAIM_TTL_SEC + 1);
+  assert.ok(tokenB, 'stale claim not taken over');
+  assert.notEqual(tokenA, tokenB, 'takeover must issue a new ownership token');
   // And A can no longer claim while B holds it fresh.
-  assert.equal(a.tryClaimInFlight(id(), t0 + INFLIGHT_CLAIM_TTL_SEC + 1), false);
-  b.releaseInFlight(id());
+  assert.equal(a.tryClaimInFlight(id(), t0 + INFLIGHT_CLAIM_TTL_SEC + 1), null);
+  b.releaseInFlight(id(), tokenB!);
+  a.close();
+  b.close();
+});
+
+await check('#3b: A releasing after B takes over does not delete B\'s claim', async () => {
+  const path = tmpDb();
+  const a = new SqliteSettlementStore(path);
+  const b = new SqliteSettlementStore(path);
+  const t0 = nowSec();
+  const tokenA = a.tryClaimInFlight(id(), t0);
+  assert.ok(tokenA, 'A should win the first claim');
+  const tokenB = b.tryClaimInFlight(id(), t0 + INFLIGHT_CLAIM_TTL_SEC + 1);
+  assert.ok(tokenB, 'B should take over the stale claim');
+  // A's eventual cleanup runs with its stale token: must be a no-op.
+  a.releaseInFlight(id(), tokenA!);
+  assert.equal(b.ownsClaim(id(), tokenB!), true, "A's late release deleted B's claim");
+  assert.equal(a.ownsClaim(id(), tokenA!), false);
+  // B's own release still works.
+  b.releaseInFlight(id(), tokenB!);
+  assert.equal(b.ownsClaim(id(), tokenB!), false);
   a.close();
   b.close();
 });
@@ -176,17 +198,37 @@ await check('#3: stale in-flight claims can be taken over (crash recovery)', asy
 await check('#3: NonceStore honors the same claim contract in-memory', async () => {
   const s: SettlementStore = new NonceStore();
   const t = nowSec();
-  assert.equal(s.tryClaimInFlight(id(), t), true);
-  assert.equal(s.tryClaimInFlight(id(), t), false, 'duplicate claim allowed');
-  s.releaseInFlight(id());
-  assert.equal(s.tryClaimInFlight(id(), t), true, 'release broken');
-  // Stale takeover works in-memory too.
-  assert.equal(
-    s.tryClaimInFlight(id(), t + INFLIGHT_CLAIM_TTL_SEC + 1),
-    true,
-    'stale in-memory claim not taken over',
-  );
+  const tokenA = s.tryClaimInFlight(id(), t);
+  assert.ok(tokenA);
+  assert.equal(s.tryClaimInFlight(id(), t), null, 'duplicate claim allowed');
+  assert.equal(s.ownsClaim(id(), tokenA!), true);
+  assert.equal(s.ownsClaim(id(), '0xdead'), false);
+  s.releaseInFlight(id(), tokenA!);
+  const tokenB = s.tryClaimInFlight(id(), t);
+  assert.ok(tokenB, 'release broken');
+  // Stale takeover works in-memory too, with a fresh token.
+  const tokenC = s.tryClaimInFlight(id(), t + INFLIGHT_CLAIM_TTL_SEC + 1);
+  assert.ok(tokenC, 'stale in-memory claim not taken over');
+  assert.notEqual(tokenB, tokenC);
+  // Conditional release: wrong token is a no-op.
+  s.releaseInFlight(id(), tokenB!);
+  assert.equal(s.ownsClaim(id(), tokenC!), true, 'wrong-token release deleted the claim');
+  s.releaseInFlight(id(), tokenC!);
+  assert.equal(s.ownsClaim(id(), tokenC!), false);
   s.close();
+});
+
+await check('#3b: broadcast intent round-trips (both implementations)', async () => {
+  for (const s of [new NonceStore(), new SqliteSettlementStore(tmpDb())] as SettlementStore[]) {
+    assert.equal(s.hasBroadcastIntent(id()), false);
+    s.setBroadcastIntent(id());
+    assert.equal(s.hasBroadcastIntent(id()), true);
+    // Intent is per-authorization.
+    assert.equal(s.hasBroadcastIntent(id({ payer: PAYER_B })), false);
+    s.deleteBroadcastIntent(id());
+    assert.equal(s.hasBroadcastIntent(id()), false);
+    s.close();
+  }
 });
 
 await check('#3: NonceStore broadcast methods round-trip', async () => {

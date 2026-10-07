@@ -11,8 +11,10 @@
  * FOUR02_SETTLEMENT_DB_PATH.
  */
 import type { Hex } from 'viem';
+import { randomBytes } from 'node:crypto';
 import {
   INFLIGHT_CLAIM_TTL_SEC,
+  newClaimToken,
   settlementKey,
   type SettlementIdentity,
   type SettlementStore,
@@ -21,7 +23,8 @@ import {
 export class NonceStore implements SettlementStore {
   private used = new Map<string, number>(); // key -> expiry unix seconds
   private broadcasts = new Map<string, Hex>(); // key -> tx hash
-  private inflight = new Map<string, number>(); // key -> claimedAt unix seconds
+  private intents = new Set<string>(); // keys with a recorded send intent
+  private inflight = new Map<string, { token: string; claimedAt: number }>();
 
   /** True if this authorization was already consumed and has not yet expired. */
   has(id: SettlementIdentity, nowSec: number): boolean {
@@ -59,18 +62,40 @@ export class NonceStore implements SettlementStore {
     this.broadcasts.delete(settlementKey(id));
   }
 
-  tryClaimInFlight(id: SettlementIdentity, nowSec: number): boolean {
+  tryClaimInFlight(id: SettlementIdentity, nowSec: number): string | null {
     const k = settlementKey(id);
-    const claimedAt = this.inflight.get(k);
-    if (claimedAt !== undefined && claimedAt + INFLIGHT_CLAIM_TTL_SEC > nowSec) {
-      return false;
+    const cur = this.inflight.get(k);
+    if (cur && cur.claimedAt + INFLIGHT_CLAIM_TTL_SEC > nowSec) {
+      return null;
     }
-    this.inflight.set(k, nowSec);
-    return true;
+    const token = newClaimToken();
+    this.inflight.set(k, { token, claimedAt: nowSec });
+    return token;
   }
 
-  releaseInFlight(id: SettlementIdentity): void {
-    this.inflight.delete(settlementKey(id));
+  releaseInFlight(id: SettlementIdentity, token: string): void {
+    const k = settlementKey(id);
+    // Conditional: a stale worker's late release never deletes its
+    // replacement's claim.
+    if (this.inflight.get(k)?.token === token) {
+      this.inflight.delete(k);
+    }
+  }
+
+  ownsClaim(id: SettlementIdentity, token: string): boolean {
+    return this.inflight.get(settlementKey(id))?.token === token;
+  }
+
+  setBroadcastIntent(id: SettlementIdentity): void {
+    this.intents.add(settlementKey(id));
+  }
+
+  hasBroadcastIntent(id: SettlementIdentity): boolean {
+    return this.intents.has(settlementKey(id));
+  }
+
+  deleteBroadcastIntent(id: SettlementIdentity): void {
+    this.intents.delete(settlementKey(id));
   }
 
   close(): void {
