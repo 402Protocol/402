@@ -876,7 +876,7 @@ function confirmedTestReceipt(): SettlementReceipt {
   };
 }
 
-await check('#2: reconcileBroadcast maps receipts to confirmed/failed/pending', async () => {
+await check('#2: reconcileBroadcast maps receipts to confirmed/failed/pending/unresolved', async () => {
   const base = {
     usdcAddress: PAYMENT.usdcAddress,
     from: PAYMENT.from,
@@ -888,7 +888,11 @@ await check('#2: reconcileBroadcast maps receipts to confirmed/failed/pending', 
   assert.equal(await at(async () => null), 'pending');
   assert.equal(await at(async () => confirmedTestReceipt()), 'confirmed');
   assert.equal(await at(async () => ({ status: 'reverted', logs: [] })), 'failed');
-  assert.equal(await at(async () => ({ status: 'success', logs: [] })), 'failed');
+  assert.equal(
+    await at(async () => ({ status: 'success', logs: [] })),
+    'unresolved',
+    'successful receipt without the transfer must not read as failed',
+  );
 });
 
 await check('#2: tx that confirms after timeout is success on retry, never rebroadcast', async () => {
@@ -955,6 +959,80 @@ await check('#2: reconcile RPC failure refuses to rebroadcast blind', async () =
   assert.equal(res2.errorReason, 'reconcile_failed');
   assert.equal(res2.transaction, FAKE_HASH);
   assert.equal(state.broadcasts, 1, 'must not rebroadcast when the prior state is unknown');
+});
+
+await check('#2: retry after expiry reconciles a confirmed payment — success, one broadcast', async () => {
+  const { state, io } = makeFakeIO();
+  const store = new NonceStore();
+
+  // Attempt 1 while the authorization is valid: broadcast lands, confirmation times out.
+  const t0 = now();
+  const r = await signedRequest();
+  const res1 = await settleExactPayment(r, { store, settlerKey, dryRun: false, io, nowSec: t0 });
+  assert.equal(res1.success, false);
+  assert.equal(res1.errorReason, 'settlement_timeout');
+  assert.equal(state.broadcasts, 1);
+
+  // The tx confirms onchain BEFORE the authorization expires.
+  state.minedReceipt = confirmedTestReceipt();
+
+  // Attempt 2 AFTER expiry: the saved tx still reconciles to success.
+  // (Regression: full verification used to reject authorization_expired
+  // before the saved transaction was ever checked.)
+  const res2 = await settleExactPayment(r, {
+    store,
+    settlerKey,
+    dryRun: false,
+    io,
+    nowSec: t0 + 600,
+  });
+  assert.equal(
+    res2.success,
+    true,
+    'a payment that confirmed before expiry must be recoverable after it',
+  );
+  assert.equal(res2.transaction, FAKE_HASH);
+  assert.equal(state.broadcasts, 1, 'must not rebroadcast');
+});
+
+await check('#2: retry after expiry with no confirmed payment is rejected, never broadcasts', async () => {
+  const { state, io } = makeFakeIO();
+  const store = new NonceStore();
+  const t0 = now();
+  const r = await signedRequest();
+  // No broadcast ever happened; the retry arrives after expiry.
+  const res = await settleExactPayment(r, {
+    store,
+    settlerKey,
+    dryRun: false,
+    io,
+    nowSec: t0 + 600,
+  });
+  assert.equal(res.success, false);
+  assert.equal(res.errorReason, 'authorization_expired');
+  assert.equal(state.broadcasts, 0, 'an expired authorization must never broadcast');
+});
+
+await check('#2: successful receipt without the expected transfer is unresolved, hash preserved', async () => {
+  const { state, io } = makeFakeIO();
+  state.waitReceipt = { status: 'success', logs: [] }; // no Transfer event
+  const store = new NonceStore();
+  const r = await signedRequest();
+  const sid = settlementIdentity(r);
+  assert.ok(sid, 'signed request must produce a settlement identity');
+
+  const res1 = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+  assert.equal(res1.success, false);
+  assert.equal(res1.errorReason, 'settlement_unresolved');
+  assert.equal(res1.transaction, FAKE_HASH);
+  assert.equal(store.getBroadcast(sid), FAKE_HASH, 'evidence must be preserved, not discarded');
+
+  // A retry reconciles the same receipt: still unresolved, never rebroadcast.
+  state.minedReceipt = { status: 'success', logs: [] };
+  const res2 = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+  assert.equal(res2.success, false);
+  assert.equal(res2.errorReason, 'settlement_unresolved');
+  assert.equal(state.broadcasts, 1, 'must not rebroadcast an unresolved authorization');
 });
 
 await check('#3: two instances sharing the DB reconcile a timed-out broadcast with one broadcast total', async () => {

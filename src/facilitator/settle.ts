@@ -14,9 +14,15 @@
  *    the payer can fund and retry.
  *  - Success is reported only when the chain confirms the intended payment:
  *    the receipt must have status success AND carry the expected USDC
- *    Transfer event (payer -> recipient, exact value). A reverted receipt,
- *    or a successful receipt without the expected transfer, is reported as
- *    failure and the nonce is left unmarked so the payer can retry.
+ *    Transfer event (payer -> recipient, exact value). A reverted receipt is
+ *    a failure and the nonce stays unmarked so the payer can retry. A
+ *    successful receipt WITHOUT the expected transfer is `unresolved`, not
+ *    failed: the authorization is likely consumed, so the hash is preserved
+ *    as evidence instead of being discarded.
+ *  - Ordering: authenticate + validate the request first (expiry deferred),
+ *    then reconcile any saved broadcast — a tx that confirmed before expiry
+ *    is still a valid payment after expiry — then enforce expiry before any
+ *    new broadcast.
  *  - In-flight dedupe (H2): concurrent duplicates of the same settlement
  *    are rejected with `duplicate_settlement` while one is processing, so
  *    exactly one broadcast happens per unique authorization.
@@ -103,7 +109,7 @@ export interface SettlementChainIO {
  * NonceStore.
  */
 /** Outcome of reconciling a prior broadcast against the chain. */
-export type ReconcileOutcome = 'confirmed' | 'failed' | 'pending';
+export type ReconcileOutcome = 'confirmed' | 'failed' | 'pending' | 'unresolved';
 
 export interface SettleOptions {
   store: SettlementStore;
@@ -194,8 +200,10 @@ export function receiptConfirmsPayment(args: {
 /**
  * Reconcile a previously broadcast settlement transaction against the chain.
  *  - 'confirmed': the tx is mined and carries the expected USDC transfer.
- *  - 'failed':    the tx is finalized but did NOT pay (reverted, or no
- *                 matching transfer) — it will never confirm, safe to retry.
+ *  - 'failed':    the tx reverted — it will never pay, safe to retry.
+ *  - 'unresolved': the tx succeeded onchain but carries no matching USDC
+ *                 transfer. The authorization is likely consumed: keep the
+ *                 hash as evidence, never rebroadcast blind.
  *  - 'pending':   the tx is not mined yet.
  * RPC errors propagate; the caller must not rebroadcast on uncertainty.
  */
@@ -209,15 +217,18 @@ export async function reconcileBroadcast(args: {
 }): Promise<ReconcileOutcome> {
   const receipt = await args.io.getReceipt(args.hash);
   if (!receipt) return 'pending';
-  return receiptConfirmsPayment({
-    receipt,
-    usdcAddress: args.usdcAddress,
-    from: args.from,
-    to: args.to,
-    value: args.value,
-  })
-    ? 'confirmed'
-    : 'failed';
+  if (
+    receiptConfirmsPayment({
+      receipt,
+      usdcAddress: args.usdcAddress,
+      from: args.from,
+      to: args.to,
+      value: args.value,
+    })
+  ) {
+    return 'confirmed';
+  }
+  return receipt.status === 'success' ? 'unresolved' : 'failed';
 }
 
 /** Default SettlementChainIO backed by viem clients. */
@@ -309,11 +320,15 @@ async function settleInner(
     };
   }
 
-  // Full verification first, without consuming the nonce yet.
+  // Authenticate and validate the request first, without consuming the nonce
+  // yet — but defer the expiry check. A saved broadcast for this
+  // authorization may have confirmed before expiry, and that payment is
+  // still recoverable after expiry via reconcile below.
   const verified = await verifyExactPayment(req, {
     store: opts.store,
     markUsed: false,
     nowSec,
+    skipExpiryCheck: true,
   });
   const network = req?.paymentRequirements?.network;
   if (!verified.isValid) {
@@ -328,14 +343,6 @@ async function settleInner(
   const cfg = chainFromCaip2(network);
   if (!cfg) {
     return { success: false, errorReason: 'invalid_network', network };
-  }
-  if (id && opts.store.has(id, nowSec)) {
-    return {
-      success: false,
-      errorReason: 'nonce_replay',
-      network: cfg.caip2,
-      payer: verified.payer,
-    };
   }
 
   const auth = req.paymentPayload.payload.authorization;
@@ -439,11 +446,43 @@ async function settleInner(
             detail: (e as Error).message?.slice(0, 500),
           };
         }
+      } else if (outcome === 'unresolved') {
+        // The prior tx succeeded onchain but carried no matching USDC
+        // transfer. The authorization is likely consumed: keep the hash as
+        // evidence and do not rebroadcast.
+        return {
+          success: false,
+          errorReason: 'settlement_unresolved',
+          transaction: priorHash,
+          network: cfg.caip2,
+          payer: from,
+          detail:
+            'A prior broadcast succeeded onchain but the expected USDC transfer was not found in its receipt. The authorization may be consumed; investigate the transaction before retrying.',
+        };
       } else {
         // 'failed': the prior tx is finalized and never paid — safe to retry.
         opts.store.deleteBroadcast(id);
       }
     }
+  }
+
+  // Expiry is enforced here: after reconcile (a tx that confirmed before
+  // expiry is still a valid payment) and before any new broadcast.
+  if (BigInt(nowSec) >= validBefore) {
+    return {
+      success: false,
+      errorReason: 'authorization_expired',
+      network: cfg.caip2,
+      payer: from,
+    };
+  }
+  if (id && opts.store.has(id, nowSec)) {
+    return {
+      success: false,
+      errorReason: 'nonce_replay',
+      network: cfg.caip2,
+      payer: verified.payer,
+    };
   }
 
   // Belt-and-braces: the chain itself tracks consumed EIP-3009 nonces.
@@ -547,21 +586,31 @@ async function settleInner(
       throw e;
     }
     // Core rule: report success only when the chain confirms the intended
-    // payment. A reverted receipt (or a successful one carrying no matching
-    // USDC Transfer) is a failure; the nonce stays unmarked so the payer
-    // can retry — a reverted EIP-3009 authorization was never consumed.
+    // payment. A reverted receipt is a failure — the EIP-3009 authorization
+    // was never consumed, so the nonce stays unmarked and the payer can
+    // retry. A successful receipt without the expected USDC transfer is
+    // UNRESOLVED, not failed: the authorization is likely consumed onchain,
+    // so the hash is preserved as evidence instead of being discarded.
     if (!receiptConfirmsPayment({ receipt, ...payment })) {
-      if (id) opts.store.deleteBroadcast(id);
-      const reverted = receipt.status !== 'success';
+      if (receipt.status !== 'success') {
+        if (id) opts.store.deleteBroadcast(id);
+        return {
+          success: false,
+          errorReason: 'transaction_reverted',
+          transaction: hash,
+          network: cfg.caip2,
+          payer: from,
+          detail: 'Transaction reverted onchain; payment was not made.',
+        };
+      }
       return {
         success: false,
-        errorReason: reverted ? 'transaction_reverted' : 'transfer_not_confirmed',
+        errorReason: 'settlement_unresolved',
         transaction: hash,
         network: cfg.caip2,
         payer: from,
-        detail: reverted
-          ? 'Transaction reverted onchain; payment was not made.'
-          : 'Receipt succeeded but carried no matching USDC Transfer event; payment not confirmed.',
+        detail:
+          'Transaction succeeded onchain but the expected USDC transfer was not found in its receipt. The authorization may be consumed; investigate the transaction before retrying.',
       };
     }
     if (id) opts.store.deleteBroadcast(id);

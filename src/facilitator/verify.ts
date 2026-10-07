@@ -36,6 +36,13 @@ export interface VerifyOptions {
   /** Mark the nonce consumed on success. Default true. */
   markUsed?: boolean;
   nowSec?: number;
+  /**
+   * Skip the authorization_expired check. Settle uses this: it authenticates
+   * and validates the request first, reconciles any saved broadcast (a tx
+   * that confirmed before expiry is still a valid payment), and enforces
+   * expiry itself before any new broadcast.
+   */
+  skipExpiryCheck?: boolean;
 }
 
 function fail(reason: string): VerifyResponse {
@@ -164,7 +171,9 @@ export async function verifyExactPayment(
   }
 
   if (BigInt(nowSec) < validAfter) return fail('authorization_not_yet_valid');
-  if (BigInt(nowSec) >= validBefore) return fail('authorization_expired');
+  if (!opts.skipExpiryCheck && BigInt(nowSec) >= validBefore) {
+    return fail('authorization_expired');
+  }
 
   const sid = settlementIdentity(req);
   if (sid && opts.store.has(sid, nowSec)) {
