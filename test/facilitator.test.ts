@@ -11,7 +11,7 @@
  * keys, no funded keys, nothing broadcast.
  */
 import assert from 'node:assert/strict';
-import { createPublicClient, http, parseAbiItem, getAddress, keccak256, toHex, pad } from 'viem';
+import { createPublicClient, http, parseAbiItem, getAddress, keccak256, toHex, pad, WaitForTransactionReceiptTimeoutError } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { INK_CONFIG } from '../src/facilitator/chains.js';
 import { loadConfig } from '../src/facilitator/config.js';
@@ -22,7 +22,15 @@ import {
 } from '../src/facilitator/eip3009.js';
 import { NonceStore } from '../src/facilitator/nonces.js';
 import { createApp } from '../src/facilitator/server.js';
-import { settleExactPayment, receiptConfirmsPayment } from '../src/facilitator/settle.js';
+import {
+  settleExactPayment,
+  receiptConfirmsPayment,
+  reconcileBroadcast,
+  settlementDedupeKey,
+  type BroadcastLog,
+  type SettlementChainIO,
+  type SettlementReceipt,
+} from '../src/facilitator/settle.js';
 import type {
   PaymentPayload,
   PaymentRequirements,
@@ -803,6 +811,136 @@ await check('R1: successful receipt with undecodable logs does not confirm', asy
     ],
   };
   assert.equal(receiptConfirmsPayment({ receipt, ...PAYMENT }), false);
+});
+
+// ---------- settle: timeout recovery (#2) ----------
+// A fake chain IO lets these tests drive the exact scenario fix #2 covers:
+// a transaction that confirms AFTER the request timed out. No broadcast,
+// no live RPC.
+
+const FAKE_HASH =
+  '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef' as `0x${string}`;
+
+function makeFakeIO() {
+  const state = {
+    broadcasts: 0,
+    /** What waitForReceipt does on the next call. */
+    waitReceipt: 'timeout' as 'timeout' | SettlementReceipt,
+    /** What getReceipt returns (null = not mined yet). */
+    minedReceipt: null as SettlementReceipt | null,
+    /** When true, getReceipt throws (RPC down). */
+    failGetReceipt: false,
+  };
+  const io: SettlementChainIO = {
+    isAuthorizationUsed: async () => false,
+    payerBalance: async () => 1_000_000n,
+    broadcast: async () => {
+      state.broadcasts++;
+      return FAKE_HASH;
+    },
+    waitForReceipt: async (hash) => {
+      if (state.waitReceipt === 'timeout') {
+        throw new WaitForTransactionReceiptTimeoutError({ hash });
+      }
+      return state.waitReceipt;
+    },
+    getReceipt: async () => {
+      if (state.failGetReceipt) throw new Error('rpc down');
+      return state.minedReceipt;
+    },
+  };
+  return { state, io };
+}
+
+function confirmedTestReceipt(): SettlementReceipt {
+  return {
+    status: 'success',
+    logs: [transferLog(PAYMENT.from, PAYMENT.to, PAYMENT.value)],
+  };
+}
+
+await check('#2: reconcileBroadcast maps receipts to confirmed/failed/pending', async () => {
+  const base = {
+    usdcAddress: PAYMENT.usdcAddress,
+    from: PAYMENT.from,
+    to: PAYMENT.to,
+    value: PAYMENT.value,
+  };
+  const at = (getReceipt: () => Promise<SettlementReceipt | null>) =>
+    reconcileBroadcast({ io: { getReceipt }, hash: FAKE_HASH, ...base });
+  assert.equal(await at(async () => null), 'pending');
+  assert.equal(await at(async () => confirmedTestReceipt()), 'confirmed');
+  assert.equal(await at(async () => ({ status: 'reverted', logs: [] })), 'failed');
+  assert.equal(await at(async () => ({ status: 'success', logs: [] })), 'failed');
+});
+
+await check('#2: tx that confirms after timeout is success on retry, never rebroadcast', async () => {
+  const { state, io } = makeFakeIO();
+  const broadcastLog: BroadcastLog = new Map();
+  const store = new NonceStore();
+  const opts = { store, settlerKey, dryRun: false, io, broadcastLog };
+
+  // Attempt 1: broadcast lands, confirmation times out.
+  const r = await signedRequest();
+  const key = settlementDedupeKey(r);
+  assert.ok(key, 'signed request must produce a dedupe key');
+  const res1 = await settleExactPayment(r, opts);
+  assert.equal(res1.success, false);
+  assert.equal(res1.errorReason, 'settlement_timeout');
+  assert.equal(res1.transaction, FAKE_HASH);
+  assert.equal(state.broadcasts, 1);
+  assert.equal(broadcastLog.get(key!), FAKE_HASH, 'hash must be saved on broadcast');
+
+  // The transaction confirms onchain AFTER the request timed out.
+  state.minedReceipt = confirmedTestReceipt();
+
+  // Attempt 2 (retry of the same authorization): reconciles, no second broadcast.
+  const res2 = await settleExactPayment(r, opts);
+  assert.equal(res2.success, true);
+  assert.equal(res2.transaction, FAKE_HASH);
+  assert.equal(state.broadcasts, 1, 'must never double-broadcast');
+  assert.equal(broadcastLog.get(key!), undefined, 'log entry cleared after confirm');
+});
+
+await check('#2: reverted prior broadcast clears the log and retries with a fresh broadcast', async () => {
+  const { state, io } = makeFakeIO();
+  state.waitReceipt = { status: 'reverted', logs: [] };
+  const broadcastLog: BroadcastLog = new Map();
+  const store = new NonceStore();
+  const opts = { store, settlerKey, dryRun: false, io, broadcastLog };
+
+  const r = await signedRequest();
+  const res1 = await settleExactPayment(r, opts);
+  assert.equal(res1.success, false);
+  assert.equal(res1.errorReason, 'transaction_reverted');
+  assert.equal(state.broadcasts, 1);
+
+  // The reverted tx is now finalized onchain; the retry reconciles it as
+  // failed and rebroadcasts. This time it confirms.
+  state.minedReceipt = { status: 'reverted', logs: [] };
+  state.waitReceipt = confirmedTestReceipt();
+  const res2 = await settleExactPayment(r, opts);
+  assert.equal(res2.success, true);
+  assert.equal(state.broadcasts, 2, 'a finalized-without-paying tx is safe to retry');
+});
+
+await check('#2: reconcile RPC failure refuses to rebroadcast blind', async () => {
+  const { state, io } = makeFakeIO();
+  const broadcastLog: BroadcastLog = new Map();
+  const store = new NonceStore();
+  const opts = { store, settlerKey, dryRun: false, io, broadcastLog };
+
+  const r = await signedRequest();
+  const res1 = await settleExactPayment(r, opts);
+  assert.equal(res1.errorReason, 'settlement_timeout');
+
+  // RPC is down during reconcile: uncertain state -> no rebroadcast.
+  state.failGetReceipt = true;
+  const res2 = await settleExactPayment(r, opts);
+  assert.equal(res2.success, false);
+  assert.equal(res2.errorReason, 'reconcile_failed');
+  assert.equal(res2.transaction, FAKE_HASH);
+  assert.equal(state.broadcasts, 1, 'must not rebroadcast when the prior state is unknown');
 });
 
 console.log(`\n${passed} facilitator tests passed${process.exitCode ? ' (with failures)' : ''}`);
