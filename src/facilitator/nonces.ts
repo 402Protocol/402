@@ -18,6 +18,7 @@ import {
   settlementKey,
   type SettlementIdentity,
   type SettlementStore,
+  type SettlementUpdate,
 } from './settlement-store.js';
 
 export class NonceStore implements SettlementStore {
@@ -96,6 +97,33 @@ export class NonceStore implements SettlementStore {
 
   deleteBroadcastIntent(id: SettlementIdentity): void {
     this.intents.delete(settlementKey(id));
+  }
+
+  updateClaimed(id: SettlementIdentity, token: string, update: SettlementUpdate): boolean {
+    // Synchronous, so no other in-process worker can take over mid-update.
+    if (!this.ownsClaim(id, token)) return false;
+    const k = settlementKey(id);
+    const expiry = this.used.get(k);
+    const hash = this.broadcasts.get(k);
+    const intent = this.intents.has(k);
+    try {
+      if (update.nonceExpiresAtSec !== undefined) this.mark(id, update.nonceExpiresAtSec);
+      if (update.broadcast === null) this.deleteBroadcast(id);
+      else if (update.broadcast !== undefined) this.setBroadcast(id, update.broadcast);
+      if (update.intent === true) this.setBroadcastIntent(id);
+      else if (update.intent === false) this.deleteBroadcastIntent(id);
+      return true;
+    } catch (e) {
+      // Match the durable store's all-or-nothing contract, including when
+      // a test injects a failing write.
+      if (expiry === undefined) this.used.delete(k);
+      else this.used.set(k, expiry);
+      if (hash === undefined) this.broadcasts.delete(k);
+      else this.broadcasts.set(k, hash);
+      if (intent) this.intents.add(k);
+      else this.intents.delete(k);
+      throw e;
+    }
   }
 
   close(): void {

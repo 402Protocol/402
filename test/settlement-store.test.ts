@@ -13,6 +13,7 @@
  * No chain access, no broadcasts — pure store behavior.
  */
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,6 +23,7 @@ import {
   SqliteSettlementStore,
   type SettlementIdentity,
   type SettlementStore,
+  type SettlementUpdate,
 } from '../src/facilitator/settlement-store.js';
 
 let passed = 0;
@@ -239,6 +241,130 @@ await check('#3: NonceStore broadcast methods round-trip', async () => {
   s.deleteBroadcast(id());
   assert.equal(s.getBroadcast(id()), undefined);
   s.close();
+});
+
+for (const kind of ['memory', 'sqlite'] as const) {
+  await check(`recovery: ${kind} applies claimed updates only for the current owner`, () => {
+    const path = tmpDb();
+    const s: SettlementStore = kind === 'sqlite' ? new SqliteSettlementStore(path) : new NonceStore();
+    const t0 = nowSec();
+    const oldToken = s.tryClaimInFlight(id(), t0);
+    assert.ok(oldToken);
+    const currentToken = s.tryClaimInFlight(id(), t0 + INFLIGHT_CLAIM_TTL_SEC + 1);
+    assert.ok(currentToken);
+    s.setBroadcast(id(), HASH_A);
+    s.setBroadcastIntent(id());
+    const updates: SettlementUpdate[] = [
+      { nonceExpiresAtSec: t0 + 3600, broadcast: null, intent: false },
+      { broadcast: HASH_A, intent: false },
+      { broadcast: null, intent: false },
+      { intent: true },
+    ];
+    try {
+      for (const update of updates) {
+        assert.equal(s.updateClaimed(id(), oldToken, update), false);
+        assert.equal(s.getBroadcast(id()), HASH_A);
+        assert.equal(s.hasBroadcastIntent(id()), true);
+        assert.equal(s.has(id(), t0), false);
+        assert.equal(s.ownsClaim(id(), currentToken), true);
+      }
+      assert.equal(s.updateClaimed(id({ payer: PAYER_B }), currentToken, { intent: true }), false);
+      assert.equal(s.hasBroadcastIntent(id({ payer: PAYER_B })), false);
+      assert.equal(s.updateClaimed(id(), currentToken, updates[0]), true);
+      assert.equal(s.getBroadcast(id()), undefined);
+      assert.equal(s.hasBroadcastIntent(id()), false);
+      assert.equal(s.has(id(), t0), true);
+    } finally {
+      s.close();
+    }
+    if (kind === 'sqlite') {
+      const restarted = new SqliteSettlementStore(path);
+      assert.equal(restarted.getBroadcast(id()), undefined);
+      assert.equal(restarted.hasBroadcastIntent(id()), false);
+      assert.equal(restarted.has(id(), t0), true);
+      restarted.close();
+    }
+  });
+}
+
+for (const [operation, table] of [
+  ['INSERT', 'settlement_nonces'],
+  ['DELETE', 'settlement_broadcasts'],
+  ['DELETE', 'settlement_intents'],
+] as const) {
+  await check(`recovery: SQLite rolls back completion when ${table} fails`, () => {
+    const path = tmpDb();
+    const s = new SqliteSettlementStore(path);
+    const faultDb = new DatabaseSync(path);
+    const t0 = nowSec();
+    const token = s.tryClaimInFlight(id(), t0);
+    assert.ok(token);
+    s.setBroadcast(id(), HASH_A);
+    s.setBroadcastIntent(id());
+    faultDb.exec(`CREATE TRIGGER fail_write BEFORE ${operation} ON ${table}
+      BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;`);
+    try {
+      assert.throws(() => s.updateClaimed(id(), token, {
+        nonceExpiresAtSec: t0 + 3600, broadcast: null, intent: false,
+      }), /injected write failure/);
+    } finally {
+      s.close();
+      faultDb.exec('DROP TRIGGER fail_write');
+      faultDb.close();
+    }
+    const restarted = new SqliteSettlementStore(path);
+    try {
+      assert.equal(restarted.getBroadcast(id()), HASH_A);
+      assert.equal(restarted.hasBroadcastIntent(id()), true);
+      assert.equal(restarted.has(id(), t0), false, 'no partially committed paid mark');
+      assert.equal(restarted.ownsClaim(id(), token), true);
+      // A rollback must leave the connection usable for a later completion.
+      assert.equal(restarted.updateClaimed(id(), token, {
+        nonceExpiresAtSec: t0 + 3600, broadcast: null, intent: false,
+      }), true);
+    } finally {
+      restarted.close();
+    }
+  });
+}
+
+await check('recovery: SQLite holds the writer lock across ownership check and mutation', () => {
+  const path = tmpDb();
+  const s = new SqliteSettlementStore(path);
+  const contender = new DatabaseSync(path);
+  const token = s.tryClaimInFlight(id(), nowSec());
+  assert.ok(token);
+  const ownsClaim = s.ownsClaim.bind(s);
+  s.ownsClaim = (sid, claimToken) => {
+    const owns = ownsClaim(sid, claimToken);
+    assert.throws(() => contender.exec("UPDATE settlement_inflight SET claim_token = 'stolen'"), /locked/);
+    return owns;
+  };
+  try {
+    assert.equal(s.updateClaimed(id(), token, { broadcast: HASH_A, intent: false }), true);
+    assert.equal(s.getBroadcast(id()), HASH_A);
+    assert.equal(ownsClaim(id(), token), true);
+  } finally {
+    contender.close();
+    s.close();
+  }
+});
+
+await check('recovery: NonceStore rolls back earlier mutations when a later write fails', () => {
+  const s = new NonceStore();
+  const t0 = nowSec();
+  const token = s.tryClaimInFlight(id(), t0);
+  assert.ok(token);
+  s.setBroadcast(id(), HASH_A);
+  s.setBroadcastIntent(id());
+  const deleteIntent = s.deleteBroadcastIntent.bind(s);
+  s.deleteBroadcastIntent = (sid) => { deleteIntent(sid); throw new Error('injected write failure'); };
+  assert.throws(() => s.updateClaimed(id(), token, {
+    nonceExpiresAtSec: t0 + 3600, broadcast: null, intent: false,
+  }), /injected write failure/);
+  assert.equal(s.getBroadcast(id()), HASH_A);
+  assert.equal(s.hasBroadcastIntent(id()), true);
+  assert.equal(s.has(id(), t0), false);
 });
 
 for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true });

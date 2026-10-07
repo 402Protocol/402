@@ -84,6 +84,14 @@ export function settlementIdentity(req: SettleRequest): SettlementIdentity | nul
   }
 }
 
+/** State changes applied together while the caller still owns the claim. */
+export interface SettlementUpdate {
+  nonceExpiresAtSec?: number;
+  /** A hash saves evidence; null clears it; omitted leaves it unchanged. */
+  broadcast?: Hex | null;
+  intent?: boolean;
+}
+
 export interface SettlementStore {
   /** True when this authorization's nonce was already consumed and unexpired. */
   has(id: SettlementIdentity, nowSec: number): boolean;
@@ -97,7 +105,7 @@ export interface SettlementStore {
   deleteBroadcast(id: SettlementIdentity): void;
   /** Record a send intent BEFORE broadcasting (crash-recovery boundary). */
   setBroadcastIntent(id: SettlementIdentity): void;
-  /** True when a send intent exists with no saved hash (outcome unknown). */
+  /** True when a send intent exists; without a saved hash its outcome is unknown. */
   hasBroadcastIntent(id: SettlementIdentity): boolean;
   /** Clear the send intent. */
   deleteBroadcastIntent(id: SettlementIdentity): void;
@@ -115,6 +123,12 @@ export interface SettlementStore {
   releaseInFlight(id: SettlementIdentity, token: string): void;
   /** True when token is the current holder of this settlement's claim. */
   ownsClaim(id: SettlementIdentity, token: string): boolean;
+  /**
+   * Atomically check ownership and apply all changes. False means the claim
+   * was lost and nothing changed. On write failure, roll back every change
+   * and throw, preserving the prior recovery evidence.
+   */
+  updateClaimed(id: SettlementIdentity, token: string, update: SettlementUpdate): boolean;
   /** Release resources (closes the DB for the SQLite store). */
   close(): void;
 }
@@ -329,6 +343,30 @@ export class SqliteSettlementStore implements SettlementStore {
         'DELETE FROM settlement_intents WHERE chain_id = ? AND token = ? AND payer = ? AND nonce = ?',
       )
       .run(n.chainId, n.token, n.payer, n.nonce);
+  }
+
+  updateClaimed(id: SettlementIdentity, token: string, update: SettlementUpdate): boolean {
+    // Acquire the writer lock BEFORE reading ownership: another process
+    // cannot take over between the claim check and any of these writes.
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!this.ownsClaim(id, token)) {
+        this.db.exec('ROLLBACK');
+        return false;
+      }
+      if (update.nonceExpiresAtSec !== undefined) this.mark(id, update.nonceExpiresAtSec);
+      if (update.broadcast === null) this.deleteBroadcast(id);
+      else if (update.broadcast !== undefined) this.setBroadcast(id, update.broadcast);
+      if (update.intent === true) this.setBroadcastIntent(id);
+      else if (update.intent === false) this.deleteBroadcastIntent(id);
+      this.db.exec('COMMIT');
+      return true;
+    } catch (e) {
+      // Some SQLite errors already roll back the transaction. Preserve the
+      // original error if there is then nothing left to roll back.
+      try { this.db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw e;
+    }
   }
 
   close(): void {

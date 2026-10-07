@@ -11,6 +11,7 @@
  * keys, no funded keys, nothing broadcast.
  */
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import { createPublicClient, http, parseAbiItem, getAddress, keccak256, toHex, pad, WaitForTransactionReceiptTimeoutError, type Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { INK_CONFIG } from '../src/facilitator/chains.js';
@@ -32,6 +33,7 @@ import {
 } from '../src/facilitator/settle.js';
 import {
   settlementIdentity,
+  INFLIGHT_CLAIM_TTL_SEC,
   type SettlementIdentity,
   type SettlementStore,
 } from '../src/facilitator/settlement-store.js';
@@ -1296,6 +1298,129 @@ await check('#3: replay is rejected across instances after a confirmed settlemen
   assert.equal(state.broadcasts, 1, 'replay must never rebroadcast');
   storeA.close();
   storeB.close();
+});
+
+for (const path of ['reconcile', 'pending', 'broadcast'] as const) {
+  await check(`recovery: ${path} keeps confirmed payment evidence when completion writes fail`, async () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), 'settle-complete-failure-')), 'settlements.db');
+    const store = new SqliteSettlementStore(dbPath);
+    const faultDb = new DatabaseSync(dbPath);
+    const { state, io } = makeFakeIO();
+    const r = await signedRequest();
+    const sid = settlementIdentity(r);
+    assert.ok(sid);
+    if (path !== 'broadcast') store.setBroadcast(sid, FAKE_HASH);
+    state.minedReceipt = path === 'reconcile' ? confirmedTestReceipt() : null;
+    state.waitReceipt = confirmedTestReceipt();
+    faultDb.exec(`CREATE TRIGGER fail_completion BEFORE INSERT ON settlement_nonces
+      BEGIN SELECT RAISE(ABORT, 'completion write failed'); END;`);
+    try {
+      const res = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+      assert.equal(res.success, true, 'a local write failure cannot undo a proven payment');
+      assert.equal(res.transaction, FAKE_HASH);
+      assert.equal(store.getBroadcast(sid), FAKE_HASH, 'keep evidence until completion commits');
+      assert.equal(store.has(sid, now()), false);
+    } finally {
+      store.close();
+      faultDb.exec('DROP TRIGGER fail_completion');
+      faultDb.close();
+    }
+
+    // A restarted worker can still reconcile the saved proof without sending again.
+    const restarted = new SqliteSettlementStore(dbPath);
+    try {
+      state.minedReceipt = confirmedTestReceipt();
+      io.isAuthorizationUsed = async () => true;
+      const res = await settleExactPayment(r, { store: restarted, settlerKey, dryRun: false, io });
+      assert.equal(res.success, true);
+      assert.equal(res.transaction, FAKE_HASH);
+      assert.equal(restarted.getBroadcast(sid), undefined);
+      assert.equal(restarted.hasBroadcastIntent(sid), false);
+      assert.equal(restarted.has(sid, now()), true);
+      assert.equal(state.broadcasts, path === 'broadcast' ? 1 : 0);
+    } finally {
+      restarted.close();
+    }
+  });
+}
+
+for (const boundary of ['receipt lookup', 'broadcast', 'receipt wait'] as const) {
+  await check(`recovery: claim takeover during ${boundary} preserves the replacement worker's state`, async () => {
+    const dbPath = join(mkdtempSync(join(tmpdir(), 'settle-takeover-')), 'settlements.db');
+    const store = new SqliteSettlementStore(dbPath);
+    const replacement = new SqliteSettlementStore(dbPath);
+    const { state, io } = makeFakeIO();
+    const r = await signedRequest();
+    const sid = settlementIdentity(r);
+    assert.ok(sid);
+    const t0 = now();
+    const replacementHash = `0x${'ab'.repeat(32)}` as Hex;
+    let replacementToken: string | null = null;
+    const takeOver = () => {
+      replacementToken = replacement.tryClaimInFlight(sid, t0 + INFLIGHT_CLAIM_TTL_SEC + 1);
+      assert.ok(replacementToken);
+      replacement.setBroadcast(sid, replacementHash);
+      replacement.setBroadcastIntent(sid);
+    };
+    if (boundary !== 'broadcast') store.setBroadcast(sid, FAKE_HASH);
+    if (boundary === 'receipt lookup') {
+      io.getReceipt = async () => { takeOver(); return confirmedTestReceipt(); };
+    } else if (boundary === 'broadcast') {
+      const broadcast = io.broadcast;
+      io.broadcast = async (args) => { const hash = await broadcast(args); takeOver(); return hash; };
+    } else {
+      io.waitForReceipt = async () => { takeOver(); return confirmedTestReceipt(); };
+    }
+    try {
+      const res = await settleExactPayment(r, { store, settlerKey, dryRun: false, io, nowSec: t0 });
+      assert.equal(res.success, false);
+      assert.equal(res.errorReason, 'claim_lost');
+      assert.equal(replacement.getBroadcast(sid), replacementHash, 'stale worker cannot delete or overwrite evidence');
+      assert.equal(replacement.hasBroadcastIntent(sid), true);
+      assert.equal(replacement.has(sid, t0), false, 'stale worker cannot mark the nonce');
+      assert.ok(replacementToken);
+      assert.equal(replacement.ownsClaim(sid, replacementToken), true);
+      assert.equal(state.broadcasts, boundary === 'broadcast' ? 1 : 0);
+    } finally {
+      store.close();
+      replacement.close();
+    }
+  });
+}
+
+for (const path of ['pending', 'broadcast'] as const) {
+  await check(`recovery: ${path} reports proven payment if the store becomes unreadable during confirmation`, async () => {
+    const store = new NonceStore();
+    const { state, io } = makeFakeIO();
+    const r = await signedRequest();
+    const sid = settlementIdentity(r);
+    assert.ok(sid);
+    if (path === 'pending') store.setBroadcast(sid, FAKE_HASH);
+    let unavailable = false;
+    const ownsClaim = store.ownsClaim.bind(store);
+    store.ownsClaim = (id, token) => {
+      if (unavailable) throw new Error('store unavailable');
+      return ownsClaim(id, token);
+    };
+    io.waitForReceipt = async () => { unavailable = true; return confirmedTestReceipt(); };
+    const res = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+    assert.equal(res.success, true);
+    assert.equal(res.transaction, FAKE_HASH);
+    assert.equal(store.getBroadcast(sid), FAKE_HASH);
+    assert.equal(store.has(sid, now()), false);
+    assert.equal(state.broadcasts, path === 'broadcast' ? 1 : 0);
+  });
+}
+
+await check('recovery: a failed claim release does not replace a confirmed payment response', async () => {
+  const store = new NonceStore();
+  const { state, io } = makeFakeIO();
+  state.waitReceipt = confirmedTestReceipt();
+  store.releaseInFlight = () => { throw new Error('claim release failed'); };
+  const res = await settleExactPayment(await signedRequest(), { store, settlerKey, dryRun: false, io });
+  assert.equal(res.success, true);
+  assert.equal(res.transaction, FAKE_HASH);
+  assert.equal(state.broadcasts, 1);
 });
 
 console.log(`\n${passed} facilitator tests passed${process.exitCode ? ' (with failures)' : ''}`);

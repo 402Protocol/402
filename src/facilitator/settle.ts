@@ -66,6 +66,7 @@ import {
   settlementKey,
   type SettlementIdentity,
   type SettlementStore,
+  type SettlementUpdate,
 } from './settlement-store.js';
 import { verifyExactPayment } from './verify.js';
 import type { SettleRequest, SettleResponse } from './types.js';
@@ -312,7 +313,12 @@ export async function settleExactPayment(
   try {
     return await settleInner(req, opts, id, claimToken);
   } finally {
-    opts.store.releaseInFlight(id, claimToken);
+    try {
+      opts.store.releaseInFlight(id, claimToken);
+    } catch {
+      // Cleanup failure must not replace a proven payment response. The
+      // claim can be taken over after its TTL if the store is unavailable.
+    }
   }
 }
 
@@ -393,17 +399,44 @@ async function settleInner(
    * of writing settlement state or broadcasting. Returns a claim_lost
    * response, or null when this worker still holds the claim.
    */
+  const claimLost = (): SettleResponse => ({
+    success: false,
+    errorReason: 'claim_lost',
+    network: cfg.caip2,
+    payer: from,
+    detail:
+      'Another worker took over this settlement; standing down to avoid a duplicate broadcast or clobbered recovery state.',
+  });
   const assertClaim = (): SettleResponse | null => {
     if (!id || !claimToken) return null; // no claim held (malformed request path)
-    if (opts.store.ownsClaim(id, claimToken)) return null;
-    return {
-      success: false,
-      errorReason: 'claim_lost',
-      network: cfg.caip2,
-      payer: from,
-      detail:
-        'Another worker took over this settlement; standing down to avoid a duplicate broadcast or clobbered recovery state.',
-    };
+    return opts.store.ownsClaim(id, claimToken) ? null : claimLost();
+  };
+  const updateState = (update: SettlementUpdate): SettleResponse | null => {
+    if (!id || !claimToken) return null;
+    // The store checks ownership in the same atomic operation as the
+    // writes, fencing other processes as well as in-process workers.
+    return opts.store.updateClaimed(id, claimToken, update) ? null : claimLost();
+  };
+  const confirmPayment = (hash: Hex): SettleResponse => {
+    try {
+      const lost = updateState({
+        nonceExpiresAtSec: Number(validBefore),
+        broadcast: null,
+        intent: false,
+      });
+      if (lost) return { ...lost, transaction: hash };
+    } catch {
+      // A matching successful receipt proves payment even if our store is
+      // unavailable. Atomic rollback retains saved evidence for a retry.
+      return {
+        success: true,
+        transaction: hash,
+        network: cfg.caip2,
+        payer: from,
+        detail: 'Payment confirmed onchain, but local completion could not be saved. Prior recovery state has been retained.',
+      };
+    }
+    return { success: true, transaction: hash, network: cfg.caip2, payer: from };
   };
 
   // #2: reconcile a prior broadcast BEFORE any new broadcast. A retry that
@@ -434,34 +467,21 @@ async function settleInner(
         };
       }
       if (outcome === 'confirmed') {
-        opts.store.deleteBroadcast(id);
-        if (id) opts.store.mark(id, Number(validBefore));
-        return {
-          success: true,
-          transaction: priorHash,
-          network: cfg.caip2,
-          payer: from,
-        };
+        return confirmPayment(priorHash);
       }
       if (outcome === 'pending') {
         // Still in flight: wait for the original tx, don't broadcast a second.
         try {
           const receipt = await io.waitForReceipt(priorHash, SETTLEMENT_CONFIRM_TIMEOUT_MS);
+          if (receiptConfirmsPayment({ receipt, ...payment })) {
+            return confirmPayment(priorHash);
+          }
           const lostAfterWait = assertClaim();
           if (lostAfterWait) return lostAfterWait;
-          if (receiptConfirmsPayment({ receipt, ...payment })) {
-            opts.store.deleteBroadcast(id);
-            if (id) opts.store.mark(id, Number(validBefore));
-            return {
-              success: true,
-              transaction: priorHash,
-              network: cfg.caip2,
-              payer: from,
-            };
-          }
           if (receipt.status !== 'success') {
             // Reverted while we waited — safe to fall through and retry.
-            opts.store.deleteBroadcast(id);
+            const lost = updateState({ broadcast: null, intent: false });
+            if (lost) return lost;
           } else {
             // Successful receipt but no matching USDC transfer: unresolved,
             // not failed. Preserve the hash as evidence; do not rebroadcast.
@@ -511,9 +531,8 @@ async function settleInner(
         };
       } else {
         // 'failed': the prior tx is finalized and never paid — safe to retry.
-        const lost = assertClaim();
+        const lost = updateState({ broadcast: null, intent: false });
         if (lost) return lost;
-        opts.store.deleteBroadcast(id);
       }
     } else if (opts.store.hasBroadcastIntent(id)) {
       // A previous attempt recorded a send intent but never saved a hash:
@@ -596,9 +615,8 @@ async function settleInner(
         detail: `simulation reverted (nothing broadcast): ${(e as Error).message?.slice(0, 300)}`,
       };
     }
-    const lostDryRun = assertClaim();
+    const lostDryRun = updateState({ nonceExpiresAtSec: Number(validBefore) });
     if (lostDryRun) return lostDryRun;
-    if (id) opts.store.mark(id, Number(validBefore));
     return {
       success: false,
       dryRun: true,
@@ -630,7 +648,8 @@ async function settleInner(
     // itself cannot be persisted, refuse to broadcast without recovery.
     if (id) {
       try {
-        opts.store.setBroadcastIntent(id);
+        const lost = updateState({ intent: true });
+        if (lost) return lost;
       } catch (e) {
         return {
           success: false,
@@ -654,12 +673,14 @@ async function settleInner(
     });
     // Save the hash the moment it is broadcast, so a later attempt
     // reconciles this transaction instead of broadcasting a duplicate.
+    // Keep the intent until completion; saving evidence must not depend on
+    // a separate cleanup write succeeding.
     // If this write fails the hash is still known in memory for this
     // attempt; a future retry fails closed via the surviving intent.
     if (id) {
       try {
-        opts.store.setBroadcast(id, hash);
-        opts.store.deleteBroadcastIntent(id);
+        const lost = updateState({ broadcast: hash });
+        if (lost) return { ...lost, transaction: hash };
       } catch {
         // proceed with the in-memory hash
       }
@@ -682,52 +703,35 @@ async function settleInner(
       }
       throw e;
     }
-    const lostAfterWait = assertClaim();
-    if (lostAfterWait) return lostAfterWait;
     // Core rule: report success only when the chain confirms the intended
     // payment. A reverted receipt is a failure — the EIP-3009 authorization
     // was never consumed, so the nonce stays unmarked and the payer can
     // retry. A successful receipt without the expected USDC transfer is
     // UNRESOLVED, not failed: the authorization is likely consumed onchain,
     // so the hash is preserved as evidence instead of being discarded.
-    if (!receiptConfirmsPayment({ receipt, ...payment })) {
-      if (receipt.status !== 'success') {
-        if (id) opts.store.deleteBroadcast(id);
-        return {
-          success: false,
-          errorReason: 'transaction_reverted',
-          transaction: hash,
-          network: cfg.caip2,
-          payer: from,
-          detail: 'Transaction reverted onchain; payment was not made.',
-        };
-      }
+    if (receiptConfirmsPayment({ receipt, ...payment })) return confirmPayment(hash);
+    const lostAfterWait = assertClaim();
+    if (lostAfterWait) return { ...lostAfterWait, transaction: hash };
+    if (receipt.status !== 'success') {
+      const lost = updateState({ broadcast: null, intent: false });
+      if (lost) return { ...lost, transaction: hash };
       return {
         success: false,
-        errorReason: 'settlement_unresolved',
+        errorReason: 'transaction_reverted',
         transaction: hash,
         network: cfg.caip2,
         payer: from,
-        detail:
-          'Transaction succeeded onchain but the expected USDC transfer was not found in its receipt. The authorization may be consumed; investigate the transaction before retrying.',
+        detail: 'Transaction reverted onchain; payment was not made.',
       };
     }
-    if (id) {
-      try {
-        opts.store.deleteBroadcast(id);
-        opts.store.deleteBroadcastIntent(id);
-        opts.store.mark(id, Number(validBefore));
-      } catch {
-        // The payment is confirmed onchain; never report failure for a
-        // confirmed payment because of a local write error. The onchain
-        // authorizationState check remains the replay backstop.
-      }
-    }
     return {
-      success: true,
+      success: false,
+      errorReason: 'settlement_unresolved',
       transaction: hash,
       network: cfg.caip2,
       payer: from,
+      detail:
+        'Transaction succeeded onchain but the expected USDC transfer was not found in its receipt. The authorization may be consumed; investigate the transaction before retrying.',
     };
   } catch (e) {
     return {
