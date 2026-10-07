@@ -44,7 +44,9 @@
     "test:foundry": "tsx test/foundry.test.ts",
     "test:foundry-http": "tsx test/foundry-http.test.ts",
     "test:quill": "tsx test/quill.test.ts",
-    "test:permissions:e2e": "node --import tsx scripts/permissions-e2e.ts"
+    "test:permissions:e2e": "node --import tsx scripts/permissions-e2e.ts",
+    "example:erc8183": "node --import tsx examples/erc8183-local.ts",
+    "test:erc8183:e2e": "npm run example:erc8183"
   },
   "type": "module",
   "version": "0.3.0"

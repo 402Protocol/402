@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [commerce-mcp, gm-regiment-mcp, agent-permissions]
+        package: [commerce-mcp, gm-regiment-mcp, agent-permissions, job-escrow]
     defaults:
       run:
         working-directory: packages/${{ matrix.package }}
@@ -77,3 +77,5 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run test:permissions:e2e
+      - run: node scripts/sync-job-escrow-abi.mjs --check
+      - run: npm run test:erc8183:e2e

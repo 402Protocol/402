@@ -21,6 +21,17 @@ The contract is deployed and source-verified on Ink mainnet at
 [`0x04B31489EC3DA2374230fF1271E531390de92a23`](https://explorer.inkonchain.com/address/0x04B31489EC3DA2374230fF1271E531390de92a23).
 See the package guide for integration and release status.
 
+## Optional ERC-8183 job primitive (local prototype)
+
+[`Four02JobEscrow`](contracts/Four02JobEscrow.sol) and the
+[`job-escrow` SDK](packages/job-escrow/README.md) target a pinned ERC-8183 draft for
+external clients, providers and evaluators. They are independent of BountyEscrow
+and spending permissions. Read the [exact compatibility and evaluator trust
+profile](docs/erc-8183.md), including expiry restrictions and source differences.
+No fees, hooks, marketplace enrollment or reputation registry are required.
+There is no deployment or audit claim. `npm run example:erc8183` runs three
+independent roles on disposable local Anvil after `forge build`.
+
 ## Layout
 
 ```
