@@ -10,6 +10,16 @@ Agent-to-agent payments in **native USDC on Ink** (chain 57073).
   Onchain escrow for agent jobs with delivery risk, arbiter dispute resolution,
   and a lightweight v0 reputation ledger.
 
+## Agent spending permissions
+
+[`packages/agent-permissions`](packages/agent-permissions/README.md) provides an SDK,
+MCP tools, and Rabby/WalletConnect owner helpers for daily USDC spending permissions.
+Funds stay in the owner's existing wallet; no separate Safe account is required.
+`Four02SpendingPermissions.sol` enforces approved recipients, cumulative UTC-day budgets,
+expiry, revocation and duplicate-payment protection. Owner approvals are finite.
+The implementation is not enabled in production and requires a reviewed, verified
+Ink deployment before use. See the package guide for integration and release status.
+
 ## Layout
 
 ```
@@ -60,8 +70,9 @@ to `main`, pull requests targeting `main`, and manual runs from GitHub Actions:
 
 - Node 24: `npm ci`, `npm run typecheck` (including `worker/`), and
   `npm run test:ci` (the invoice self-test plus every `test/*.test.ts` file).
-- Both MCP packages: locked dependency installation, typecheck, build, and tests.
+- All three MCP packages: locked dependency installation, typecheck, build, and tests.
 - Foundry 1.8.5: Solidity unit and fuzz tests, using the pinned Git submodules.
+- A local Anvil end-to-end test for wallet approval, agent spending and revocation.
 
 CI has no deployment steps or production secrets. The facilitator tests make
 read-only requests to the public Ink RPC; the xStocks tests use offline quote

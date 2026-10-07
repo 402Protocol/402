@@ -67,7 +67,7 @@ function toolText(res: unknown): Record<string, unknown> {
   return JSON.parse(r.content[0].text) as Record<string, unknown>;
 }
 
-await check('lists 25 tools', async () => {
+await check('lists 29 tools', async () => {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
@@ -87,6 +87,10 @@ await check('lists 25 tools', async () => {
     'lounge_post',
     'oracle_gas',
     'oracle_price',
+    'permissions_grant',
+    'permissions_pay',
+    'permissions_revoke',
+    'permissions_status',
     'wallet_create',
     'wallet_verify_backup',
     'xstocks_balance',

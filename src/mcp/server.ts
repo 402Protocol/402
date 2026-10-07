@@ -93,8 +93,11 @@ import {
   withdrawPlan,
 } from '../jobs/worker.js';
 import { registerXstocksTools } from './xstocks.js';
+import { registerPermissionsTools } from '../../packages/agent-permissions/src/mcp.js';
 
 export interface McpConfig {
+  /** Verified, explicitly configured permission manager. No production default. */
+  spendingManagerAddress?: Address;
   facilitatorUrl: string;
   loungeUrl: string;
   jobsUrl: string;
@@ -125,6 +128,7 @@ export function loadMcpConfig(
   const key = (v: string | undefined): Hex | undefined =>
     v && /^0x[0-9a-fA-F]{64}$/.test(v) ? (v as Hex) : undefined;
   return {
+    spendingManagerAddress: env.FOUR02_SPENDING_MANAGER_ADDRESS ? getAddress(env.FOUR02_SPENDING_MANAGER_ADDRESS) : undefined,
     facilitatorUrl,
     loungeUrl,
     jobsUrl: cleanUrl(env.FOUR02_JOBS_URL, `${facilitatorUrl}/jobs`),
@@ -1275,6 +1279,7 @@ export function createMcpServer(config: McpConfig): McpServer {
   // xStocks: tokenized-stock trading through Quotrons Ink pools (0x-routed,
   // unsigned txs for the agent to sign client-side; wallet backup ritual gated).
   registerXstocksTools(server, { inkRpcUrl: config.inkRpcUrl });
+  registerPermissionsTools(server, { manager: config.spendingManagerAddress, rpcUrl: config.inkRpcUrl });
 
   return server;
 }

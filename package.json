@@ -43,7 +43,8 @@
     "test:policies": "tsx test/policies.test.ts",
     "test:foundry": "tsx test/foundry.test.ts",
     "test:foundry-http": "tsx test/foundry-http.test.ts",
-    "test:quill": "tsx test/quill.test.ts"
+    "test:quill": "tsx test/quill.test.ts",
+    "test:permissions:e2e": "node --import tsx scripts/permissions-e2e.ts"
   },
   "type": "module",
   "version": "0.3.0"
