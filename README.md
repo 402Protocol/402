@@ -17,8 +17,9 @@ MCP tools, and Rabby/WalletConnect owner helpers for daily USDC spending permiss
 Funds stay in the owner's existing wallet; no separate Safe account is required.
 `Four02SpendingPermissions.sol` enforces approved recipients, cumulative UTC-day budgets,
 expiry, revocation and duplicate-payment protection. Owner approvals are finite.
-The implementation is not enabled in production and requires a reviewed, verified
-Ink deployment before use. See the package guide for integration and release status.
+The contract is deployed and source-verified on Ink mainnet at
+[`0x04B31489EC3DA2374230fF1271E531390de92a23`](https://explorer.inkonchain.com/address/0x04B31489EC3DA2374230fF1271E531390de92a23).
+See the package guide for integration and release status.
 
 ## Layout
 
