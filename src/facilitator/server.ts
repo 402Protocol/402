@@ -37,7 +37,8 @@ import { parseUnits } from 'viem';
 import { CHAINS, INK_CONFIG } from './chains.js';
 import type { FacilitatorConfig } from './config.js';
 import { NonceStore } from './nonces.js';
-import { settleExactPayment, settlerAddress, type BroadcastLog } from './settle.js';
+import type { SettlementStore } from './settlement-store.js';
+import { settleExactPayment, settlerAddress } from './settle.js';
 import type {
   PaymentPayload,
   PaymentRequired,
@@ -220,15 +221,11 @@ export function apiKeyAllowed(provided: string | null, allowlist: string[]): boo
 
 export function createApp(
   config: FacilitatorConfig,
-  store: NonceStore = new NonceStore(),
+  store: SettlementStore = new NonceStore(),
   opts: ServerOptions = {},
 ): Hono {
   const app = new Hono();
   const maxBodyBytes = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
-
-  // #2: broadcast log for settlement timeout recovery (per-process, same
-  // caveat as NonceStore; fix #3 makes it durable).
-  const broadcastLog: BroadcastLog = new Map();
 
   // The 402 site and other browser clients call this API cross-origin.
   // Writes stay signature-gated; CORS only lets browsers read/post.
@@ -498,7 +495,6 @@ export function createApp(
       store,
       settlerKey: config.settlerKey,
       dryRun: config.dryRun,
-      broadcastLog,
     });
     // The Tape: log real broadcasts (dry-runs report success:false, so the
     // helper's null check keeps them out automatically).
@@ -670,7 +666,7 @@ export function createApp(
     }
     const result = await settleExactPayment(
       { paymentPayload, paymentRequirements: requirements },
-      { store, settlerKey: config.settlerKey, dryRun: config.dryRun, broadcastLog },
+      { store, settlerKey: config.settlerKey, dryRun: config.dryRun },
     );
     if (result.success) {
       const row = settlementRow(
@@ -834,7 +830,7 @@ export function createApp(
 
     const settled = await settleExactPayment(
       { paymentPayload, paymentRequirements: requirements },
-      { store, settlerKey: config.settlerKey, dryRun: false, broadcastLog },
+      { store, settlerKey: config.settlerKey, dryRun: false },
     );
     if (!settled.success) {
       const status = settled.errorReason === 'missing_settler_key' ? 503 : 402;

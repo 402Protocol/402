@@ -27,10 +27,17 @@ import {
   receiptConfirmsPayment,
   reconcileBroadcast,
   settlementDedupeKey,
-  type BroadcastLog,
   type SettlementChainIO,
   type SettlementReceipt,
 } from '../src/facilitator/settle.js';
+import {
+  settlementIdentity,
+  type SettlementIdentity,
+} from '../src/facilitator/settlement-store.js';
+import { SqliteSettlementStore } from '../src/facilitator/settlement-store.js';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type {
   PaymentPayload,
   PaymentRequirements,
@@ -389,7 +396,7 @@ await check('H1: /verify does not consume the nonce — /settle proceeds after /
   assert.equal(vbody.isValid, true, vbody.invalidReason);
 
   // /verify must be read-only: the nonce is NOT consumed.
-  assert.equal(store.has(INK_CONFIG.chainId, nonce, now()), false, '/verify consumed the nonce');
+  assert.equal(store.has(testId(nonce), now()), false, '/verify consumed the nonce');
 
   // The standard x402 flow now works: /settle gets past the nonce check.
   // (dry-run returns dry_run_mode whether or not the simulation passes —
@@ -412,11 +419,11 @@ await check('H2: NonceStore survives past 10,000 entries (sweep uses real time)'
   for (let i = 0; i < 10_001; i++) {
     const n = randomNonce();
     nonces.push(n);
-    store.mark(INK_CONFIG.chainId, n, future);
+    store.mark(testId(n), future);
   }
   assert.equal(store.size, 10_001, 'store wiped itself at 10k entries');
   for (const n of nonces) {
-    assert.equal(store.has(INK_CONFIG.chainId, n, now()), true, 'live nonce evicted');
+    assert.equal(store.has(testId(n), now()), true, 'live nonce evicted');
   }
 });
 
@@ -424,7 +431,7 @@ await check('H2: sweep still evicts genuinely expired entries', async () => {
   const store = new NonceStore();
   const past = now() - 3600;
   for (let i = 0; i < 10_000; i++) {
-    store.mark(INK_CONFIG.chainId, randomNonce(), past);
+    store.mark(testId(randomNonce()), past);
   }
   // The 10,000th mark triggers the sweep, which must clear expired entries.
   assert.equal(store.size, 0, 'expired entries were not swept');
@@ -649,7 +656,7 @@ await check('H1-23: /demo/data with dry-run off + valid API key reaches settleme
   assert.equal(res.status, 503);
   const body = (await res.json()) as { errorReason: string };
   assert.equal(body.errorReason, 'missing_settler_key');
-  assert.equal(store.has(INK_CONFIG.chainId, nonce, now()), false);
+  assert.equal(store.has(testId(nonce), now()), false);
 });
 
 await check('H1-23: /demo/data dry-run still permissionless (no API key needed)', async () => {
@@ -753,6 +760,16 @@ const PAYMENT = {
   to: demoPayTo,
   value: 10000n,
 };
+
+/** Build a SettlementIdentity for the test chain/token/payer. */
+function testId(nonce: string, payerAddr: `0x${string}` = payer.address): SettlementIdentity {
+  return {
+    chainId: INK_CONFIG.chainId,
+    token: INK_CONFIG.usdc.address as `0x${string}`,
+    payer: payerAddr,
+    nonce: nonce as `0x${string}`,
+  };
+}
 
 await check('R1: reverted receipt never confirms payment, even with a valid Transfer log', async () => {
   const receipt = {
@@ -876,20 +893,19 @@ await check('#2: reconcileBroadcast maps receipts to confirmed/failed/pending', 
 
 await check('#2: tx that confirms after timeout is success on retry, never rebroadcast', async () => {
   const { state, io } = makeFakeIO();
-  const broadcastLog: BroadcastLog = new Map();
   const store = new NonceStore();
-  const opts = { store, settlerKey, dryRun: false, io, broadcastLog };
+  const opts = { store, settlerKey, dryRun: false, io };
 
   // Attempt 1: broadcast lands, confirmation times out.
   const r = await signedRequest();
-  const key = settlementDedupeKey(r);
-  assert.ok(key, 'signed request must produce a dedupe key');
+  const sid = settlementIdentity(r);
+  assert.ok(sid, 'signed request must produce a settlement identity');
   const res1 = await settleExactPayment(r, opts);
   assert.equal(res1.success, false);
   assert.equal(res1.errorReason, 'settlement_timeout');
   assert.equal(res1.transaction, FAKE_HASH);
   assert.equal(state.broadcasts, 1);
-  assert.equal(broadcastLog.get(key!), FAKE_HASH, 'hash must be saved on broadcast');
+  assert.equal(store.getBroadcast(sid!), FAKE_HASH, 'hash must be saved on broadcast');
 
   // The transaction confirms onchain AFTER the request timed out.
   state.minedReceipt = confirmedTestReceipt();
@@ -899,15 +915,14 @@ await check('#2: tx that confirms after timeout is success on retry, never rebro
   assert.equal(res2.success, true);
   assert.equal(res2.transaction, FAKE_HASH);
   assert.equal(state.broadcasts, 1, 'must never double-broadcast');
-  assert.equal(broadcastLog.get(key!), undefined, 'log entry cleared after confirm');
+  assert.equal(store.getBroadcast(sid!), undefined, 'broadcast entry cleared after confirm');
 });
 
-await check('#2: reverted prior broadcast clears the log and retries with a fresh broadcast', async () => {
+await check('#2: reverted prior broadcast clears the entry and retries with a fresh broadcast', async () => {
   const { state, io } = makeFakeIO();
   state.waitReceipt = { status: 'reverted', logs: [] };
-  const broadcastLog: BroadcastLog = new Map();
   const store = new NonceStore();
-  const opts = { store, settlerKey, dryRun: false, io, broadcastLog };
+  const opts = { store, settlerKey, dryRun: false, io };
 
   const r = await signedRequest();
   const res1 = await settleExactPayment(r, opts);
@@ -926,9 +941,8 @@ await check('#2: reverted prior broadcast clears the log and retries with a fres
 
 await check('#2: reconcile RPC failure refuses to rebroadcast blind', async () => {
   const { state, io } = makeFakeIO();
-  const broadcastLog: BroadcastLog = new Map();
   const store = new NonceStore();
-  const opts = { store, settlerKey, dryRun: false, io, broadcastLog };
+  const opts = { store, settlerKey, dryRun: false, io };
 
   const r = await signedRequest();
   const res1 = await settleExactPayment(r, opts);
@@ -941,6 +955,52 @@ await check('#2: reconcile RPC failure refuses to rebroadcast blind', async () =
   assert.equal(res2.errorReason, 'reconcile_failed');
   assert.equal(res2.transaction, FAKE_HASH);
   assert.equal(state.broadcasts, 1, 'must not rebroadcast when the prior state is unknown');
+});
+
+await check('#3: two instances sharing the DB reconcile a timed-out broadcast with one broadcast total', async () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), 'settle-xinst-')), 'settlements.db');
+  const storeA = new SqliteSettlementStore(dbPath);
+  const storeB = new SqliteSettlementStore(dbPath);
+  const { state, io } = makeFakeIO(); // one shared fake chain
+
+  // Instance A: broadcast lands, confirmation times out. Hash is durable now.
+  const r = await signedRequest();
+  const resA = await settleExactPayment(r, { store: storeA, settlerKey, dryRun: false, io });
+  assert.equal(resA.success, false);
+  assert.equal(resA.errorReason, 'settlement_timeout');
+  assert.equal(state.broadcasts, 1);
+
+  // The tx confirms onchain after A's request timed out.
+  state.minedReceipt = confirmedTestReceipt();
+
+  // Instance B (a second facilitator on the same DB) reconciles the same
+  // authorization: success, and crucially no second broadcast.
+  const resB = await settleExactPayment(r, { store: storeB, settlerKey, dryRun: false, io });
+  assert.equal(resB.success, true);
+  assert.equal(resB.transaction, FAKE_HASH);
+  assert.equal(state.broadcasts, 1, 'second instance must not rebroadcast');
+  storeA.close();
+  storeB.close();
+});
+
+await check('#3: replay is rejected across instances after a confirmed settlement', async () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), 'settle-xreplay-')), 'settlements.db');
+  const storeA = new SqliteSettlementStore(dbPath);
+  const storeB = new SqliteSettlementStore(dbPath);
+  const { state, io } = makeFakeIO();
+  state.waitReceipt = confirmedTestReceipt();
+
+  const r = await signedRequest();
+  const resA = await settleExactPayment(r, { store: storeA, settlerKey, dryRun: false, io });
+  assert.equal(resA.success, true);
+
+  // Same authorization on the second instance: replay, not a rebroadcast.
+  const resB = await settleExactPayment(r, { store: storeB, settlerKey, dryRun: false, io });
+  assert.equal(resB.success, false);
+  assert.equal(resB.errorReason, 'nonce_replay');
+  assert.equal(state.broadcasts, 1, 'replay must never rebroadcast');
+  storeA.close();
+  storeB.close();
 });
 
 console.log(`\n${passed} facilitator tests passed${process.exitCode ? ' (with failures)' : ''}`);

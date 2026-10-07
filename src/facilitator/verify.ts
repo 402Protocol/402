@@ -23,7 +23,7 @@ import {
 } from 'viem';
 import { chainFromCaip2, type ChainConfig } from './chains.js';
 import { EIP3009_TYPES, eip3009Domain } from './eip3009.js';
-import { NonceStore } from './nonces.js';
+import { settlementIdentity, type SettlementStore } from './settlement-store.js';
 import type {
   PaymentPayload,
   PaymentRequirements,
@@ -32,7 +32,7 @@ import type {
 } from './types.js';
 
 export interface VerifyOptions {
-  store: NonceStore;
+  store: SettlementStore;
   /** Mark the nonce consumed on success. Default true. */
   markUsed?: boolean;
   nowSec?: number;
@@ -166,11 +166,12 @@ export async function verifyExactPayment(
   if (BigInt(nowSec) < validAfter) return fail('authorization_not_yet_valid');
   if (BigInt(nowSec) >= validBefore) return fail('authorization_expired');
 
-  if (opts.store.has(cfg.chainId, auth.nonce, nowSec)) {
+  const sid = settlementIdentity(req);
+  if (sid && opts.store.has(sid, nowSec)) {
     return fail('nonce_replay');
   }
-  if (markUsed) {
-    opts.store.mark(cfg.chainId, auth.nonce, Number(validBefore));
+  if (markUsed && sid) {
+    opts.store.mark(sid, Number(validBefore));
   }
 
   return {

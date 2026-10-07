@@ -23,6 +23,7 @@
     "status": "tsx src/cli/status.ts",
     "test": "tsx test/selftest.ts",
     "test:facilitator": "tsx test/facilitator.test.ts",
+    "test:settlement-store": "tsx test/settlement-store.test.ts",
     "test:sol": "forge test",
     "typecheck": "tsc --noEmit",
     "test:lounge": "tsx test/lounge.test.ts",

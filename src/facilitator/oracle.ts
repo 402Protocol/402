@@ -19,6 +19,7 @@ import { parseUnits } from 'viem';
 import { INK_CONFIG } from './chains.js';
 import type { FacilitatorConfig } from './config.js';
 import { NonceStore } from './nonces.js';
+import type { SettlementStore } from './settlement-store.js';
 import { settleExactPayment } from './settle.js';
 import type {
   PaymentPayload,
@@ -73,7 +74,7 @@ export interface OracleQuery {
 }
 
 export interface OracleDeps {
-  store?: NonceStore;
+  store?: SettlementStore;
   /** Injectable fetch for tests. Defaults to global fetch. */
   fetchFn?: typeof fetch;
   /** Fired after every served query (the spectacle feed). */

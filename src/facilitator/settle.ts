@@ -46,7 +46,12 @@ import {
   usdcEip3009Abi,
   viemChain,
 } from './eip3009.js';
-import { NonceStore } from './nonces.js';
+import {
+  settlementIdentity,
+  settlementKey,
+  type SettlementIdentity,
+  type SettlementStore,
+} from './settlement-store.js';
 import { verifyExactPayment } from './verify.js';
 import type { SettleRequest, SettleResponse } from './types.js';
 
@@ -97,17 +102,11 @@ export interface SettlementChainIO {
  * durable storage and a richer key. Same-process only, same caveat as
  * NonceStore.
  */
-export interface BroadcastLog {
-  get(key: string): Hex | undefined;
-  set(key: string, hash: Hex): void;
-  delete(key: string): void;
-}
-
 /** Outcome of reconciling a prior broadcast against the chain. */
 export type ReconcileOutcome = 'confirmed' | 'failed' | 'pending';
 
 export interface SettleOptions {
-  store: NonceStore;
+  store: SettlementStore;
   /** Settler private key. Absent -> settle is refused outright. */
   settlerKey?: Hex;
   /** True -> simulate only, never broadcast. */
@@ -117,15 +116,13 @@ export interface SettleOptions {
   rpcUrl?: string;
   /** Chain interaction surface. Defaults to viem clients. */
   io?: SettlementChainIO;
-  /** Broadcast log for timeout recovery. Absent -> no reconcile (timeouts still report the hash). */
-  broadcastLog?: BroadcastLog;
 }
 
 function isValidSettlerKey(k: unknown): k is Hex {
   return typeof k === 'string' && /^0x[0-9a-fA-F]{64}$/.test(k);
 }
 
-// ---- H2 (2026-09-23 audit): duplicate-settlement guard ----------------------
+// ---- H2 (2026-09-23 audit) + #3: duplicate-settlement guard --------------
 //
 // Concurrent duplicate /settle requests could both pass the nonce check and
 // double-broadcast: one transaction reverts but the operator still pays gas
@@ -133,30 +130,22 @@ function isValidSettlerKey(k: unknown): k is Hex {
 // check is not enough because two requests can interleave between the check
 // and the broadcast.
 //
-// Track in-flight settlements by a stable key — network + EIP-3009 nonce,
-// which is unique per payer authorization — and reject duplicates with
-// `duplicate_settlement` (mapped to HTTP 409 by the route) while one is
-// processing. Exactly one broadcast per unique settlement. The entry is
-// removed in a finally block so a crashed/failed settlement never wedges
-// the key forever. Same-process only (same caveat as NonceStore); the
-// onchain authorizationState check remains the backstop across processes.
-const inFlightSettlements = new Map<string, Promise<SettleResponse>>();
+// Claim the settlement in the SettlementStore before doing any work and
+// reject duplicates with `duplicate_settlement` (mapped to HTTP 409 by the
+// route) while one is processing. Exactly one broadcast per unique
+// settlement. The claim is released in a finally block; a crashed instance's
+// stale claim can be taken over after INFLIGHT_CLAIM_TTL_SEC. Unlike the old
+// in-process Map, the claim works across facilitator instances sharing the
+// durable store; the onchain authorizationState check remains the backstop.
 
 /**
  * Stable dedupe key for a settlement request, or null when the request is
  * too malformed to key (falls through to normal validation errors).
+ * Now derived from the full settlement identity: chain + token + payer + nonce.
  */
 export function settlementDedupeKey(req: SettleRequest): string | null {
-  try {
-    const network = req?.paymentRequirements?.network;
-    const nonce = req?.paymentPayload?.payload?.authorization?.nonce;
-    if (typeof network !== 'string' || typeof nonce !== 'string' || !nonce) {
-      return null;
-    }
-    return `${network.toLowerCase()}:${nonce.toLowerCase()}`;
-  } catch {
-    return null;
-  }
+  const id = settlementIdentity(req);
+  return id ? settlementKey(id) : null;
 }
 
 /**
@@ -282,10 +271,13 @@ export async function settleExactPayment(
   req: SettleRequest,
   opts: SettleOptions,
 ): Promise<SettleResponse> {
-  const key = settlementDedupeKey(req);
-  if (!key) return settleInner(req, opts);
-  const existing = inFlightSettlements.get(key);
-  if (existing) {
+  const id = settlementIdentity(req);
+  if (!id) return settleInner(req, opts, null);
+  const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
+  // Durable in-flight claim (#3): taken synchronously, before any await, so
+  // a concurrent duplicate — same process or a second instance sharing the
+  // store — is guaranteed to see it.
+  if (!opts.store.tryClaimInFlight(id, nowSec)) {
     return {
       success: false,
       errorReason: 'duplicate_settlement',
@@ -294,20 +286,17 @@ export async function settleExactPayment(
         'An identical settlement is already being processed. Wait for it instead of resubmitting.',
     };
   }
-  // Registered synchronously, before any await: a concurrent duplicate that
-  // arrives while this one is in flight is guaranteed to see the entry.
-  const p = settleInner(req, opts);
-  inFlightSettlements.set(key, p);
   try {
-    return await p;
+    return await settleInner(req, opts, id);
   } finally {
-    if (inFlightSettlements.get(key) === p) inFlightSettlements.delete(key);
+    opts.store.releaseInFlight(id);
   }
 }
 
 async function settleInner(
   req: SettleRequest,
   opts: SettleOptions,
+  id: SettlementIdentity | null,
 ): Promise<SettleResponse> {
   const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
 
@@ -340,7 +329,7 @@ async function settleInner(
   if (!cfg) {
     return { success: false, errorReason: 'invalid_network', network };
   }
-  if (opts.store.has(cfg.chainId, req.paymentPayload.payload.authorization.nonce, nowSec)) {
+  if (id && opts.store.has(id, nowSec)) {
     return {
       success: false,
       errorReason: 'nonce_replay',
@@ -385,9 +374,8 @@ async function settleInner(
   // This runs before the nonce/already-used checks: a tx that confirmed
   // after a timeout consumed the authorization, and the correct answer is
   // success, not `authorization_already_used`.
-  const blogKey = opts.broadcastLog ? settlementDedupeKey(req) : null;
-  if (blogKey && opts.broadcastLog) {
-    const priorHash = opts.broadcastLog.get(blogKey);
+  if (id) {
+    const priorHash = opts.store.getBroadcast(id);
     if (priorHash) {
       let outcome: ReconcileOutcome;
       try {
@@ -405,8 +393,8 @@ async function settleInner(
         };
       }
       if (outcome === 'confirmed') {
-        opts.broadcastLog.delete(blogKey);
-        opts.store.mark(cfg.chainId, nonce, Number(validBefore));
+        opts.store.deleteBroadcast(id);
+        if (id) opts.store.mark(id, Number(validBefore));
         return {
           success: true,
           transaction: priorHash,
@@ -419,8 +407,8 @@ async function settleInner(
         try {
           const receipt = await io.waitForReceipt(priorHash, SETTLEMENT_CONFIRM_TIMEOUT_MS);
           if (receiptConfirmsPayment({ receipt, ...payment })) {
-            opts.broadcastLog.delete(blogKey);
-            opts.store.mark(cfg.chainId, nonce, Number(validBefore));
+            opts.store.deleteBroadcast(id);
+            if (id) opts.store.mark(id, Number(validBefore));
             return {
               success: true,
               transaction: priorHash,
@@ -429,7 +417,7 @@ async function settleInner(
             };
           }
           // Finalized without our payment — safe to fall through and retry.
-          opts.broadcastLog.delete(blogKey);
+          opts.store.deleteBroadcast(id);
         } catch (e) {
           if (e instanceof WaitForTransactionReceiptTimeoutError) {
             return {
@@ -453,7 +441,7 @@ async function settleInner(
         }
       } else {
         // 'failed': the prior tx is finalized and never paid — safe to retry.
-        opts.broadcastLog.delete(blogKey);
+        opts.store.deleteBroadcast(id);
       }
     }
   }
@@ -502,7 +490,7 @@ async function settleInner(
         detail: `simulation reverted (nothing broadcast): ${(e as Error).message?.slice(0, 300)}`,
       };
     }
-    opts.store.mark(cfg.chainId, nonce, Number(validBefore));
+    if (id) opts.store.mark(id, Number(validBefore));
     return {
       success: false,
       dryRun: true,
@@ -539,7 +527,7 @@ async function settleInner(
     });
     // #2: save the hash the moment it is broadcast, so a later attempt
     // reconciles this transaction instead of broadcasting a duplicate.
-    if (blogKey && opts.broadcastLog) opts.broadcastLog.set(blogKey, hash);
+    if (id) opts.store.setBroadcast(id, hash);
     let receipt: SettlementReceipt;
     try {
       receipt = await io.waitForReceipt(hash, SETTLEMENT_CONFIRM_TIMEOUT_MS);
@@ -563,7 +551,7 @@ async function settleInner(
     // USDC Transfer) is a failure; the nonce stays unmarked so the payer
     // can retry — a reverted EIP-3009 authorization was never consumed.
     if (!receiptConfirmsPayment({ receipt, ...payment })) {
-      if (blogKey && opts.broadcastLog) opts.broadcastLog.delete(blogKey);
+      if (id) opts.store.deleteBroadcast(id);
       const reverted = receipt.status !== 'success';
       return {
         success: false,
@@ -576,8 +564,8 @@ async function settleInner(
           : 'Receipt succeeded but carried no matching USDC Transfer event; payment not confirmed.',
       };
     }
-    if (blogKey && opts.broadcastLog) opts.broadcastLog.delete(blogKey);
-    opts.store.mark(cfg.chainId, nonce, Number(validBefore));
+    if (id) opts.store.deleteBroadcast(id);
+    if (id) opts.store.mark(id, Number(validBefore));
     return {
       success: true,
       transaction: hash,
