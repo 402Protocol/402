@@ -12,6 +12,11 @@
  *  - The nonce is marked consumed only after a broadcast is confirmed or a
  *    dry-run simulation passes; a failed simulation leaves the nonce free so
  *    the payer can fund and retry.
+ *  - Success is reported only when the chain confirms the intended payment:
+ *    the receipt must have status success AND carry the expected USDC
+ *    Transfer event (payer -> recipient, exact value). A reverted receipt,
+ *    or a successful receipt without the expected transfer, is reported as
+ *    failure and the nonce is left unmarked so the payer can retry.
  *  - In-flight dedupe (H2): concurrent duplicates of the same settlement
  *    are rejected with `duplicate_settlement` while one is processing, so
  *    exactly one broadcast happens per unique authorization.
@@ -21,6 +26,7 @@ import {
   type Hex,
   createPublicClient,
   createWalletClient,
+  decodeEventLog,
   getAddress,
   http,
 } from 'viem';
@@ -82,6 +88,52 @@ export function settlementDedupeKey(req: SettleRequest): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Confirm the intended payment from the broadcast receipt.
+ *
+ * Returns true ONLY when the receipt has status success AND carries the
+ * expected USDC Transfer event (payer -> recipient, exact value). Any other
+ * outcome — reverted receipt, missing logs, a transfer to the wrong
+ * recipient, a transfer of the wrong amount, or logs from a different token
+ * contract — returns false, so a reverted or unexpected transaction can
+ * never be reported as a successful payment.
+ */
+export function receiptConfirmsPayment(args: {
+  receipt: {
+    status: string;
+    logs: Array<{ address: string; topics: Hex[]; data: Hex }>;
+  };
+  usdcAddress: Address;
+  from: Address;
+  to: Address;
+  value: bigint;
+}): boolean {
+  const { receipt, usdcAddress, from, to, value } = args;
+  if (receipt.status !== 'success') return false;
+  const wantToken = usdcAddress.toLowerCase();
+  const wantFrom = from.toLowerCase();
+  const wantTo = to.toLowerCase();
+  return receipt.logs.some((log) => {
+    if (log.address.toLowerCase() !== wantToken) return false;
+    let decoded: { eventName: string; args: Record<string, unknown> };
+    try {
+      decoded = decodeEventLog({
+        abi: usdcEip3009Abi,
+        data: log.data,
+        topics: log.topics as [Hex, ...Hex[]],
+      }) as { eventName: string; args: Record<string, unknown> };
+    } catch {
+      return false; // Not a decodable USDC event; ignore this log.
+    }
+    return (
+      decoded.eventName === 'Transfer' &&
+      String(decoded.args.from).toLowerCase() === wantFrom &&
+      String(decoded.args.to).toLowerCase() === wantTo &&
+      (decoded.args.value as bigint) === value
+    );
+  });
 }
 
 export async function settleExactPayment(
@@ -258,7 +310,32 @@ async function settleInner(
       functionName: 'transferWithAuthorization',
       args,
     });
-    await publicClient.waitForTransactionReceipt({ hash });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    // Core rule: report success only when the chain confirms the intended
+    // payment. A reverted receipt (or a successful one carrying no matching
+    // USDC Transfer) is a failure; the nonce stays unmarked so the payer
+    // can retry — a reverted EIP-3009 authorization was never consumed.
+    if (
+      !receiptConfirmsPayment({
+        receipt,
+        usdcAddress: cfg.usdc.address,
+        from,
+        to,
+        value,
+      })
+    ) {
+      const reverted = receipt.status !== 'success';
+      return {
+        success: false,
+        errorReason: reverted ? 'transaction_reverted' : 'transfer_not_confirmed',
+        transaction: hash,
+        network: cfg.caip2,
+        payer: from,
+        detail: reverted
+          ? 'Transaction reverted onchain; payment was not made.'
+          : 'Receipt succeeded but carried no matching USDC Transfer event; payment not confirmed.',
+      };
+    }
     opts.store.mark(cfg.chainId, nonce, Number(validBefore));
     return {
       success: true,

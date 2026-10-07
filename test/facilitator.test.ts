@@ -11,7 +11,7 @@
  * keys, no funded keys, nothing broadcast.
  */
 import assert from 'node:assert/strict';
-import { createPublicClient, http, parseAbiItem, getAddress } from 'viem';
+import { createPublicClient, http, parseAbiItem, getAddress, keccak256, toHex, pad } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { INK_CONFIG } from '../src/facilitator/chains.js';
 import { loadConfig } from '../src/facilitator/config.js';
@@ -22,7 +22,7 @@ import {
 } from '../src/facilitator/eip3009.js';
 import { NonceStore } from '../src/facilitator/nonces.js';
 import { createApp } from '../src/facilitator/server.js';
-import { settleExactPayment } from '../src/facilitator/settle.js';
+import { settleExactPayment, receiptConfirmsPayment } from '../src/facilitator/settle.js';
 import type {
   PaymentPayload,
   PaymentRequirements,
@@ -713,6 +713,96 @@ await check('H2-23: different nonces do not dedupe each other', async () => {
   ]);
   assert.equal(a.errorReason, 'dry_run_mode');
   assert.equal(b.errorReason, 'dry_run_mode');
+});
+
+// ---------- settle: receipt confirmation (R1) ----------
+// receiptConfirmsPayment is the decision point for fix #1: success is
+// reported only when the chain confirms the intended payment. These tests
+// fabricate receipts directly, so no broadcast or mock is needed.
+
+const TRANSFER_TOPIC = keccak256(toHex('Transfer(address,address,uint256)'));
+
+function transferLog(
+  from: `0x${string}`,
+  to: `0x${string}`,
+  value: bigint,
+  token: `0x${string}` = USDC_ADDRESS as `0x${string}`,
+) {
+  return {
+    address: token,
+    topics: [
+      TRANSFER_TOPIC,
+      pad(from, { size: 32 }),
+      pad(to, { size: 32 }),
+    ] as [`0x${string}`, `0x${string}`, `0x${string}`],
+    data: toHex(value, { size: 32 }),
+  };
+}
+
+const PAYMENT = {
+  usdcAddress: USDC_ADDRESS as `0x${string}`,
+  from: payer.address,
+  to: demoPayTo,
+  value: 10000n,
+};
+
+await check('R1: reverted receipt never confirms payment, even with a valid Transfer log', async () => {
+  const receipt = {
+    status: 'reverted',
+    logs: [transferLog(PAYMENT.from, PAYMENT.to, PAYMENT.value)],
+  };
+  assert.equal(receiptConfirmsPayment({ receipt, ...PAYMENT }), false);
+});
+
+await check('R1: successful receipt with matching Transfer confirms payment', async () => {
+  const receipt = {
+    status: 'success',
+    logs: [transferLog(PAYMENT.from, PAYMENT.to, PAYMENT.value)],
+  };
+  assert.equal(receiptConfirmsPayment({ receipt, ...PAYMENT }), true);
+});
+
+await check('R1: successful receipt with Transfer to wrong recipient does not confirm', async () => {
+  const receipt = {
+    status: 'success',
+    logs: [transferLog(PAYMENT.from, other.address, PAYMENT.value)],
+  };
+  assert.equal(receiptConfirmsPayment({ receipt, ...PAYMENT }), false);
+});
+
+await check('R1: successful receipt with Transfer of wrong value does not confirm', async () => {
+  const receipt = {
+    status: 'success',
+    logs: [transferLog(PAYMENT.from, PAYMENT.to, 1n)],
+  };
+  assert.equal(receiptConfirmsPayment({ receipt, ...PAYMENT }), false);
+});
+
+await check('R1: successful receipt with Transfer from a different token does not confirm', async () => {
+  const receipt = {
+    status: 'success',
+    logs: [transferLog(PAYMENT.from, PAYMENT.to, PAYMENT.value, other.address)],
+  };
+  assert.equal(receiptConfirmsPayment({ receipt, ...PAYMENT }), false);
+});
+
+await check('R1: successful receipt with no logs does not confirm', async () => {
+  const receipt = { status: 'success', logs: [] };
+  assert.equal(receiptConfirmsPayment({ receipt, ...PAYMENT }), false);
+});
+
+await check('R1: successful receipt with undecodable logs does not confirm', async () => {
+  const receipt = {
+    status: 'success',
+    logs: [
+      {
+        address: USDC_ADDRESS as `0x${string}`,
+        topics: ['0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef'] as [`0x${string}`],
+        data: '0x' as `0x${string}`,
+      },
+    ],
+  };
+  assert.equal(receiptConfirmsPayment({ receipt, ...PAYMENT }), false);
 });
 
 console.log(`\n${passed} facilitator tests passed${process.exitCode ? ' (with failures)' : ''}`);

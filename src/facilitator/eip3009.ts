@@ -49,6 +49,7 @@ export const usdcEip3009Abi = [
     'function authorizationState(address authorizer, bytes32 nonce) view returns (bool)',
   ),
   parseAbiItem('function balanceOf(address account) view returns (uint256)'),
+  parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)'),
 ] as const;
 
 /** Build a viem Chain object from a ChainConfig (keeps viem out of chains.ts). */
