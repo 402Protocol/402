@@ -32,7 +32,9 @@
  *    broadcasting again — a tx that confirms after the request timed out is
  *    reported as success, never double-broadcast. If the send outcome is
  *    unknown (crash between broadcast and hash-save), the retry fails
- *    closed; a consumed onchain nonce proves the payment succeeded.
+ *    closed until the intended payment can be proven. A consumed onchain
+ *    nonce alone cannot prove payment: it may have been cancelled or used
+ *    for a different recipient or amount.
  *  - Claim fencing (#3): the in-flight claim carries an ownership token.
  *    Only the holder may release it or write settlement state — a stale
  *    worker that lost its claim stands down instead of broadcasting or
@@ -516,30 +518,17 @@ async function settleInner(
     } else if (opts.store.hasBroadcastIntent(id)) {
       // A previous attempt recorded a send intent but never saved a hash:
       // the send outcome is unknown (crash or store failure at the broadcast
-      // boundary). Fail closed — never rebroadcast blind.
-      let consumed = false;
-      try {
-        consumed = await io.isAuthorizationUsed(from, nonce);
-      } catch {
-        // On RPC failure the outcome stays unknown.
-      }
-      if (consumed) {
-        // EIP-3009 marks the nonce only after _transfer succeeds, so a
-        // consumed nonce proves our exact payment succeeded onchain — the
-        // hash was lost, not the payment.
-        const lost = assertClaim();
-        if (lost) return lost;
-        opts.store.deleteBroadcastIntent(id);
-        opts.store.mark(id, Number(validBefore));
-        return { success: true, network: cfg.caip2, payer: from };
-      }
+      // boundary). authorizationState is shared by transfers and
+      // cancellations and binds only payer + nonce, not recipient + amount.
+      // Retain the intent regardless of nonce state: without exact payment
+      // evidence, never report success or rebroadcast blind.
       return {
         success: false,
         errorReason: 'settlement_unknown',
         network: cfg.caip2,
         payer: from,
         detail:
-          'A previous attempt recorded a broadcast intent but no transaction hash (possible crash at the broadcast boundary), and the authorization is not consumed onchain. The transaction may be pending or never submitted. Investigate before retrying — this will not rebroadcast.',
+          'A previous attempt recorded a broadcast intent but no transaction hash (possible crash at the broadcast boundary). Nonce consumption alone cannot prove the expected USDC payment; the authorization may have been cancelled or used for a different payment. Investigate and recover the transaction hash before retrying — this will not rebroadcast.',
       };
     }
   }

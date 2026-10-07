@@ -1127,7 +1127,7 @@ await check('#3b: intent that cannot be persisted refuses to broadcast', async (
   assert.equal(state.broadcasts, 0, 'must not broadcast without recovery');
 });
 
-await check('#3b: crashed attempt with consumed authorization recovers to success, no rebroadcast', async () => {
+await check('#3b: crashed attempt with consumed authorization stays unknown without payment evidence', async () => {
   const { state, io } = makeFakeIO();
   const store = new NonceStore();
   const r = await signedRequest();
@@ -1135,13 +1135,103 @@ await check('#3b: crashed attempt with consumed authorization recovers to succes
   assert.ok(sid);
   // Simulate the crash: intent persisted, process died before the hash-save.
   store.setBroadcastIntent(sid);
-  // The transaction did submit and consumed the authorization onchain.
+  // Consumption alone does not prove which payment (if any) occurred.
   io.isAuthorizationUsed = async () => true;
 
+  let marks = 0;
+  const mark = store.mark.bind(store);
+  store.mark = (id, expiry) => { marks++; mark(id, expiry); };
+  const t0 = now();
+  // Both immediate retries and retries after expiry must retain recovery state.
+  for (const nowSec of [t0, t0, t0 + 600]) {
+    const res = await settleExactPayment(r, { store, settlerKey, dryRun: false, io, nowSec });
+    assert.equal(res.success, false);
+    assert.equal(res.errorReason, 'settlement_unknown');
+    assert.equal(res.transaction, undefined);
+    assert.equal(state.broadcasts, 0, 'must not rebroadcast');
+    assert.equal(store.hasBroadcastIntent(sid), true, 'intent must survive every retry');
+    assert.equal(store.getBroadcast(sid), undefined);
+    assert.equal(store.has(sid, t0), false, 'no payment was proven');
+    assert.equal(marks, 0, 'must never mark the nonce paid, even after expiry');
+  }
+});
+
+await check('#3b: cancelled authorization keeps its unknown intent across SQLite restarts', async () => {
+  const dbPath = join(mkdtempSync(join(tmpdir(), 'settle-cancelled-')), 'settlements.db');
+  const { state, io } = makeFakeIO();
+  const r = await signedRequest();
+  const sid = settlementIdentity(r);
+  assert.ok(sid);
+  // EIP-3009 cancelAuthorization sets authorizationState(from, nonce) to
+  // true without transferring funds. There is no saved payment tx hash.
+  io.isAuthorizationUsed = async () => true;
+  const initialStore = new SqliteSettlementStore(dbPath);
+  initialStore.setBroadcastIntent(sid);
+  initialStore.close();
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const store = new SqliteSettlementStore(dbPath);
+    try {
+      let marks = 0;
+      const mark = store.mark.bind(store);
+      store.mark = (id, expiry) => { marks++; mark(id, expiry); };
+      const res = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+      assert.equal(res.success, false, 'cancellation is not a payment');
+      assert.equal(res.errorReason, 'settlement_unknown');
+      assert.equal(res.transaction, undefined);
+      assert.equal(store.hasBroadcastIntent(sid), true, 'intent must survive restart');
+      assert.equal(store.getBroadcast(sid), undefined);
+      assert.equal(store.has(sid, now()), false);
+      assert.equal(marks, 0, 'cancellation must not mark the nonce paid');
+      assert.equal(state.broadcasts, 0, 'must not rebroadcast');
+    } finally {
+      store.close();
+    }
+  }
+});
+
+for (const mismatch of ['recipient', 'amount'] as const) {
+  await check(`#3b: nonce consumed by a different ${mismatch} cannot prove the intended payment`, async () => {
+    const { state, io } = makeFakeIO();
+    const store = new NonceStore();
+    const r = await signedRequest();
+    const sid = settlementIdentity(r);
+    assert.ok(sid);
+    store.setBroadcastIntent(sid);
+    io.isAuthorizationUsed = async () => true;
+    state.minedReceipt = {
+      status: 'success',
+      logs: [transferLog(
+        PAYMENT.from,
+        mismatch === 'recipient' ? other.address : PAYMENT.to,
+        mismatch === 'amount' ? PAYMENT.value + 1n : PAYMENT.value,
+      )],
+    };
+
+    const res = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
+    assert.equal(res.success, false);
+    assert.equal(res.errorReason, 'settlement_unknown');
+    assert.equal(store.hasBroadcastIntent(sid), true);
+    assert.equal(store.has(sid, now()), false, 'unrelated payment must not mark this nonce paid');
+    assert.equal(state.broadcasts, 0, 'must not rebroadcast');
+  });
+}
+
+await check('#3b: unknown send intent stays unknown when authorization state RPC is unavailable', async () => {
+  const { state, io } = makeFakeIO();
+  const store = new NonceStore();
+  const r = await signedRequest();
+  const sid = settlementIdentity(r);
+  assert.ok(sid);
+  store.setBroadcastIntent(sid);
+  io.isAuthorizationUsed = async () => { throw new Error('rpc down'); };
+
   const res = await settleExactPayment(r, { store, settlerKey, dryRun: false, io });
-  assert.equal(res.success, true, 'a consumed nonce proves the payment succeeded');
-  assert.equal(state.broadcasts, 0, 'must not rebroadcast');
-  assert.equal(store.hasBroadcastIntent(sid), false, 'intent cleared after recovery');
+  assert.equal(res.success, false);
+  assert.equal(res.errorReason, 'settlement_unknown');
+  assert.equal(store.hasBroadcastIntent(sid), true);
+  assert.equal(store.has(sid, now()), false);
+  assert.equal(state.broadcasts, 0);
 });
 
 await check('#3b: crashed attempt with unconsumed authorization fails closed', async () => {
@@ -1158,6 +1248,8 @@ await check('#3b: crashed attempt with unconsumed authorization fails closed', a
   assert.equal(res.success, false);
   assert.equal(res.errorReason, 'settlement_unknown');
   assert.equal(state.broadcasts, 0, 'must not rebroadcast when the send outcome is unknown');
+  assert.equal(store.hasBroadcastIntent(sid), true);
+  assert.equal(store.has(sid, now()), false);
 });
 
 await check('#3: two instances sharing the DB reconcile a timed-out broadcast with one broadcast total', async () => {
