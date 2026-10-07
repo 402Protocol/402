@@ -21,6 +21,8 @@ export interface PostTweetArgs {
   dryRun?: boolean;
   /** Optional: post as a reply to this tweet id. */
   replyToTweetId?: string;
+  /** Optional: post as a quote tweet of this tweet id. */
+  quoteTweetId?: string;
 }
 
 export interface PostResult {
@@ -51,6 +53,7 @@ export async function postTweet({
   text,
   dryRun = true,
   replyToTweetId,
+  quoteTweetId,
 }: PostTweetArgs): Promise<PostResult> {
   const length = tweetLength(text);
   if (length > MAX_TWEET_CHARS) throw new TweetTooLongError(length);
@@ -63,6 +66,9 @@ export async function postTweet({
   const payload: Record<string, unknown> = { text };
   if (replyToTweetId) {
     payload.reply = { in_reply_to_tweet_id: replyToTweetId };
+  }
+  if (quoteTweetId) {
+    payload.quote_tweet_id = quoteTweetId;
   }
   const res = await fetchFn(X_TWEETS_URL, {
     method: 'POST',

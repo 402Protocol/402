@@ -284,6 +284,23 @@ await check('replyTo adds reply.in_reply_to_tweet_id', async () => {
   });
 });
 
+await check('quoteTweetId adds quote_tweet_id', async () => {
+  const m = mockFetch();
+  m.respondWith(() => ({ json: { data: { id: '444' } } }));
+  const r = await postTweet({
+    fetchFn: m.fn,
+    accessToken: 'AT',
+    text: 'two agents talking on the internet. what could go wrong',
+    dryRun: false,
+    quoteTweetId: '2107914898365673903',
+  });
+  assert.equal(r.posted, true);
+  assert.deepEqual(JSON.parse(m.calls[0].init.body), {
+    text: 'two agents talking on the internet. what could go wrong',
+    quote_tweet_id: '2107914898365673903',
+  });
+});
+
 // ---------- tokens.ts ----------
 
 function tmpPath(): string {
